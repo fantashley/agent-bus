@@ -18,10 +18,12 @@ directly, instead of Ashley relaying messages between windows. Designed in
   message caps (`THREAD_LIMIT_REACHED` until Ashley runs `resume`), deadlines and job
   de-duplication. Jobs whose worker died are reaped, so a crash never wedges a thread.
 - **Headless peers can't use tools that act.** Claude runs with `--strict-mcp-config` and only
-  Read/Grep/Glob/web tools; Codex has every MCP server disabled; and any agent-bus MCP server a
-  peer launches sees `AGENT_BUS_PEER` and refuses every call. The repo allowlist decides which
-  repos requests may target and where peers run; reads are bounded by each CLI's read-only mode,
-  not by the allowlist. (Antigravity's other MCP servers stay loaded in plan mode.)
+  Read/Grep/Glob/web tools; Codex has every live MCP server disabled (and the turn fails if they
+  can't be listed); Antigravity has no per-session switch, so its turns are refused while it has any
+  MCP server besides agent-bus configured, unless `peers.antigravity.allow_mcp` is set. Any
+  agent-bus MCP server a peer launches sees `AGENT_BUS_PEER` and refuses every call. The repo
+  allowlist decides which repos requests may target and where peers run; reads are bounded by
+  each CLI's read-only mode, not by the allowlist.
 
 ## Discussions
 

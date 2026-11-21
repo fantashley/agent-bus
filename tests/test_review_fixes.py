@@ -155,13 +155,130 @@ def test_blind_inbox_does_not_spin(env, no_spawn):
     assert {m["id"] for m in first}.isdisjoint({m["id"] for m in after})
 
 
-def test_absent_initiator_sees_proposals_after_round_one(env, no_spawn):
+def test_absent_initiator_with_one_peer_can_read_and_vote(env, no_spawn):
+    """One peer + absent initiator: the worker stops after round 1, and the initiator
+    must still be able to read the proposal it is asked to vote on."""
+    bus = env["bus"]
+    sid = bus.register_session("claude")
+    claude = Service(bus, "claude", sid)
+    tid = claude.start_discussion("Q?", peers=["codex"], max_rounds=1)["thread"]["id"]
+    bus.conn.execute("UPDATE sessions SET last_seen=0 WHERE id=?", (sid,))
+    run_job(bus, tid)
+    t = bus.thread(tid)
+    assert t["status"] == "open" and t["round"] == 1 and not t["blind"]
+    msgs = claude.inbox(thread=tid)["messages"]
+    assert any(m["from"] == "codex" and m["kind"] == "proposal" for m in msgs)
+    assert "Waiting for claude" in msgs[-1]["body"]
+    claude.send("ok", thread=tid, kind="vote", on="P1", stance="agree")
+    assert bus.thread(tid)["status"] == "resolved"
+
+
+def test_old_database_is_migrated(env, tmp_path):
+    import sqlite3
+    from agent_bus.db import Bus
+    path = tmp_path / "old.db"
+    c = sqlite3.connect(path)
+    c.executescript("""
+      CREATE TABLE threads (id TEXT PRIMARY KEY, kind TEXT NOT NULL, goal TEXT NOT NULL, participants TEXT NOT NULL,
+        initiator TEXT, initiator_session TEXT, status TEXT NOT NULL DEFAULT 'open', round INTEGER NOT NULL DEFAULT 0,
+        max_rounds INTEGER NOT NULL DEFAULT 4, max_messages INTEGER NOT NULL DEFAULT 60, deadline REAL, repo TEXT,
+        refs TEXT, limit_reached INTEGER NOT NULL DEFAULT 0, final_proposal TEXT, created_at REAL NOT NULL,
+        updated_at REAL NOT NULL);
+      CREATE TABLE jobs (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, kind TEXT NOT NULL, params TEXT NOT NULL,
+        dedupe_key TEXT UNIQUE, status TEXT NOT NULL, lease_owner TEXT, lease_expires REAL, pid INTEGER, error TEXT,
+        created_at REAL NOT NULL, updated_at REAL NOT NULL);
+      INSERT INTO jobs VALUES ('j-old','t-x','review','{}','k','failed',NULL,NULL,NULL,'boom',0,0);
+    """)
+    c.close()
+    bus = Bus(path)
+    assert bus.job("j-old")["status"] == "failed"
+    t = bus.create_thread("review", "g", ["claude", "codex"], initiator="claude")
+    job, created = bus.create_job(t["id"], "review", {}, "k")  # same key as the failed job
+    assert created
+    assert "blind" in bus.thread(t["id"])
+
+
+def test_fenced_write_rejects_reaped_worker(env, no_spawn):
+    from agent_bus.worker import LeaseLost
+    bus = env["bus"]
+    tid = Service(bus, HUMAN).start_discussion("Q?", peers=["codex"])["thread"]["id"]
+    jid = bus.jobs(tid)[0]["id"]
+    w = Worker(bus, jid)
+    assert bus.claim_job(jid, w.owner)
+    bus.conn.execute("UPDATE jobs SET lease_expires=0 WHERE id=?", (jid,))
+    bus.reap()
+    with pytest.raises(LeaseLost):
+        w.system("should not land")
+    assert all(m["body"] != "should not land" for m in bus.history(tid)["messages"])
+
+
+def test_dedupe_hit_on_dead_job_is_recovered(env, no_spawn):
     bus = env["bus"]
     claude = Service(bus, "claude", bus.register_session("claude"))
-    tid = claude.start_discussion("Q?", peers=["codex"])["thread"]["id"]
-    bus.post(tid, "codex", "codex view", kind="proposal")
-    bus.set_thread(tid, round=2)
-    assert any(m["from"] == "codex" for m in claude.inbox(thread=tid)["messages"])
+    sha = "a" * 40
+    r1 = claude.request_review("codex", str(env["repo"]), sha, "b" * 40)
+    bus.claim_job(r1["job"]["id"], "dead", lease_s=-1)
+    r2 = claude.request_review("codex", str(env["repo"]), sha, "b" * 40)
+    assert not r2["job"].get("deduplicated") and r2["job"]["id"] != r1["job"]["id"]
+
+
+def test_followup_while_previous_pass_running_is_refused(env, no_spawn):
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    sha, h1, h2 = "a" * 40, "b" * 40, "c" * 40
+    r1 = claude.request_review("codex", str(env["repo"]), sha, h1)
+    with pytest.raises(BusError) as e:
+        claude.request_review("codex", str(env["repo"]), sha, h2, prev_head_commit_id=h1)
+    assert e.value.code == "REVIEW_BUSY"
+    assert bus.thread(r1["thread"]["id"])["refs"]["head_commit_id"] == h1
+
+
+def test_malformed_findings_do_not_crash(env):
+    from agent_bus.worker import normalize_verdict
+    assert normalize_verdict({"verdict": "approve", "findings": 1}) is None
+    v = normalize_verdict({"verdict": "approve", "findings": [{"file": "a", "line": "x"}, 3]})
+    assert v["findings"] == [{"file": "a", "line": None, "severity": "?", "comment": ""}]
+
+
+def test_codex_fails_closed_when_mcp_list_fails(env, tmp_path):
+    from agent_bus.peers import CodexAdapter
+    bad = tmp_path / "bad-codex"
+    bad.write_text("#!/bin/sh\nexit 3\n")
+    bad.chmod(0o755)
+    conf = Config.load()
+    conf.peers = {"codex": {"command": str(bad)}}
+    res = CodexAdapter(conf).run("hi", str(tmp_path), 10, lambda k, t: None)
+    assert not res.ok and "mcp list" in res.error
+
+
+def test_antigravity_refuses_unisolatable_mcp(env, monkeypatch):
+    from agent_bus.peers import AntigravityAdapter
+    agy = env["tmp"] / "agy"
+    (agy / "mcp_config.json").write_text('{"mcpServers": {"github": {"command": "gh-mcp"}}}')
+    res = AntigravityAdapter(Config.load()).run("hi", str(env["tmp"]), 10, lambda k, t: None)
+    assert not res.ok and "github" in res.error
+    conf = Config.load()
+    conf.peers = {**conf.peers, "antigravity": {**conf.peers["antigravity"], "allow_mcp": True}}
+    assert AntigravityAdapter(conf).run("hi", str(env["tmp"]), 10, lambda k, t: None).ok
+
+
+def test_followup_fallback_has_full_context(env, no_spawn):
+    """If the reviewer's session can't be resumed, the fresh prompt has base..head and its earlier verdict."""
+    repo = env["repo"]
+    sh, rev = _jj_repo(repo)
+    base, head1 = rev("@-"), rev("@")
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(repo), base, head1)["thread"]["id"]
+    run_job(bus, tid)
+    bus.set_peer_session(tid, "codex", None)  # session lost
+    (repo / "a.txt").write_text("hello world\n")
+    head2 = rev("@")
+    claude.request_review("codex", str(repo), base, head2, prev_head_commit_id=head1, focus="NOTE-2")
+    run_job(bus, tid)
+    last = [c for c in calls(env) if c["agent"] == "codex"][-1]
+    assert "Diff from base to head" in last["prompt"] and "+hello world" in last["prompt"]
+    assert "earlier verdicts" in last["prompt"] and "typo" in last["prompt"] and "NOTE-2" in last["prompt"]
 
 
 def test_absent_initiator_stops_peer_rounds_early(env, no_spawn):
@@ -173,6 +290,7 @@ def test_absent_initiator_stops_peer_rounds_early(env, no_spawn):
     run_job(bus, tid)
     t = bus.thread(tid)
     assert t["status"] == "open" and t["round"] == 2  # not 4: peers already agreed
+    assert not t["blind"]
     claude.advance_discussion(tid)  # rounds remain for the initiator
 
 

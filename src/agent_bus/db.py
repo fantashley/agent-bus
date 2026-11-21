@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS threads (
     repo TEXT,
     refs TEXT,                          -- JSON
     limit_reached INTEGER NOT NULL DEFAULT 0,
+    blind INTEGER NOT NULL DEFAULT 0,       -- 1 while a discussion's round 1 is in progress
     final_proposal TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -166,6 +167,13 @@ class _LockedConn:
         with self.lock:
             self._conn.executescript(sql)
 
+    def executescript_in_tx(self, sql: str) -> None:
+        """Run ;-separated DDL without executescript's implicit COMMIT."""
+        with self.lock:
+            for stmt in sql.split(";"):
+                if stmt.strip():
+                    self._conn.execute(stmt)
+
     def close(self) -> None:
         with self.lock:
             self._conn.close()
@@ -184,22 +192,64 @@ class Bus:
         self.conn = _LockedConn(raw)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=30000")
+        self._depth = 0
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring databases created by older versions up to the current schema."""
+        with self.tx():
+            cols = {r["name"] for r in self._all("PRAGMA table_info(threads)")}
+            if "blind" not in cols:
+                self.conn.execute("ALTER TABLE threads ADD COLUMN blind INTEGER NOT NULL DEFAULT 0")
+            jobs_sql = self._one("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'")["sql"]
+            if "dedupe_key TEXT UNIQUE" in jobs_sql:
+                # v0.1.0 made dedupe keys unique, which blocks retrying a failed job.
+                self.conn.execute("ALTER TABLE jobs RENAME TO jobs_v0")
+                self.conn.executescript_in_tx(SCHEMA)
+                self.conn.execute("INSERT INTO jobs SELECT * FROM jobs_v0")
+                self.conn.execute("DROP TABLE jobs_v0")
 
     def close(self) -> None:
         self.conn.close()
 
     @contextmanager
     def tx(self) -> Iterator[_LockedConn]:
+        """IMMEDIATE transaction; nested uses join the outer one."""
         with self.conn.lock:
+            if self._depth:
+                self._depth += 1
+                try:
+                    yield self.conn
+                finally:
+                    self._depth -= 1
+                return
             self.conn.execute("BEGIN IMMEDIATE")
+            self._depth = 1
             try:
                 yield self.conn
             except BaseException:
+                self._depth = 0
                 self.conn.execute("ROLLBACK")
                 raise
             else:
+                self._depth = 0
                 self.conn.execute("COMMIT")
+
+    @contextmanager
+    def fenced(self, job_id: str, owner: str) -> Iterator[None]:
+        """A transaction that only proceeds while ``owner`` holds a live lease on the job.
+
+        Workers do every durable write inside one, so the ownership check and the
+        write are atomic: a worker whose lease expired, was reaped, or was taken
+        over can't post, vote, or change thread state.
+        """
+        with self.tx():
+            ok = self._one("SELECT 1 FROM jobs WHERE id=? AND lease_owner=? AND status='running'"
+                           " AND lease_expires>=?", job_id, owner, _now())
+            if not ok:
+                raise BusError("LEASE_LOST", f"job {job_id} is no longer held by this worker")
+            yield
 
     def _one(self, sql: str, *args: Any) -> sqlite3.Row | None:
         with self.conn.lock:
@@ -253,11 +303,11 @@ class Bus:
                 seen.append(p)
         self.conn.execute(
             "INSERT INTO threads (id, kind, goal, participants, initiator, initiator_session, status,"
-            " round, max_rounds, max_messages, deadline, repo, refs, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?)",
+            " round, max_rounds, max_messages, deadline, repo, refs, blind, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?)",
             (tid, kind, goal, json.dumps(seen), initiator, initiator_session,
              1 if kind == "discussion" else 0, max_rounds, max_messages, deadline, repo,
-             json.dumps(refs) if refs else None, now, now),
+             json.dumps(refs) if refs else None, 1 if kind == "discussion" else 0, now, now),
         )
         return self.thread(tid)
 
@@ -465,8 +515,9 @@ class Bus:
     def _blind(self, t: dict, viewer: str) -> bool:
         """Round 1 is blind: a participant sees no other agent's messages until it has
         posted its own proposal.  Once round 2 starts, a participant that missed round 1
-        sees everything (it was absent, so there's nothing left to keep independent)."""
-        if (t["kind"] != "discussion" or t["status"] != "open" or t["round"] != 1
+        sees everything (it was absent, so there's nothing left to keep independent).
+        The worker clears ``blind`` when round 1 is over, even if it stops there."""
+        if (t["kind"] != "discussion" or t["status"] != "open" or not t["blind"]
                 or viewer not in t["participants"]):
             return False
         posted = self._one("SELECT 1 FROM messages WHERE thread_id=? AND sender=? AND kind='proposal' LIMIT 1",
@@ -537,20 +588,20 @@ class Bus:
     # Queued jobs are spawned immediately; one still unclaimed after this long lost its worker.
     QUEUE_GRACE_S = 60
 
-    def reap(self, thread_id: str | None = None) -> list[str]:
-        """Fail jobs whose worker died (expired lease, or never claimed).  Returns their ids."""
+    def reap(self) -> list[str]:
+        """Fail jobs whose worker died (expired lease, or never claimed).  Returns their ids.
+
+        One conditional UPDATE, so a lease renewed or a job claimed a moment ago is never
+        failed by mistake.
+        """
         now = _now()
-        where = "thread_id=? AND " if thread_id else ""
-        args: tuple = (thread_id,) if thread_id else ()
-        rows = self._all(
-            f"SELECT id FROM jobs WHERE {where}((status='running' AND lease_expires<?)"
-            " OR (status='queued' AND created_at<?))", *args, now, now - self.QUEUE_GRACE_S)
-        ids = [r["id"] for r in rows]
-        for jid in ids:
-            self.conn.execute(
+        with self.tx():
+            rows = self.conn.execute(
                 "UPDATE jobs SET status='failed', error='worker died (lease expired or never claimed)',"
-                " updated_at=? WHERE id=? AND status IN ('queued','running')", (now, jid))
-        return ids
+                " updated_at=? WHERE (status='running' AND lease_expires<?)"
+                " OR (status='queued' AND created_at<?) RETURNING id",
+                (now, now, now - self.QUEUE_GRACE_S)).fetchall()
+        return [r["id"] for r in rows]
 
     def create_job(self, thread_id: str, kind: str, params: dict, dedupe_key: str | None) -> tuple[dict, bool]:
         """Insert a job unless an equivalent one is active or already succeeded.  Returns (job, created).
@@ -559,7 +610,7 @@ class Bus:
         reaped first, so a crash never wedges a thread.
         """
         with self.tx():
-            self.reap(thread_id)
+            self.reap()
             if dedupe_key:
                 row = self._one("SELECT * FROM jobs WHERE dedupe_key=? AND status IN ('queued','running','done')"
                                 " ORDER BY created_at DESC LIMIT 1", dedupe_key)
@@ -593,7 +644,7 @@ class Bus:
         return [self._job(r) for r in self._all("SELECT * FROM jobs WHERE thread_id=? ORDER BY created_at", thread_id)]
 
     def active_job(self, thread_id: str) -> dict | None:
-        self.reap(thread_id)
+        self.reap()
         row = self._one("SELECT * FROM jobs WHERE thread_id=? AND status IN ('queued','running')", thread_id)
         return self._job(row) if row else None
 

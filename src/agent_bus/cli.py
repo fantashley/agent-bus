@@ -120,30 +120,45 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
     status: dict[str, str] = {}
     jobs: dict[str, str] = {}
     first = True
+    one_line = lambda text, n: " ".join(str(text).split())[:n]  # noqa: E731
+
+    def drain() -> None:
+        nonlocal last_msg
+        for r in bus._all("SELECT id FROM messages WHERE id>? ORDER BY id", last_msg):
+            m = bus.message(r["id"])
+            last_msg = m["id"]
+            if (wanted and m["thread_id"] not in wanted) or m["kind"] not in kinds:
+                continue
+            who = "Ashley" if m["sender"] == HUMAN else m["sender"]
+            extra = m["data"].get("verdict") or m["data"].get("proposal_id") or ""
+            print(one_line(f"{m['kind'].upper()} {m['thread_id']} {who} {extra}: {m['body']}", 300), flush=True)
+
+    def settled(tid: str) -> bool:
+        """Closed, or open with no worker left and its last job failed (nothing more will come)."""
+        if bus.active_job(tid):
+            return False
+        if status.get(tid) in ("resolved", "needs_human", "cancelled"):
+            return True
+        js = bus.jobs(tid)
+        return bool(js) and js[-1]["status"] == "failed"
+
     try:
         while True:
-            for r in bus._all("SELECT id FROM messages WHERE id>? ORDER BY id", last_msg):
-                m = bus.message(r["id"])
-                last_msg = m["id"]
-                if (wanted and m["thread_id"] not in wanted) or m["kind"] not in kinds:
-                    continue
-                who = "Ashley" if m["sender"] == HUMAN else m["sender"]
-                extra = m["data"].get("verdict") or m["data"].get("proposal_id") or ""
-                summary = " ".join(m["body"].split())[:200]
-                print(f"{m['kind'].upper()} {m['thread_id']} {who} {extra}: {summary}".replace("  ", " "), flush=True)
+            bus.reap()
+            drain()
             for t in bus.threads(include_closed=True, limit=200):
                 if wanted and t["id"] not in wanted:
                     continue
                 if status.get(t["id"]) != t["status"] and not first and t["status"] != "open":
-                    print(f"THREAD {t['id']} {t['status']}: {t['goal'][:120]}", flush=True)
+                    print(one_line(f"THREAD {t['id']} {t['status']}: {t['goal']}", 200), flush=True)
                 status[t["id"]] = t["status"]
                 for j in bus.jobs(t["id"]):
                     if j["status"] == "failed" and jobs.get(j["id"]) != "failed" and not first:
-                        print(f"JOB_FAILED {t['id']} {j['id']}: {(j['error'] or '')[:200]}", flush=True)
+                        print(one_line(f"JOB_FAILED {t['id']} {j['id']}: {j['error'] or ''}", 300), flush=True)
                     jobs[j["id"]] = j["status"]
             first = False
-            if wanted and all(status.get(t) in ("resolved", "needs_human", "cancelled") for t in wanted) \
-                    and not any(bus.active_job(t) for t in wanted):
+            if wanted and all(settled(t) for t in wanted):
+                drain()  # a verdict posted just before the thread closed is still reported
                 return 0
             time.sleep(args.interval)
     except KeyboardInterrupt:

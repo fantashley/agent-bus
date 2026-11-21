@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from .config import Config
@@ -21,6 +22,10 @@ from .db import new_uuid
 
 # argv entries above this size go through stdin or a file instead.
 MAX_ARG = 100_000
+
+
+class PeerSetupError(Exception):
+    """The peer can't be started safely (e.g. its integrations can't be isolated)."""
 
 
 @dataclass
@@ -68,7 +73,10 @@ class Adapter:
     def run(self, prompt: str, cwd: str, timeout: float, emit: Emit, resume_id: str | None = None,
             add_dirs: list[str] | None = None, cancelled: Callable[[], bool] = lambda: False,
             peer_tag: str = "1") -> TurnResult:
-        inv = self.invocation(prompt, resume_id, cwd, add_dirs or [])
+        try:
+            inv = self.invocation(prompt, resume_id, cwd, add_dirs or [])
+        except PeerSetupError as e:
+            return TurnResult(ok=False, error=str(e))
         st = StreamState(external_id=inv.external_id)
         # Any agent-bus MCP server the peer CLI launches sees this and refuses every tool,
         # so a headless peer can't post, start jobs, or read blind proposals.
@@ -206,13 +214,23 @@ class CodexAdapter(Adapter):
     agent = "codex"
     default_command = "codex"
 
-    def mcp_servers(self) -> list[str]:
+    def mcp_servers(self, cwd: str) -> list[str]:
+        """Live MCP servers as codex would load them in ``cwd`` (project config included).
+
+        Raises if they can't be listed: without the list we can't switch them off,
+        and running a peer with unknown integrations live is not read-only.
+        """
+        overrides = [a for i, a in enumerate(self.extra) if i > 0 and self.extra[i - 1] == "-c"]
+        argv = [self.command, *sum((["-c", o] for o in overrides), []), "mcp", "list", "--json"]
         try:
-            out = subprocess.run([self.command, "mcp", "list", "--json"], capture_output=True, text=True,
-                                 timeout=30)
-            data = json.loads(out.stdout) if out.returncode == 0 else []
-        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-            data = []
+            out = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30)
+            if out.returncode != 0:
+                raise PeerSetupError(f"`codex mcp list` failed: {out.stderr.strip()[:300]}")
+            data = json.loads(out.stdout)
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+            raise PeerSetupError(f"could not list codex MCP servers to disable them: {e}") from e
+        if not isinstance(data, list):
+            raise PeerSetupError("unexpected `codex mcp list --json` output")
         # Only servers that exist: overriding a missing one creates a half-defined entry
         # that codex rejects ("invalid transport").  agent-bus itself is also covered by
         # the AGENT_BUS_PEER guard even if it isn't listed here.
@@ -223,7 +241,7 @@ class CodexAdapter(Adapter):
         common = ["--json", "--skip-git-repo-check", "-c", 'sandbox_mode="read-only"',
                   "-c", 'approval_policy="never"']
         # The read-only sandbox doesn't cover MCP side effects, so switch every server off.
-        for name in self.mcp_servers():
+        for name in self.mcp_servers(cwd):
             common += ["-c", f"mcp_servers.{json.dumps(name)}.enabled=false"]
         if resume_id:
             argv = [self.command, "exec", "resume", *common, *self.extra, resume_id, "-"]
@@ -256,7 +274,32 @@ class AntigravityAdapter(Adapter):
     agent = "antigravity"
     default_command = "agy"
 
+    def check_isolation(self) -> None:
+        """agy has no per-session switch for MCP servers, so refuse to run a peer while
+        any server other than agent-bus (which refuses peers itself) is configured,
+        unless config sets peers.antigravity.allow_mcp."""
+        if self.config.peers.get(self.agent, {}).get("allow_mcp"):
+            return
+        base = Path(os.environ.get("AGY_CONFIG_DIR") or Path.home() / ".gemini" / "config")
+        files = [base / "mcp_config.json", *sorted(base.glob("plugins/*/mcp_config.json"))]
+        live = []
+        for f in files:
+            if not f.exists():
+                continue
+            try:
+                text = f.read_text().strip()
+                servers = (json.loads(text).get("mcpServers") or {}) if text else {}  # agy leaves it empty
+            except (OSError, json.JSONDecodeError, AttributeError) as e:
+                raise PeerSetupError(f"can't read {f} to check Antigravity's MCP servers: {e}") from e
+            live += [n for n, spec in servers.items()
+                     if n != "agent-bus" and not (isinstance(spec, dict) and spec.get("disabled"))]
+        if live:
+            raise PeerSetupError(
+                f"Antigravity has MCP servers configured ({', '.join(sorted(live))}) that a headless peer "
+                "can't be isolated from. Remove them, or set peers.antigravity.allow_mcp = true to accept that.")
+
     def invocation(self, prompt, resume_id, cwd, add_dirs):
+        self.check_isolation()
         argv = [self.command, "--mode", "plan", "--sandbox", "--output-format", "stream-json"]
         for d in add_dirs:
             argv += ["--add-dir", d]

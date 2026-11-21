@@ -23,6 +23,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENT_BUS_DB", raising=False)
     monkeypatch.delenv("AGENT_BUS_CONFIG", raising=False)
     monkeypatch.delenv("REX_SESSION", raising=False)
+    monkeypatch.delenv("AGENT_BUS_PEER", raising=False)
+    (tmp_path / "agy").mkdir()
+    monkeypatch.setenv("AGY_CONFIG_DIR", str(tmp_path / "agy"))
     bindir = tmp_path / "bin"
     bindir.mkdir()
     peers = {}

@@ -208,14 +208,24 @@ class Service:
         if previous:
             # Follow-up pass: same thread, so the worker resumes the reviewer's conversation.
             t = previous
-            job_row, created = self.bus.create_job(t["id"], "review", {"mode": "followup"}, key)
-            if created:
-                self.bus.set_thread(t["id"], refs=json.dumps(refs), status="open", round=t["round"] + 1,
-                                    goal=f"Review {change_id or head_commit_id[:12]} in {os.path.basename(repo_path)}")
-                if focus:
-                    self.bus.post(t["id"], self.agent, focus, session_id=self.session_id, recipient=reviewer)
-                worker.spawn(job_row["id"])
-            job = self._job_info(job_row, created)
+            active = self.bus.active_job(t["id"])
+            if active and active["dedupe_key"] != key:
+                raise BusError("REVIEW_BUSY", f"{reviewer} is still on the previous pass ({t['id']}); "
+                               "wait for that verdict, then request this head again")
+            if active:
+                job = self._job_info(active, False)
+            else:
+                with self.bus.tx():  # all-or-nothing: the note, the new refs and the job
+                    if focus:
+                        self.bus.post(t["id"], self.agent, focus, session_id=self.session_id, recipient=reviewer)
+                    self.bus.set_thread(t["id"], refs=json.dumps(refs), status="open", round=t["round"] + 1,
+                                        max_rounds=t["round"] + 1,
+                                        goal=f"Review {change_id or head_commit_id[:12]} in "
+                                             f"{os.path.basename(repo_path)}")
+                    job_row, created = self.bus.create_job(t["id"], "review", {"mode": "followup"}, key)
+                if created:
+                    worker.spawn(job_row["id"])
+                job = self._job_info(job_row, created)
         else:
             goal = f"Review {change_id or head_commit_id[:12]} in {os.path.basename(repo_path)}"
             t = self.bus.create_thread("review", goal, [self.agent, reviewer], initiator=self.agent,
@@ -263,9 +273,14 @@ class Service:
         if t["kind"] == "discussion":
             res["job"] = self._dispatch(thread, "discussion", {"mode": "start_later"},
                                         f"{thread}:resume:{time.time():.0f}")
-        elif t["kind"] == "review" and t["status"] == "needs_human":
+        elif t["kind"] == "review" and not self.bus.active_job(thread) and not self._has_verdict_for_head(t):
             res["job"] = self._dispatch(thread, "review", {"mode": "retry"}, f"{thread}:retry:{time.time():.0f}")
         return res
+
+    def _has_verdict_for_head(self, t: dict) -> bool:
+        head = (t["refs"] or {}).get("head_commit_id")
+        return any(m["kind"] == "review_verdict" and m["data"].get("head_commit_id") == head
+                   for m in self.bus.history(t["id"])["messages"])
 
     def cancel(self, thread: str) -> dict:
         if self.agent != HUMAN:
