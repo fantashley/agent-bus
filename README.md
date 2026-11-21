@@ -1,0 +1,95 @@
+# agent-bus
+
+A local message bus that lets **Claude Code**, **Codex** and **Antigravity** talk to each other
+directly, instead of Ashley relaying messages between windows. Designed in
+[fantashley/dotfiles#131](https://github.com/fantashley/dotfiles/issues/131).
+
+- **One stdio MCP server** (`agent-bus mcp --agent <type>`) registered in every client. The server
+  stamps the sender from its launch command, so agents can't impersonate each other.
+- **SQLite (WAL) per host** at `$XDG_STATE_HOME/agent-bus/bus.db`, mode `0600`. History is never
+  deleted; read state is a per-session, per-thread cursor.
+- **On-demand worker, no daemon.** Typed actions (`start_discussion`, `advance_discussion`,
+  `request_review`) queue a job and spawn `agent-bus run-job <id>`, which holds an SQLite lease and
+  runs the peers headless and read-only (`claude -p --permission-mode plan`,
+  `codex exec` with a read-only sandbox, `agy --mode plan --sandbox`), resuming each peer's
+  conversation every round.
+- **Safety in the server:** peer text is returned as `trust: "peer_data"` inside visible fences;
+  only the CLI posts `trust: "human"`. Round caps, message caps (`THREAD_LIMIT_REACHED` until
+  Ashley runs `resume`), deadlines, job de-duplication and a repo allowlist.
+
+## Discussions
+
+```sh
+agent-bus ask "SQLite or a JSON file for a small CLI?" --with claude,codex,antigravity --wait
+```
+
+1. Round 1 is blind: each participant proposes without seeing the others (`P1`, `P2`, …).
+2. Later rounds run peers in turn; each votes `agree`/`object` on a proposal id or revises one.
+   Authoring a proposal counts as agreeing with it.
+3. Consensus = every participant agrees on the same proposal. The bus posts a `final` message and
+   marks the thread `resolved`.
+4. Out of rounds or past the deadline → `needs_human`, with who backs what and who objects.
+
+An agent can start one from its own chat with the `start_discussion` tool; it takes part with
+`send` + `wait`. If its turn ends, it's marked absent, and if the peers agree without it the thread
+waits in its inbox for its vote.
+
+## Reviews
+
+`request_review(reviewer, repo, base_commit_id, head_commit_id, …)` pins full commit ids. The worker
+computes `jj diff --from base --to head --git` (or an interdiff from `prev_head_commit_id`), the
+reviewer returns a structured verdict, and it lands as a `review_verdict` in the requester's inbox.
+
+## Watching and stepping in
+
+```sh
+agent-bus threads                 # list open threads
+agent-bus tail t-1a2b3c [--peer codex|--events]
+agent-bus reply t-1a2b3c "Prefer the simpler option" [--to codex]
+agent-bus cancel t-1a2b3c
+agent-bus resume t-1a2b3c --rounds 2
+agent-bus watch t-1a2b3c          # inside Rex: open viewer panes
+```
+
+`tail` emits [OSC 7501 program status](https://www.superlogical.com/rex/docs/build/program-status)
+(`working`, `done`, `blocked/question` on `needs_human`), so Rex shows discussion state on any
+client, local or attached to a remote host. Viewer panes are output-only; nothing is ever typed
+into a block. Everything works without Rex.
+
+## Install (Home Manager)
+
+```nix
+# flake inputs
+agent-bus = { url = "github:fantashley/agent-bus"; inputs.nixpkgs.follows = "nixpkgs"; };
+
+# home-manager modules
+imports = [ agent-bus.homeManagerModules.default ];
+local.agentBus = {
+  enable = true;
+  repos = [ "~/dotfiles" "~/src" ];   # what peers may read
+};
+```
+
+This installs the CLI, writes `~/.config/agent-bus/config.json`, and registers the MCP server:
+
+- **Claude Code:** a local plugin from a directory marketplace in the store, enabled through
+  dotfiles' `local.claude.extraKnownMarketplaces`/`enabledPlugins` when those options exist
+  (otherwise use `config.local.agentBus.claudeMarketplace`).
+- **Codex:** `codex mcp add agent-bus …` at activation, skipped when the entry already matches.
+- **Antigravity:** a plugin linked at `~/.gemini/config/plugins/agent-bus` (on by default when
+  `local.antigravity.enable` is set).
+
+Add [`docs/AGENTS-section.md`](docs/AGENTS-section.md) to the shared global agent rules.
+
+## Development
+
+```sh
+nix develop -c pytest      # tests use fake peer CLIs that speak each client's stream format
+nix build                  # package (runs the tests)
+```
+
+## Not in v1
+
+Interactive peer panes and `rex send` wake-ups (v1.1, gated on a verified input-ready signal);
+cross-host discussions, per-client fixed-hint hooks, writable participants in separate
+`jj workspace`s (v1.5).
