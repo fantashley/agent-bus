@@ -516,3 +516,23 @@ def test_stream_reports_failure_discovered_while_settling(env, no_spawn, capsys,
     from agent_bus.cli import main
     assert main(["stream", tid, "--interval", "0.1"]) == 0
     assert "JOB_FAILED" in capsys.readouterr().out
+
+
+# ---- review pass 5 ----------------------------------------------------------
+
+@pytest.mark.parametrize("state", ["running", "done"])
+def test_repeating_a_followup_is_idempotent(env, no_spawn, state):
+    bus = env["bus"]
+    sha, h1, h2 = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), sha, h1)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    bus.transition(tid, "resolved")
+    first = claude.request_review("codex", str(env["repo"]), sha, h2, prev_head_commit_id=h1, focus="n")
+    if state == "done":
+        bus.conn.execute("UPDATE jobs SET status='done'")
+        bus.transition(tid, "resolved")
+    again = claude.request_review("codex", str(env["repo"]), sha, h2, prev_head_commit_id=h1, focus="n")
+    assert again["job"]["id"] == first["job"]["id"] and again["job"]["deduplicated"]
+    assert len([m for m in bus.history(tid)["messages"] if m["body"] == "n"]) == 1
+    assert bus.thread(tid)["refs"]["heads"] == [h1, h2]

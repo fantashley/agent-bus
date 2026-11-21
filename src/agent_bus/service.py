@@ -217,8 +217,13 @@ class Service:
                 current = (t["refs"] or {}).get("head_commit_id")
                 active = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND status IN ('queued','running')",
                                        t["id"])
-                if active and active["dedupe_key"] == key:
-                    job_row, created = self.bus._job(active), False  # this exact request is already queued
+                same = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND dedupe_key=?"
+                                     " AND status IN ('queued','running','done') ORDER BY created_at DESC LIMIT 1",
+                                     t["id"], key)
+                if same:
+                    # This exact request (same prev head -> head) is queued, running or done:
+                    # idempotent, whatever happened to the thread since.
+                    job_row, created = self.bus._job(same), False
                 elif active:
                     raise BusError("REVIEW_BUSY", f"{reviewer} is still on a previous pass ({t['id']}); "
                                    "wait for that verdict, then request this head again")
