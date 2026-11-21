@@ -13,9 +13,15 @@ directly, instead of Ashley relaying messages between windows. Designed in
   runs the peers headless and read-only (`claude -p --permission-mode plan`,
   `codex exec` with a read-only sandbox, `agy --mode plan --sandbox`), resuming each peer's
   conversation every round.
-- **Safety in the server:** peer text is returned as `trust: "peer_data"` inside visible fences;
-  only the CLI posts `trust: "human"`. Round caps, message caps (`THREAD_LIMIT_REACHED` until
-  Ashley runs `resume`), deadlines, job de-duplication and a repo allowlist.
+- **Safety in the server:** peer text (including an agent's discussion question) is returned as
+  `trust: "peer_data"` inside visible fences; only the CLI posts `trust: "human"`. Round caps,
+  message caps (`THREAD_LIMIT_REACHED` until Ashley runs `resume`), deadlines and job
+  de-duplication. Jobs whose worker died are reaped, so a crash never wedges a thread.
+- **Headless peers can't use tools that act.** Claude runs with `--strict-mcp-config` and only
+  Read/Grep/Glob/web tools; Codex has every MCP server disabled; and any agent-bus MCP server a
+  peer launches sees `AGENT_BUS_PEER` and refuses every call. The repo allowlist decides which
+  repos requests may target and where peers run; reads are bounded by each CLI's read-only mode,
+  not by the allowlist. (Antigravity's other MCP servers stay loaded in plan mode.)
 
 ## Discussions
 
@@ -37,8 +43,14 @@ waits in its inbox for its vote.
 ## Reviews
 
 `request_review(reviewer, repo, base_commit_id, head_commit_id, …)` pins full commit ids. The worker
-computes `jj diff --from base --to head --git` (or an interdiff from `prev_head_commit_id`), the
-reviewer returns a structured verdict, and it lands as a `review_verdict` in the requester's inbox.
+computes `jj diff --from base --to head --git`, the reviewer returns a structured verdict, and it
+lands as a `review_verdict` in the requester's inbox.
+
+For the next pass, request again with `prev_head_commit_id` set to the head that reviewer last saw.
+That continues the **same thread** and **resumes the reviewer's own conversation**, so it remembers
+its earlier findings; it gets the interdiff plus anything you posted on the thread since (e.g. a
+`send` explaining how each finding was addressed). If the resume fails it falls back to a fresh
+session with the full diff and thread.
 
 ## Watching and stepping in
 
@@ -49,7 +61,11 @@ agent-bus reply t-1a2b3c "Prefer the simpler option" [--to codex]
 agent-bus cancel t-1a2b3c
 agent-bus resume t-1a2b3c --rounds 2
 agent-bus watch t-1a2b3c          # inside Rex: open viewer panes
+agent-bus stream [t-1a2b3c …]     # one line per verdict / final / failure, as each arrives
 ```
+
+`stream` is meant for notifications: each event is one stdout line, so a harness that turns
+lines into alerts (or a plain `while read`) hears about each reviewer as it finishes.
 
 `tail` emits [OSC 7501 program status](https://www.superlogical.com/rex/docs/build/program-status)
 (`working`, `done`, `blocked/question` on `needs_human`), so Rex shows discussion state on any

@@ -55,13 +55,17 @@ def thread_status(bus: Bus, thread: str) -> tuple[str, str | None, str]:
 
 def peer_status(bus: Bus, thread: str, peer: str) -> tuple[str, str | None, str]:
     t = bus.thread(thread)
+    if t["status"] == "cancelled":
+        return "idle", None, f"{peer}: cancelled"
     if t["status"] == "needs_human":
-        return "blocked", "question", f"{peer}: discussion needs Ashley"
-    if bus.peer_busy(thread, peer):
+        return "blocked", "question", f"{peer}: needs Ashley"
+    if bus.peer_busy(thread, peer) and bus.active_job(thread):
         return "working", None, f"{peer}: thinking (round {t['round']})"
     st = bus.standings(thread).get(peer)
-    if t["status"] == "resolved" or (st and st["stance"] == "agree" and t["final_proposal"]):
-        return "done", None, f"{peer}: agreed on {t['final_proposal'] or (st or {}).get('proposal_id')}"
+    if t["status"] == "resolved":
+        if t["kind"] == "review":
+            return "done", None, f"{peer}: review posted"
+        return "done", None, f"{peer}: agreed on {t['final_proposal']}"
     if st:
         return "idle", None, f"{peer}: {st['stance']} {st['proposal_id']}"
     return "idle", None, f"{peer}: waiting"
@@ -99,6 +103,49 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
             if args.once:
                 return 0
             time.sleep(1.0)
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
+    """One line per notable event: verdicts, finals, status changes, failed jobs.
+
+    Built for notification hooks (each stdout line is one event).  Starts from now
+    unless --from-start; with --threads it exits once all of them are closed.
+    """
+    kinds = set(args.kinds.split(","))
+    wanted = set(args.threads or [])
+    row = bus._one("SELECT COALESCE(MAX(id), 0) AS m FROM messages")
+    last_msg = 0 if args.from_start else row["m"]
+    status: dict[str, str] = {}
+    jobs: dict[str, str] = {}
+    first = True
+    try:
+        while True:
+            for r in bus._all("SELECT id FROM messages WHERE id>? ORDER BY id", last_msg):
+                m = bus.message(r["id"])
+                last_msg = m["id"]
+                if (wanted and m["thread_id"] not in wanted) or m["kind"] not in kinds:
+                    continue
+                who = "Ashley" if m["sender"] == HUMAN else m["sender"]
+                extra = m["data"].get("verdict") or m["data"].get("proposal_id") or ""
+                summary = " ".join(m["body"].split())[:200]
+                print(f"{m['kind'].upper()} {m['thread_id']} {who} {extra}: {summary}".replace("  ", " "), flush=True)
+            for t in bus.threads(include_closed=True, limit=200):
+                if wanted and t["id"] not in wanted:
+                    continue
+                if status.get(t["id"]) != t["status"] and not first and t["status"] != "open":
+                    print(f"THREAD {t['id']} {t['status']}: {t['goal'][:120]}", flush=True)
+                status[t["id"]] = t["status"]
+                for j in bus.jobs(t["id"]):
+                    if j["status"] == "failed" and jobs.get(j["id"]) != "failed" and not first:
+                        print(f"JOB_FAILED {t['id']} {j['id']}: {(j['error'] or '')[:200]}", flush=True)
+                    jobs[j["id"]] = j["status"]
+            first = False
+            if wanted and all(status.get(t) in ("resolved", "needs_human", "cancelled") for t in wanted) \
+                    and not any(bus.active_job(t) for t in wanted):
+                return 0
+            time.sleep(args.interval)
     except KeyboardInterrupt:
         return 0
 
@@ -165,6 +212,13 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--no-status", action="store_true", help="don't emit OSC 7501 status")
     s.add_argument("--no-color", action="store_true")
 
+    s = sub.add_parser("stream", help="print one line per verdict/final/status change (for notifications)")
+    s.add_argument("threads", nargs="*", help="only these threads; exit once they're all closed")
+    s.add_argument("--kinds", default="review_verdict,final",
+                   help="message kinds to report (default: review_verdict,final)")
+    s.add_argument("--from-start", action="store_true", help="also report existing messages")
+    s.add_argument("--interval", type=float, default=2.0)
+
     s = sub.add_parser("reply", help="post to a thread as Ashley")
     s.add_argument("thread")
     s.add_argument("body")
@@ -211,6 +265,8 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         return cmd_ask(bus, args)
     if args.cmd == "tail":
         return cmd_tail(bus, args)
+    if args.cmd == "stream":
+        return cmd_stream(bus, args)
     if args.cmd == "threads":
         ts = bus.threads(include_closed=args.all)
         if args.json:

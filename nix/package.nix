@@ -1,4 +1,4 @@
-{ lib, python3Packages, jujutsu }:
+{ lib, python3Packages, jujutsu, git }:
 
 python3Packages.buildPythonApplication {
   pname = "agent-bus";
@@ -13,6 +13,10 @@ python3Packages.buildPythonApplication {
 
   build-system = [ python3Packages.setuptools ];
   dependencies = [ python3Packages.mcp ];
+
+  # Reviews diff pinned commits with jj (git as a fallback), so both are on the
+  # wrapped program's PATH rather than assumed to be installed.
+  makeWrapperArgs = [ "--suffix" "PATH" ":" (lib.makeBinPath [ jujutsu git ]) ];
 
   nativeCheckInputs = [ python3Packages.pytestCheckHook jujutsu ];
   # The review test makes a throwaway jj repo; jj wants a user and a writable home.

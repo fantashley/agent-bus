@@ -6,6 +6,7 @@ Ashley (CLI, ``agent="human"``).  Results are plain dicts ready to serialise.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -16,6 +17,7 @@ from . import rex, worker
 from .db import HUMAN, SYSTEM, Bus, BusError, wrap_peer
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+CHANGE_RE = re.compile(r"^[a-z0-9]{1,64}$")
 
 
 def present(m: dict) -> dict:
@@ -37,6 +39,9 @@ def present(m: dict) -> dict:
 def thread_summary(t: dict) -> dict:
     keys = ("id", "kind", "goal", "participants", "initiator", "status", "round", "max_rounds")
     out = {k: t[k] for k in keys}
+    if t["initiator"] not in (HUMAN, SYSTEM, None):
+        # An agent wrote the goal; label it so it isn't read as an instruction.
+        out["goal"] = wrap_peer(t["initiator"], t["goal"])
     if t["deadline"]:
         out["deadline"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t["deadline"]))
     if t["final_proposal"]:
@@ -148,8 +153,13 @@ class Service:
             max_messages=max(self.config.max_messages, rounds * len(participants) * 3),
             deadline=time.time() + minutes * 60, repo=repo_path,
             refs={"context_refs": context_refs} if context_refs else None)
-        self.bus.post(t["id"], SYSTEM, f"Discussion started by "
-                      f"{'Ashley' if self.agent == HUMAN else self.agent}: {question.strip()}", kind="status")
+        if self.agent == HUMAN:
+            self.bus.post(t["id"], HUMAN, question.strip())
+        else:
+            # The question is the initiator's own text: it stays peer_data, never system.
+            self.bus.post(t["id"], self.agent, question.strip(), session_id=self.session_id)
+        self.bus.post(t["id"], SYSTEM, f"Discussion started by {'Ashley' if self.agent == HUMAN else self.agent} "
+                      f"with {', '.join(participants)}; up to {rounds} rounds.", kind="status")
         job = self._dispatch(t["id"], "discussion", {"mode": "start"}, f"{t['id']}:start")
         res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(t["id"])), "job": job}
         if self.agent != HUMAN:
@@ -184,25 +194,53 @@ class Service:
                             ("prev_head_commit_id", prev_head_commit_id)):
             if value is not None and not COMMIT_RE.match(value):
                 raise ValueError(f"{name} must be a full 40-character commit id")
+        if change_id is not None and not CHANGE_RE.match(change_id):
+            raise ValueError("change_id must be a jj change id (lowercase letters and digits)")
         repo_path = self._allowed_repo(repo)
         refs = {"reviewer": reviewer, "repo": repo_path, "change_id": change_id,
                 "base_commit_id": base_commit_id, "head_commit_id": head_commit_id,
                 "prev_head_commit_id": prev_head_commit_id, "focus": focus}
-        goal = f"Review {change_id or head_commit_id[:12]} in {os.path.basename(repo_path)}"
-        t = self.bus.create_thread("review", goal, [self.agent, reviewer], initiator=self.agent,
-                                   initiator_session=self.session_id, max_rounds=1,
-                                   max_messages=self.config.max_messages, repo=repo_path, refs=refs,
-                                   deadline=time.time() + self.config.turn_timeout_s * 2)
-        job = self._dispatch(t["id"], "review", {},
-                             f"review:{repo_path}:{reviewer}:{prev_head_commit_id or base_commit_id}:{head_commit_id}")
-        if job.get("deduplicated"):
-            # The same review is already queued or done; drop the empty thread we just made.
-            self.bus.set_thread(t["id"], status="cancelled")
-            existing = self.bus.thread(job["thread"])
-            return {"thread": thread_summary(existing), "job": job,
-                    "next": f"Already requested. Call wait(\"{existing['id']}\") for the verdict."}
+        # The requester is part of the key: two agents asking for the same review each get
+        # their own thread, so each verdict reaches the agent that asked.
+        key = (f"review:{self.agent}:{repo_path}:{reviewer}:"
+               f"{prev_head_commit_id or base_commit_id}:{head_commit_id}")
+        previous = self._previous_review(reviewer, repo_path, prev_head_commit_id) if prev_head_commit_id else None
+        if previous:
+            # Follow-up pass: same thread, so the worker resumes the reviewer's conversation.
+            t = previous
+            job_row, created = self.bus.create_job(t["id"], "review", {"mode": "followup"}, key)
+            if created:
+                self.bus.set_thread(t["id"], refs=json.dumps(refs), status="open", round=t["round"] + 1,
+                                    goal=f"Review {change_id or head_commit_id[:12]} in {os.path.basename(repo_path)}")
+                if focus:
+                    self.bus.post(t["id"], self.agent, focus, session_id=self.session_id, recipient=reviewer)
+                worker.spawn(job_row["id"])
+            job = self._job_info(job_row, created)
+        else:
+            goal = f"Review {change_id or head_commit_id[:12]} in {os.path.basename(repo_path)}"
+            t = self.bus.create_thread("review", goal, [self.agent, reviewer], initiator=self.agent,
+                                       initiator_session=self.session_id, max_rounds=1,
+                                       max_messages=self.config.max_messages, repo=repo_path, refs=refs)
+            t["round"] = 1
+            self.bus.set_thread(t["id"], round=1)
+            job = self._dispatch(t["id"], "review", {"mode": "first"}, key)
+            if job.get("deduplicated"):
+                self.bus.set_thread(t["id"], status="cancelled")
+                t = self.bus.thread(job["thread"])
+        t = self.bus.thread(t["id"])
         return {"thread": thread_summary(t), "job": job,
                 "next": f"Call wait(\"{t['id']}\") for the verdict, or check inbox later."}
+
+    def _previous_review(self, reviewer: str, repo: str, prev_head: str) -> dict | None:
+        """The requester's latest review thread with this reviewer whose head was ``prev_head``."""
+        for r in self.bus._all("SELECT id FROM threads WHERE kind='review' AND initiator=? AND repo=?"
+                               " ORDER BY created_at DESC", self.agent, repo):
+            t = self.bus.thread(r["id"])
+            refs = t["refs"] or {}
+            if refs.get("reviewer") == reviewer and refs.get("head_commit_id") == prev_head \
+                    and t["status"] != "cancelled":
+                return t
+        return None
 
     def resume(self, thread: str, extra_rounds: int = 2) -> dict:
         """Human only: lift the turn cap and give a stalled discussion more rounds."""
@@ -219,11 +257,14 @@ class Service:
             fields["max_rounds"] = max(t["max_rounds"], t["round"]) + extra_rounds
             fields["deadline"] = time.time() + self.config.deadline_minutes * 60
         self.bus.set_thread(thread, **fields)
-        self.bus.post(thread, SYSTEM, f"Resumed by Ashley with {extra_rounds} more round(s).", kind="status")
+        self.bus.post(thread, SYSTEM, f"Resumed by Ashley with {extra_rounds} more round(s)."
+                      if t["kind"] == "discussion" else "Resumed by Ashley.", kind="status")
         res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(thread))}
         if t["kind"] == "discussion":
             res["job"] = self._dispatch(thread, "discussion", {"mode": "start_later"},
                                         f"{thread}:resume:{time.time():.0f}")
+        elif t["kind"] == "review" and t["status"] == "needs_human":
+            res["job"] = self._dispatch(thread, "review", {"mode": "retry"}, f"{thread}:retry:{time.time():.0f}")
         return res
 
     def cancel(self, thread: str) -> dict:
@@ -254,5 +295,9 @@ class Service:
         job, created = self.bus.create_job(thread, kind, params, dedupe_key)
         if created:
             worker.spawn(job["id"])
+        return self._job_info(job, created)
+
+    @staticmethod
+    def _job_info(job: dict, created: bool) -> dict:
         return {"id": job["id"], "thread": job["thread_id"], "status": job["status"],
                 **({} if created else {"deduplicated": True})}

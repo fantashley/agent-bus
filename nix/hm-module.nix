@@ -57,7 +57,8 @@ let
   '';
 
   hasDotfilesClaude = options ? local && options.local ? claude
-    && options.local.claude ? enabledPlugins;
+    && options.local.claude ? enabledPlugins
+    && options.local.claude ? extraKnownMarketplaces;
   defaultAntigravity = (options ? local && options.local ? antigravity)
     && config.local.antigravity.enable or false;
 in
@@ -77,8 +78,11 @@ in
       default = [ ];
       example = [ "~/dotfiles" "~/src" ];
       description = ''
-        Repositories (or parent directories) that headless peers may read for
-        discussions and reviews. Anything outside this list is refused.
+        Repositories (or parent directories) that discussions and reviews may
+        target. A request naming a repo outside this list is refused, and peers
+        run with that repo as their working directory. This is not a read
+        sandbox: what a peer can read is governed by its own CLI's read-only
+        mode (plan mode / read-only sandbox).
       '';
     };
 
@@ -130,7 +134,10 @@ in
     })
 
     (lib.mkIf cfg.codex.enable {
-      home.activation.agentBusCodex = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+      # After installPackages so a codex installed in this same generation is
+      # found, with the profile on PATH because activation's own PATH is minimal.
+      home.activation.agentBusCodex = lib.hm.dag.entryAfter [ "writeBoundary" "installPackages" ] ''
+        PATH="${config.home.profileDirectory}/bin:/etc/profiles/per-user/${config.home.username}/bin:$PATH"
         if command -v codex >/dev/null 2>&1; then
           current=$(codex mcp get agent-bus --json 2>/dev/null \
             | ${lib.getExe pkgs.jq} -c '[.transport.command, .transport.args]' 2>/dev/null || true)

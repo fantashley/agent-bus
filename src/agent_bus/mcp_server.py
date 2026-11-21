@@ -37,11 +37,18 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
         raise SystemExit(f"--agent must be one of {', '.join(cfg.AGENTS)}")
     bus = bus or Bus()
     cwd = os.getcwd()
-    session_id = bus.register_session(agent, cwd=cwd, repo=cfg.repo_root(cwd), role=role)
+    # Set by the worker on headless peers: they contribute only through their reply,
+    # never through tools (no posting, no new jobs, no peeking at blind proposals).
+    peer_job = os.environ.get("AGENT_BUS_PEER")
+    session_id = None if peer_job else bus.register_session(agent, cwd=cwd, repo=cfg.repo_root(cwd), role=role)
     svc = service.Service(bus, agent=agent, session_id=session_id)
     mcp = MCPServer(name="agent-bus", instructions=INSTRUCTIONS)
 
     def call(fn, *args, **kwargs) -> dict[str, Any]:
+        if peer_job:
+            return {"error": "PEER_READ_ONLY",
+                    "message": "You are running as a headless agent-bus peer; your reply is posted for you. "
+                               "agent-bus tools are disabled in this session."}
         bus.touch_session(session_id)
         try:
             return fn(*args, **kwargs)
@@ -132,8 +139,10 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
                        focus: str | None = None) -> dict[str, Any]:
         """Ask another agent for a read-only review of a pinned change in an allow-listed repo.
 
-        Pin full commit ids (`jj log -r @ -T commit_id`). A new head needs a new request; pass the
-        previously reviewed head as prev_head_commit_id to get an interdiff review.
+        Pin full commit ids (`jj log --no-graph -r @ -T commit_id`). For a follow-up pass, pass the
+        head that reviewer last reviewed as prev_head_commit_id: the request continues the same
+        review thread and resumes the reviewer's own conversation, so it keeps its earlier
+        findings and sees only the interdiff plus any replies you posted on the thread.
         """
         return call(svc.request_review, reviewer=reviewer, repo=repo, change_id=change_id,
                     base_commit_id=base_commit_id, head_commit_id=head_commit_id,

@@ -17,6 +17,15 @@ agent = os.environ["FAKE_AGENT"]
 behaviour = os.environ.get("FAKE_BEHAVIOUR", "consensus")
 argv = sys.argv[1:]
 
+if agent == "codex" and argv[:2] == ["mcp", "list"]:
+    print(json.dumps([{"name": "agent-bus", "enabled": True}, {"name": "github", "enabled": True},
+                      {"name": "off", "enabled": False}]))
+    sys.exit(0)
+
+if behaviour == "hang":
+    import time
+    time.sleep(60)  # never reads stdin, never writes stdout
+
 if agent == "antigravity":
     prompt = argv[argv.index("--print") + 1]
 else:
@@ -25,7 +34,8 @@ else:
 log = os.environ.get("FAKE_LOG")
 if log:
     with open(log, "a") as f:
-        f.write(json.dumps({"agent": agent, "argv": argv, "prompt": prompt}) + "\n")
+        f.write(json.dumps({"agent": agent, "argv": argv, "prompt": prompt,
+                            "peer_env": os.environ.get("AGENT_BUS_PEER")}) + "\n")
 
 if behaviour == "review" or "Diff from base to head" in prompt or "Interdiff" in prompt:
     reply = 'Looks fine.\n{"verdict": "request_changes", "summary": "one bug", "findings": [{"file": "a.txt", "line": 1, "severity": "high", "comment": "typo"}]}'

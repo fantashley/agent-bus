@@ -66,33 +66,22 @@ class Adapter:
         raise NotImplementedError
 
     def run(self, prompt: str, cwd: str, timeout: float, emit: Emit, resume_id: str | None = None,
-            add_dirs: list[str] | None = None, cancelled: Callable[[], bool] = lambda: False) -> TurnResult:
+            add_dirs: list[str] | None = None, cancelled: Callable[[], bool] = lambda: False,
+            peer_tag: str = "1") -> TurnResult:
         inv = self.invocation(prompt, resume_id, cwd, add_dirs or [])
         st = StreamState(external_id=inv.external_id)
+        # Any agent-bus MCP server the peer CLI launches sees this and refuses every tool,
+        # so a headless peer can't post, start jobs, or read blind proposals.
+        env = {**os.environ, "AGENT_BUS_PEER": peer_tag}
         try:
             proc = subprocess.Popen(
                 inv.argv, cwd=cwd, stdin=subprocess.PIPE if inv.stdin is not None else subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, env=env)
         except OSError as e:
             return TurnResult(ok=False, error=f"could not start {inv.argv[0]}: {e}")
 
-        stderr_tail: list[str] = []
-
-        def pump_stderr() -> None:
-            assert proc.stderr
-            for line in proc.stderr:
-                stderr_tail.append(line)
-                del stderr_tail[:-40]
-
-        threading.Thread(target=pump_stderr, daemon=True).start()
-        if inv.stdin is not None:
-            assert proc.stdin
-            try:
-                proc.stdin.write(inv.stdin)
-                proc.stdin.close()
-            except BrokenPipeError:
-                pass
-
+        # Supervision starts before any I/O, so a peer that never reads stdin or never
+        # writes stdout still hits the timeout and cancellation.
         timed_out = False
         killer_done = threading.Event()
 
@@ -106,6 +95,27 @@ class Adapter:
                     return
 
         threading.Thread(target=watchdog, daemon=True).start()
+
+        stderr_tail: list[str] = []
+
+        def pump_stderr() -> None:
+            assert proc.stderr
+            for line in proc.stderr:
+                stderr_tail.append(line)
+                del stderr_tail[:-40]
+
+        threading.Thread(target=pump_stderr, daemon=True).start()
+
+        def feed_stdin() -> None:
+            assert proc.stdin
+            try:
+                proc.stdin.write(inv.stdin or "")
+                proc.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+        if inv.stdin is not None:
+            threading.Thread(target=feed_stdin, daemon=True).start()
         assert proc.stdout
         for line in proc.stdout:
             line = line.strip()
@@ -152,14 +162,15 @@ def _short(text: str, n: int = 240) -> str:
 class ClaudeAdapter(Adapter):
     agent = "claude"
     default_command = "claude"
-    # Read-only tools only; `jj`/`git` inspection is allowed for reviews.
-    allowed_tools = ["Read", "Grep", "Glob", "WebSearch", "WebFetch",
-                     "Bash(jj diff:*)", "Bash(jj show:*)", "Bash(jj log:*)", "Bash(jj file show:*)",
-                     "Bash(git diff:*)", "Bash(git show:*)", "Bash(git log:*)"]
+    # Read-only tools only. No Bash at all: `jj`/`git` accept flags (--tool, --output,
+    # --ext-diff) that run commands or write files, and reviews get the diff in the prompt.
+    allowed_tools = ["Read", "Grep", "Glob", "WebSearch", "WebFetch"]
 
     def invocation(self, prompt, resume_id, cwd, add_dirs):
+        # --strict-mcp-config with no --mcp-config loads no MCP servers at all.
         argv = [self.command, "-p", "--output-format", "stream-json", "--verbose",
-                "--permission-mode", "plan", "--allowedTools", *self.allowed_tools]
+                "--permission-mode", "plan", "--strict-mcp-config",
+                "--allowedTools", ",".join(self.allowed_tools)]
         for d in add_dirs:
             argv += ["--add-dir", d]
         sid = resume_id
@@ -195,9 +206,25 @@ class CodexAdapter(Adapter):
     agent = "codex"
     default_command = "codex"
 
+    def mcp_servers(self) -> list[str]:
+        try:
+            out = subprocess.run([self.command, "mcp", "list", "--json"], capture_output=True, text=True,
+                                 timeout=30)
+            data = json.loads(out.stdout) if out.returncode == 0 else []
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            data = []
+        # Only servers that exist: overriding a missing one creates a half-defined entry
+        # that codex rejects ("invalid transport").  agent-bus itself is also covered by
+        # the AGENT_BUS_PEER guard even if it isn't listed here.
+        return sorted({d["name"] for d in data
+                       if isinstance(d, dict) and isinstance(d.get("name"), str) and d.get("enabled", True)})
+
     def invocation(self, prompt, resume_id, cwd, add_dirs):
         common = ["--json", "--skip-git-repo-check", "-c", 'sandbox_mode="read-only"',
                   "-c", 'approval_policy="never"']
+        # The read-only sandbox doesn't cover MCP side effects, so switch every server off.
+        for name in self.mcp_servers():
+            common += ["-c", f"mcp_servers.{json.dumps(name)}.enabled=false"]
         if resume_id:
             argv = [self.command, "exec", "resume", *common, *self.extra, resume_id, "-"]
         else:
