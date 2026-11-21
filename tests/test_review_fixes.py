@@ -401,3 +401,75 @@ def test_stream_reports_each_verdict(env, no_spawn, capsys):
     assert main(["stream", tid, "--from-start", "--interval", "0.1"]) == 0
     out = capsys.readouterr().out
     assert "REVIEW_VERDICT" in out and "approve" in out
+
+
+# ---- review pass 3 ----------------------------------------------------------
+
+def test_concurrent_followups_cannot_retarget_a_pending_review(env, no_spawn):
+    from agent_bus.db import Bus
+    bus = env["bus"]
+    sha, h1, h2, h3 = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), sha, h1)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    bus.transition(tid, "resolved")
+    results, barrier = {}, threading.Barrier(2)
+
+    def follow(head, note):
+        own = Bus(bus.path)  # separate connection, like a second MCP server process
+        svc = Service(own, "claude", own.register_session("claude"))
+        barrier.wait()
+        try:
+            results[head] = svc.request_review("codex", str(env["repo"]), sha, head, prev_head_commit_id=h1,
+                                               focus=note)
+        except BusError as e:
+            results[head] = e.code
+        finally:
+            own.close()
+
+    ts = [threading.Thread(target=follow, args=(h, f"note-{h[0]}")) for h in (h2, h3)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    winners = [h for h, r in results.items() if isinstance(r, dict)]
+    losers = [r for r in results.values() if not isinstance(r, dict)]
+    assert len(winners) == 1 and losers and losers[0] in ("REVIEW_BUSY", "REVIEW_STALE")
+    t = bus.thread(tid)
+    assert t["refs"]["head_commit_id"] == winners[0]
+    notes = [m for m in bus.history(tid)["messages"] if m["body"].startswith("note-")]
+    assert len(notes) == 1 and notes[0]["body"] == f"note-{winners[0][0]}"
+
+
+def test_delivery_continues_past_500_messages(env, no_spawn):
+    bus = env["bus"]
+    tid = Service(bus, HUMAN).start_discussion("Q?", peers=["codex"])["thread"]["id"]
+    for i in range(600):
+        bus.post(tid, HUMAN, f"human-{i}")
+    assert len(bus.history(tid)["messages"]) > 600
+    w = Worker(bus, bus.jobs(tid)[0]["id"])
+    assert bus.claim_job(w.job["id"], w.owner)
+    bus.set_peer_session(tid, "codex", "sess")
+    bus.mark_delivered(tid, "codex", bus.history(tid)["messages"][550]["id"])
+    prompt, _fresh, upto = w.later_prompt("codex")
+    assert "human-599" in prompt and upto == bus.history(tid)["messages"][-1]["id"]
+
+
+def test_stream_reports_failure_it_reaps_itself(env, no_spawn, capsys):
+    bus = env["bus"]
+    tid = Service(bus, HUMAN).start_discussion("Q?", peers=["codex"])["thread"]["id"]
+    bus.claim_job(bus.jobs(tid)[0]["id"], "dead", lease_s=-1)  # worker died; nobody has reaped it yet
+    from agent_bus.cli import main
+    assert main(["stream", tid, "--interval", "0.1"]) == 0
+    assert "JOB_FAILED" in capsys.readouterr().out
+
+
+def test_limit_survives_enclosing_transaction_rollback(env, no_spawn):
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.send("1", to="codex")["thread"]["id"]
+    bus.set_thread(tid, max_messages=1)
+    with pytest.raises(BusError):
+        with bus.tx():
+            bus.post(tid, "claude", "2")
+    assert bus.thread(tid)["limit_reached"] == 1
+    Service(bus, HUMAN).resume(tid)
+    assert bus.thread(tid)["limit_reached"] == 0

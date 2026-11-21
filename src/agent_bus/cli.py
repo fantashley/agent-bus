@@ -118,7 +118,10 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
     row = bus._one("SELECT COALESCE(MAX(id), 0) AS m FROM messages")
     last_msg = 0 if args.from_start else row["m"]
     status: dict[str, str] = {}
-    jobs: dict[str, str] = {}
+    # Failures that predate this stream are history; anything that fails after it starts,
+    # including a dead worker this stream's own reap() discovers, is reported.
+    preexisting = {r["id"] for r in bus._all("SELECT id FROM jobs WHERE status='failed'")}
+    reported: set[str] = set()
     first = True
     one_line = lambda text, n: " ".join(str(text).split())[:n]  # noqa: E731
 
@@ -153,9 +156,9 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
                     print(one_line(f"THREAD {t['id']} {t['status']}: {t['goal']}", 200), flush=True)
                 status[t["id"]] = t["status"]
                 for j in bus.jobs(t["id"]):
-                    if j["status"] == "failed" and jobs.get(j["id"]) != "failed" and not first:
+                    if j["status"] == "failed" and j["id"] not in preexisting and j["id"] not in reported:
+                        reported.add(j["id"])
                         print(one_line(f"JOB_FAILED {t['id']} {j['id']}: {j['error'] or ''}", 300), flush=True)
-                    jobs[j["id"]] = j["status"]
             first = False
             if wanted and all(settled(t) for t in wanted):
                 drain()  # a verdict posted just before the thread closed is still reported

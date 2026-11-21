@@ -318,6 +318,11 @@ class Bus:
         t = dict(row)
         t["participants"] = json.loads(t["participants"])
         t["refs"] = _loads(t["refs"])
+        # Derived, not stored: a stored flag could be rolled back with an enclosing
+        # transaction.  Ashley's `resume` lifts it by raising max_messages.
+        t["agent_messages"] = self._one(
+            "SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender NOT IN (?,?)", tid, HUMAN, SYSTEM)["n"]
+        t["limit_reached"] = int(t["agent_messages"] >= t["max_messages"])
         return t
 
     def threads(self, include_closed: bool = False, agent_type: str | None = None,
@@ -362,14 +367,7 @@ class Bus:
         """Append a message, applying protocol rules.  Returns the stored message."""
         if kind not in KINDS:
             raise BusError("BAD_KIND", f"kind must be one of {', '.join(KINDS)}")
-        data = dict(data or {})
-        try:
-            return self._post(thread_id, sender, body, kind, session_id, recipient, data)
-        except BusError as e:
-            if e.code == "THREAD_LIMIT_REACHED":
-                # Recorded outside the rolled-back transaction so the cap sticks.
-                self.set_thread(thread_id, limit_reached=1)
-            raise
+        return self._post(thread_id, sender, body, kind, session_id, recipient, dict(data or {}))
 
     def _post(self, thread_id: str, sender: str, body: str, kind: str, session_id: str | None,
               recipient: str | None, data: dict) -> dict:
@@ -380,11 +378,6 @@ class Bus:
                 if t["status"] == "cancelled":
                     raise BusError("THREAD_CANCELLED", f"thread {thread_id} was cancelled")
                 if t["limit_reached"]:
-                    raise BusError("THREAD_LIMIT_REACHED",
-                                   f"thread {thread_id} hit its budget; waiting for a human `agent-bus resume`")
-                count = self._one("SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender NOT IN (?,?)",
-                                  thread_id, HUMAN, SYSTEM)["n"]
-                if count >= t["max_messages"]:
                     raise BusError("THREAD_LIMIT_REACHED",
                                    f"thread {thread_id} reached {t['max_messages']} agent messages; "
                                    "waiting for a human `agent-bus resume`")
@@ -537,10 +530,11 @@ class Bus:
         return out, blind
 
     def history(self, thread_id: str, viewer: str | None = None, after_id: int = 0,
-                limit: int = 500) -> dict:
+                limit: int | None = None) -> dict:
+        """Messages after ``after_id``; all of them unless ``limit`` is given."""
         t = self.thread(thread_id)
         rows = self._all("SELECT * FROM messages WHERE thread_id=? AND id>? ORDER BY id LIMIT ?",
-                         thread_id, after_id, limit)
+                         thread_id, after_id, -1 if limit is None else limit)
         msgs, blind = self._visible(t, rows, viewer)
         return {"thread": t, "messages": msgs, "blind": blind}
 

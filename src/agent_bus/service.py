@@ -207,15 +207,23 @@ class Service:
         previous = self._previous_review(reviewer, repo_path, prev_head_commit_id) if prev_head_commit_id else None
         if previous:
             # Follow-up pass: same thread, so the worker resumes the reviewer's conversation.
-            t = previous
-            active = self.bus.active_job(t["id"])
-            if active and active["dedupe_key"] != key:
-                raise BusError("REVIEW_BUSY", f"{reviewer} is still on the previous pass ({t['id']}); "
-                               "wait for that verdict, then request this head again")
-            if active:
-                job = self._job_info(active, False)
-            else:
-                with self.bus.tx():  # all-or-nothing: the note, the new refs and the job
+            # Everything is decided and written in one IMMEDIATE transaction: concurrent
+            # follow-ups serialize, and a loser changes nothing.
+            self.bus.reap()
+            with self.bus.tx():
+                t = self.bus.thread(previous["id"])
+                current = (t["refs"] or {}).get("head_commit_id")
+                active = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND status IN ('queued','running')",
+                                       t["id"])
+                if active and active["dedupe_key"] == key:
+                    job_row, created = self.bus._job(active), False  # this exact request is already queued
+                elif active:
+                    raise BusError("REVIEW_BUSY", f"{reviewer} is still on a previous pass ({t['id']}); "
+                                   "wait for that verdict, then request this head again")
+                elif current != prev_head_commit_id:
+                    raise BusError("REVIEW_STALE", f"{t['id']} has moved on to head {str(current)[:12]}; "
+                                   "use that as prev_head_commit_id")
+                else:
                     if focus:
                         self.bus.post(t["id"], self.agent, focus, session_id=self.session_id, recipient=reviewer)
                     self.bus.set_thread(t["id"], refs=json.dumps(refs), status="open", round=t["round"] + 1,
@@ -223,9 +231,9 @@ class Service:
                                         goal=f"Review {change_id or head_commit_id[:12]} in "
                                              f"{os.path.basename(repo_path)}")
                     job_row, created = self.bus.create_job(t["id"], "review", {"mode": "followup"}, key)
-                if created:
-                    worker.spawn(job_row["id"])
-                job = self._job_info(job_row, created)
+            if created:
+                worker.spawn(job_row["id"])
+            job = self._job_info(job_row, created)
         else:
             goal = f"Review {change_id or head_commit_id[:12]} in {os.path.basename(repo_path)}"
             t = self.bus.create_thread("review", goal, [self.agent, reviewer], initiator=self.agent,
@@ -259,7 +267,7 @@ class Service:
         t = self.bus.thread(thread)
         if t["status"] in ("resolved",):
             raise BusError("THREAD_CLOSED", "thread is already resolved")
-        fields: dict[str, Any] = {"limit_reached": 0, "status": "open"}
+        fields: dict[str, Any] = {"status": "open"}
         count = self.bus._one("SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender NOT IN (?,?)",
                               thread, HUMAN, SYSTEM)["n"]
         fields["max_messages"] = max(t["max_messages"], count + self.config.max_messages)
