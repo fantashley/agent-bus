@@ -136,6 +136,13 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
             extra = m["data"].get("verdict") or m["data"].get("proposal_id") or ""
             print(one_line(f"{m['kind'].upper()} {m['thread_id']} {who} {extra}: {m['body']}", 300), flush=True)
 
+    def failures() -> None:
+        for tid in (wanted or [t["id"] for t in bus.threads(include_closed=True, limit=200)]):
+            for j in bus.jobs(tid):
+                if j["status"] == "failed" and j["id"] not in preexisting and j["id"] not in reported:
+                    reported.add(j["id"])
+                    print(one_line(f"JOB_FAILED {tid} {j['id']}: {j['error'] or ''}", 300), flush=True)
+
     def settled(tid: str) -> bool:
         """Closed, or open with no worker left and its last job failed (nothing more will come)."""
         if bus.active_job(tid):
@@ -155,13 +162,13 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
                 if status.get(t["id"]) != t["status"] and not first and t["status"] != "open":
                     print(one_line(f"THREAD {t['id']} {t['status']}: {t['goal']}", 200), flush=True)
                 status[t["id"]] = t["status"]
-                for j in bus.jobs(t["id"]):
-                    if j["status"] == "failed" and j["id"] not in preexisting and j["id"] not in reported:
-                        reported.add(j["id"])
-                        print(one_line(f"JOB_FAILED {t['id']} {j['id']}: {j['error'] or ''}", 300), flush=True)
+            failures()
             first = False
             if wanted and all(settled(t) for t in wanted):
-                drain()  # a verdict posted just before the thread closed is still reported
+                # Settling may itself have reaped a job, and a verdict may have landed just
+                # before the thread closed: report both before exiting.
+                failures()
+                drain()
                 return 0
             time.sleep(args.interval)
     except KeyboardInterrupt:

@@ -199,19 +199,21 @@ class Service:
         repo_path = self._allowed_repo(repo)
         refs = {"reviewer": reviewer, "repo": repo_path, "change_id": change_id,
                 "base_commit_id": base_commit_id, "head_commit_id": head_commit_id,
-                "prev_head_commit_id": prev_head_commit_id, "focus": focus}
+                "prev_head_commit_id": prev_head_commit_id, "focus": focus,
+                "heads": [head_commit_id]}  # every head this thread has been asked to review
         # The requester is part of the key: two agents asking for the same review each get
         # their own thread, so each verdict reaches the agent that asked.
         key = (f"review:{self.agent}:{repo_path}:{reviewer}:"
                f"{prev_head_commit_id or base_commit_id}:{head_commit_id}")
-        previous = self._previous_review(reviewer, repo_path, prev_head_commit_id) if prev_head_commit_id else None
-        if previous:
-            # Follow-up pass: same thread, so the worker resumes the reviewer's conversation.
-            # Everything is decided and written in one IMMEDIATE transaction: concurrent
-            # follow-ups serialize, and a loser changes nothing.
-            self.bus.reap()
-            with self.bus.tx():
-                t = self.bus.thread(previous["id"])
+        self.bus.reap()
+        # Follow-up pass: same thread, so the worker resumes the reviewer's conversation.
+        # The lineage lookup and every busy/stale decision and write happen in one IMMEDIATE
+        # transaction, so concurrent follow-ups serialize and a loser changes nothing.
+        with self.bus.tx():
+            previous = (self._previous_review(reviewer, repo_path, prev_head_commit_id)
+                        if prev_head_commit_id else None)
+            if previous:
+                t = previous
                 current = (t["refs"] or {}).get("head_commit_id")
                 active = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND status IN ('queued','running')",
                                        t["id"])
@@ -226,11 +228,13 @@ class Service:
                 else:
                     if focus:
                         self.bus.post(t["id"], self.agent, focus, session_id=self.session_id, recipient=reviewer)
+                    refs["heads"] = [*self._heads(t), head_commit_id]
                     self.bus.set_thread(t["id"], refs=json.dumps(refs), status="open", round=t["round"] + 1,
                                         max_rounds=t["round"] + 1,
                                         goal=f"Review {change_id or head_commit_id[:12]} in "
                                              f"{os.path.basename(repo_path)}")
                     job_row, created = self.bus.create_job(t["id"], "review", {"mode": "followup"}, key)
+        if previous:
             if created:
                 worker.spawn(job_row["id"])
             job = self._job_info(job_row, created)
@@ -249,14 +253,20 @@ class Service:
         return {"thread": thread_summary(t), "job": job,
                 "next": f"Call wait(\"{t['id']}\") for the verdict, or check inbox later."}
 
+    @staticmethod
+    def _heads(t: dict) -> list[str]:
+        refs = t["refs"] or {}
+        return list(refs.get("heads") or [refs.get("head_commit_id")])
+
     def _previous_review(self, reviewer: str, repo: str, prev_head: str) -> dict | None:
-        """The requester's latest review thread with this reviewer whose head was ``prev_head``."""
+        """The requester's review thread with this reviewer that has reviewed ``prev_head``
+        at any point (not only as its current head), so a request based on a head the
+        thread has since moved past is reported as stale instead of starting a new thread."""
         for r in self.bus._all("SELECT id FROM threads WHERE kind='review' AND initiator=? AND repo=?"
                                " ORDER BY created_at DESC", self.agent, repo):
             t = self.bus.thread(r["id"])
-            refs = t["refs"] or {}
-            if refs.get("reviewer") == reviewer and refs.get("head_commit_id") == prev_head \
-                    and t["status"] != "cancelled":
+            if (t["refs"] or {}).get("reviewer") == reviewer and t["status"] != "cancelled" \
+                    and prev_head in self._heads(t):
                 return t
         return None
 

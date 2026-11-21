@@ -473,3 +473,46 @@ def test_limit_survives_enclosing_transaction_rollback(env, no_spawn):
     assert bus.thread(tid)["limit_reached"] == 1
     Service(bus, HUMAN).resume(tid)
     assert bus.thread(tid)["limit_reached"] == 0
+
+
+# ---- review pass 4 ----------------------------------------------------------
+
+@pytest.mark.parametrize("h2_finished", [False, True])
+def test_followup_from_a_superseded_head_never_forks_a_new_thread(env, no_spawn, h2_finished):
+    """Deterministic version of the race: H2 commits first, then H3 arrives with prev_head=H1."""
+    bus = env["bus"]
+    sha, h1, h2, h3 = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), sha, h1)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    bus.transition(tid, "resolved")
+    claude.request_review("codex", str(env["repo"]), sha, h2, prev_head_commit_id=h1)
+    if h2_finished:
+        bus.conn.execute("UPDATE jobs SET status='done'")
+        bus.transition(tid, "resolved")
+    threads_before = len(bus.threads(include_closed=True))
+    with pytest.raises(BusError) as e:
+        claude.request_review("codex", str(env["repo"]), sha, h3, prev_head_commit_id=h1, focus="stale note")
+    assert e.value.code == ("REVIEW_STALE" if h2_finished else "REVIEW_BUSY")
+    assert len(bus.threads(include_closed=True)) == threads_before
+    assert all(m["body"] != "stale note" for m in bus.history(tid)["messages"])
+    assert bus.thread(tid)["refs"]["heads"] == [h1, h2]
+
+
+def test_stream_reports_failure_discovered_while_settling(env, no_spawn, capsys, monkeypatch):
+    from agent_bus.db import Bus
+    bus = env["bus"]
+    tid = Service(bus, HUMAN).start_discussion("Q?", peers=["codex"])["thread"]["id"]
+    jid = bus.jobs(tid)[0]["id"]
+    real_reap, calls = Bus.reap, {"n": 0}
+
+    def reap(self):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the reap inside settled(), after this iteration's failure scan
+            self.conn.execute("UPDATE jobs SET status='failed', error='died just now' WHERE id=?", (jid,))
+        return real_reap(self)
+
+    monkeypatch.setattr(Bus, "reap", reap)
+    from agent_bus.cli import main
+    assert main(["stream", tid, "--interval", "0.1"]) == 0
+    assert "JOB_FAILED" in capsys.readouterr().out
