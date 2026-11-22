@@ -212,6 +212,7 @@ class Bus:
         self.conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._depth = 0
+        self._read_only = False
         self.conn.executescript(SCHEMA)
         self._migrate()
 
@@ -254,6 +255,8 @@ class Bus:
     def tx(self) -> Iterator[_LockedConn]:
         """IMMEDIATE transaction; nested uses join the outer one."""
         with self.conn.lock:
+            if self._read_only:
+                raise RuntimeError("write transaction inside a read snapshot")
             if self._depth:
                 self._depth += 1
                 try:
@@ -272,6 +275,31 @@ class Bus:
             else:
                 self._depth = 0
                 self.conn.execute("COMMIT")
+
+    @contextmanager
+    def snapshot(self) -> Iterator[None]:
+        """A read transaction: every read inside sees one consistent snapshot (WAL),
+        without taking the write lock.  Inside another transaction it just joins it."""
+        with self.conn.lock:
+            if self._depth:
+                yield
+                return
+            # The connection itself refuses writes while the snapshot is open.
+            self.conn.execute("PRAGMA query_only=ON")
+            self.conn.execute("BEGIN DEFERRED")
+            self._depth = 1
+            self._read_only = True
+            try:
+                yield
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+            else:
+                self.conn.execute("COMMIT")
+            finally:
+                self._depth = 0
+                self._read_only = False
+                self.conn.execute("PRAGMA query_only=OFF")
 
     @contextmanager
     def fenced(self, job_id: str, owner: str) -> Iterator[None]:

@@ -137,6 +137,25 @@ lines into alerts (or a plain `while read`) hears about each reviewer as it fini
 client, local or attached to a remote host. Viewer panes are output-only; nothing is ever typed
 into a block. Everything works without Rex.
 
+### When an idle session has mail
+
+Hooks only reach an agent when its client starts or ends a turn. An idle session gets nothing
+until you nudge it, so agent-bus tells *you* instead:
+- **`stream`** prints a `MAIL` line, e.g. `MAIL codex has unread agent-bus mail on t-1a2b3c:
+  session s-… (Rex block:…)`. It's on by default; leave `mail` out of `--kinds` to turn it off.
+  Sessions already waiting when `stream` starts are reported too, since mail is a state, not an
+  event.
+- **`tail`:** while a thread has no worker running and a participant's session has mail on it,
+  its status is `blocked/question` ("codex has mail on t-…").
+- **`tail --notify`** also sends a desktop notification (OSC 777 and OSC 9) for it.
+
+Which mail counts is the same as for hooks (see below). The notice gives only the agent,
+session, thread ids and Rex block, never a sender's text. A session counts only while its client
+process is still running: same pid and start time. Sessions registered by an agent-bus
+version that didn't record this are never announced; restart that client. Each watcher announces a session at most once
+per read position: after a notice, it speaks up again only once the session has read something
+and has mail again. Nothing is ever typed into a terminal, and no mail is marked read.
+
 ## Rex sessions and wake-ups
 
 agent-bus never types into a terminal, its own panes included. All three clients report
