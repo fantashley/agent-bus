@@ -13,10 +13,12 @@ def fake_rex(records, fg_pid, inspect_ok=True):
     def run(argv, **kw):
         calls.append(argv)
         assert argv[0] == "rex" and "write" not in argv and "send" not in argv and "send-key" not in argv
+        assert argv[1] == "--autostart=false"
+        argv = argv[argv.index("block") - 1:]  # drop global flags
         if argv[1:3] == ["block", "inspect"]:
             if not inspect_ok:
                 return subprocess.CompletedProcess(argv, 1, "", "Error: block not found")
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"block": {"label": "codex"}}), "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"block": {"block_id": BLOCK, "label": "codex"}}), "")
         method = argv[3]
         if method == "program_status":
             return subprocess.CompletedProcess(argv, 0, json.dumps({"records": records}), "")
@@ -113,16 +115,16 @@ def test_latest_sessions_one_per_agent(env):
 
 def test_malformed_rex_output_fails_closed(env):
     def run(argv, **kw):
-        if argv[1:3] == ["block", "inspect"]:
+        if "inspect" in argv:
             return subprocess.CompletedProcess(argv, 1, "", "\n")  # whitespace-only stderr
         raise AssertionError(argv)
     r = rexcheck.check(env["bus"], block=BLOCK, agent="codex", run=run)
     assert not r["ok"] and results(r)["block"] == "fail" and results(r)["input_ready"] == "unavailable"
 
     def shapes(argv, **kw):
-        if argv[1:3] == ["block", "inspect"]:
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"block": "weird"}), "")
-        if argv[3] == "program_status":
+        if "inspect" in argv:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"block": {"block_id": BLOCK}}), "")
+        if "program_status" in argv:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"records": "nope"}), "")
         return subprocess.CompletedProcess(argv, 0, "[]", "")
     r = rexcheck.check(env["bus"], block=BLOCK, agent="codex", run=shapes)
@@ -173,3 +175,25 @@ def test_cli_exit_codes_and_json(env, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out[0]["ok"] and out[0]["checks"][-1]["check"] == "input_ready"
     assert cli.main(["rex-check", "--block", BLOCK]) == 2  # --block needs --agent
+
+
+def test_malformed_block_inspect_fails_even_with_good_status(env):
+    good = fake_rex([rec()], 100)
+    for bad in ({}, {"block": "weird"}, {"block": {"label": "x"}}):
+        def run(argv, bad=bad, **kw):
+            if "inspect" in argv:
+                return subprocess.CompletedProcess(argv, 0, json.dumps(bad), "")
+            return good(argv, **kw)
+        r = rexcheck.check(env["bus"], block=BLOCK, agent="codex", run=run)
+        assert not r["ok"] and results(r)["block"] == "fail", bad
+
+
+def test_session_server_is_used_and_never_autostarted(env):
+    bus = env["bus"]
+    sid = bus.register_session("codex", env={"REX_SESSION": "s", "REX_BLOCK": BLOCK, "REX_SERVER": "nuc"})
+    run = fake_rex([rec()], 100)
+    rexcheck.check(bus, session_id=sid, run=run)
+    assert run.calls and all(c[1:4] == ["--autostart=false", "-S", "nuc"] for c in run.calls)
+    run = fake_rex([rec()], 100)
+    rexcheck.check(bus, block=BLOCK, agent="codex", run=run)
+    assert all("-S" not in c for c in run.calls)

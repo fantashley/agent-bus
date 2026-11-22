@@ -9,7 +9,9 @@ missing, malformed or unreadable fails, and input readiness is always reported
 as unavailable, never inferred.
 
 Read-only: it calls ``rex block inspect`` and ``rex block call`` with the
-``program_status`` and ``process`` methods, which don't change the block.
+``program_status`` and ``process`` methods, which don't change the block, with
+``--autostart=false`` so it never starts a Rex server, and ``-S`` with the
+server a session recorded (REX_SERVER), if any.
 """
 
 from __future__ import annotations
@@ -38,9 +40,12 @@ class RexError(Exception):
     pass
 
 
-def _rex(run: Runner, *args: str) -> dict:
+def _rex(run: Runner, server: str | None, *args: str) -> dict:
+    # Never start a server (rex autostarts a missing local one by default), and ask the
+    # server the session recorded, not whichever one this shell would pick.
+    argv = ["rex", "--autostart=false", *(["-S", server] if server else []), *args]
     try:
-        out = run(["rex", *args], capture_output=True, text=True, timeout=15)
+        out = run(argv, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RexError(str(e)) from e
     if out.returncode != 0:
@@ -128,6 +133,7 @@ def check(bus: Bus, session_id: str | None = None, block: str | None = None, age
         checks.append({"check": name, "result": result, "detail": detail})
 
     session = None
+    server = None
     if session_id:
         session = bus.session(session_id)
         if not session:
@@ -136,6 +142,7 @@ def check(bus: Bus, session_id: str | None = None, block: str | None = None, age
             raise ValueError(f"session {session_id} is a {session['agent_type']} session, not {agent}")
         agent = session["agent_type"]
         block = block or session["rex_block"]
+        server = session["rex_server"]
         if session["rex_session"] and session["rex_block"]:
             add("rex_env", PASS, "REX_SESSION and REX_BLOCK were recorded when the session registered")
         else:
@@ -159,18 +166,22 @@ def check(bus: Bus, session_id: str | None = None, block: str | None = None, age
         add("block", FAIL, "no Rex block to check")
         return _finish(report)
     try:
-        info = _rex(run, "block", "inspect", block, "--json")
-        meta = info.get("block") if isinstance(info.get("block"), dict) else {}
+        info = _rex(run, server, "block", "inspect", block, "--json")
+        meta = info.get("block")
+        if not isinstance(meta, dict) or not isinstance(meta.get("block_id"), str) or not meta["block_id"]:
+            raise RexError("rex block inspect returned no block id")
         label = meta.get("label")
-        add("block", PASS, "block exists" + (f" (label {label!r})" if isinstance(label, str) and label else ""))
+        add("block", PASS, f"block exists ({meta['block_id']}"
+            + (f", label {label!r})" if isinstance(label, str) and label else ")"))
+        block = meta["block_id"]
     except RexError as e:
         add("block", FAIL, f"can't inspect block: {e}")
         return _finish(report)
 
     app = APPS[agent]
     try:
-        rec = _pick_record(_rex(run, "block", "call", "program_status", "--block", block).get("records"), app)
-        proc = _rex(run, "block", "call", "process", "--block", block)
+        rec = _pick_record(_rex(run, server, "block", "call", "program_status", "--block", block).get("records"), app)
+        proc = _rex(run, server, "block", "call", "process", "--block", block)
     except RexError as e:
         add("app", FAIL, f"can't read the block's status or process: {e}")
         return _finish(report)
