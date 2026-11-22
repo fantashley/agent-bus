@@ -13,6 +13,7 @@ import time
 from typing import Any
 
 from . import config as cfg
+from . import quota
 from . import rex, worker
 from .db import HUMAN, SYSTEM, Bus, BusError, wrap_peer
 
@@ -132,6 +133,16 @@ class Service:
 
     # ------------------------------------------------------------- coordination
 
+    def _quota_block(self, agent: str, override: dict | None = None) -> dict | None:
+        model = quota.effective_model(self.config, agent, self.config.peer_settings(agent, override))
+        return self.bus.quota_block(agent, quota.model_key(model))
+
+    def _quota_check(self, agent: str, role: str, override: dict | None = None) -> None:
+        """Fail fast, before any job is queued, when ``agent`` is known to be out of usage."""
+        block = self._quota_block(agent, override)
+        if block:
+            raise BusError("USAGE_EXHAUSTED", quota.message(agent, role, block))
+
     def start_discussion(self, question: str, peers: list[str] | None = None, repo: str | None = None,
                          context_refs: list[str] | None = None, max_rounds: int | None = None,
                          deadline_minutes: int | None = None, watch: bool = False,
@@ -149,16 +160,29 @@ class Service:
             if p == self.agent:
                 raise ValueError("you are already a participant; list only the other agents as peers")
             self.config.require_available(p, "peer")
-        if not peers:
-            if defaulted:
-                which = "no agent" if self.agent == HUMAN else "no other agent"
-                raise ValueError(f"a discussion needs at least one peer ({which} is available on this machine)")
-            raise ValueError("a discussion needs at least one peer")
         settings = {}
         for agent, value in (peer_settings or {}).items():
             if agent not in peers:
                 raise ValueError(f"peer_settings names {agent!r}, which isn't a peer in this discussion")
             settings[agent] = cfg.check_peer_settings(agent, value)
+        # Out of usage: left out of a default roster (and reported), refused when named.
+        skipped: dict[str, dict] = {}
+        for p in list(peers):
+            block = self._quota_block(p, settings.get(p))
+            if block and defaulted:
+                skipped[p] = block
+                peers.remove(p)
+                settings.pop(p, None)
+            elif block:
+                raise BusError("USAGE_EXHAUSTED", quota.message(p, "peer", block))
+        if not peers:
+            if skipped:
+                raise BusError("USAGE_EXHAUSTED", "no peer has usage left: "
+                               + " ".join(quota.message(p, "peer", b) for p, b in skipped.items()))
+            if defaulted:
+                which = "no agent" if self.agent == HUMAN else "no other agent"
+                raise ValueError(f"a discussion needs at least one peer ({which} is available on this machine)")
+            raise ValueError("a discussion needs at least one peer")
         repo_path = self._allowed_repo(repo) if repo else None
         rounds = max(1, min(int(max_rounds or self.config.max_rounds), 10))
         minutes = max(1, min(int(deadline_minutes or self.config.deadline_minutes), 240))
@@ -175,9 +199,13 @@ class Service:
             # The question is the initiator's own text: it stays peer_data, never system.
             self.bus.post(t["id"], self.agent, question.strip(), session_id=self.session_id)
         self.bus.post(t["id"], SYSTEM, f"Discussion started by {'the human user' if self.agent == HUMAN else self.agent} "
-                      f"with {', '.join(participants)}; up to {rounds} rounds.", kind="status")
+                      f"with {', '.join(participants)}; up to {rounds} rounds."
+                      + "".join(f" Left out: {quota.message(p, 'peer', b)}" for p, b in skipped.items()),
+                      kind="status")
         job = self._dispatch(t["id"], "discussion", {"mode": "start"}, f"{t['id']}:start")
         res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(t["id"])), "job": job}
+        if skipped:
+            res["skipped_peers"] = {p: quota.summary(b) for p, b in skipped.items()}
         if self.agent != HUMAN:
             res["next"] = ("Round 1 is blind. Post your own initial view now with "
                            f"send(thread=\"{t['id']}\", kind=\"proposal\", body=...) before reading anything, "
@@ -204,6 +232,11 @@ class Service:
         for p in t["participants"]:
             if p != t["initiator"]:
                 self.config.require_available(p, "peer")
+        # Out-of-usage peers keep their recorded votes; refuse only when no round can help.
+        blocked = quota.stalemate_blocks(self.bus, self.config, t)
+        if blocked:
+            raise BusError("USAGE_EXHAUSTED", "no consensus is possible until these peers have usage again: "
+                           + " ".join(quota.message(p, "peer", b) for p, b in blocked.items()))
         job = self._dispatch(thread, "discussion", {"mode": "advance"}, f"{thread}:advance:{t['round'] + 1}")
         return {"thread": thread_summary(t), "job": job}
 
@@ -260,10 +293,12 @@ class Service:
                     raise BusError("REVIEW_STALE", f"{t['id']} has moved on to head {str(current)[:12]}; "
                                    "use that as prev_head_commit_id")
                 else:
+                    kept = ((t["refs"] or {}).get("peer_settings") or {}).get(reviewer, {})
+                    # The follow-up runs with the thread's settings plus any new ones.
+                    self._quota_check(reviewer, "reviewer", {**kept, **override})
                     if focus:
                         self.bus.post(t["id"], self.agent, focus, session_id=self.session_id, recipient=reviewer)
                     refs["heads"] = [*self._heads(t), head_commit_id]
-                    kept = ((t["refs"] or {}).get("peer_settings") or {}).get(reviewer, {})
                     if kept or override:
                         refs["peer_settings"] = {reviewer: {**kept, **override}}
                     self.bus.set_thread(t["id"], refs=json.dumps(refs), status="open", round=t["round"] + 1,
@@ -276,6 +311,7 @@ class Service:
                 worker.spawn(job_row["id"])
             job = self._job_info(job_row, created)
         else:
+            self._quota_check(reviewer, "reviewer", override)
             goal = f"Review {change_id or head_commit_id[:12]} in {os.path.basename(repo_path)}"
             t = self.bus.create_thread("review", goal, [self.agent, reviewer], initiator=self.agent,
                                        initiator_session=self.session_id, max_rounds=1,
@@ -314,14 +350,17 @@ class Service:
         t = self.bus.thread(thread)
         if t["status"] in ("resolved",):
             raise BusError("THREAD_CLOSED", "thread is already resolved")
+        overrides = (t["refs"] or {}).get("peer_settings") or {}
         if t["kind"] == "discussion":
-            for p in t["participants"]:
-                if p != t["initiator"]:
-                    self.config.require_available(p, "peer")
-        elif t["kind"] == "review":
-            reviewer = (t["refs"] or {}).get("reviewer")
-            if reviewer:
-                self.config.require_available(reviewer, "reviewer")
+            peers = [p for p in t["participants"] if p != t["initiator"]]
+        else:
+            peers = [r for r in [(t["refs"] or {}).get("reviewer")] if r]
+        for p in peers:
+            self.config.require_available(p, "peer" if t["kind"] == "discussion" else "reviewer")
+        # The human is retrying now: forget cached out-of-usage blocks for these peers, so
+        # a stale or wrong one doesn't stop the retry.  A real limit is found again.
+        cleared = [p for p in peers if self.bus.clear_quota(p, quota.model_key(quota.effective_model(
+            self.config, p, self.config.peer_settings(p, overrides.get(p)))))]
         fields: dict[str, Any] = {"status": "open"}
         count = self.bus._one("SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender NOT IN (?,?)",
                               thread, HUMAN, SYSTEM)["n"]
@@ -330,8 +369,10 @@ class Service:
             fields["max_rounds"] = max(t["max_rounds"], t["round"]) + extra_rounds
             fields["deadline"] = time.time() + self.config.deadline_minutes * 60
         self.bus.set_thread(thread, **fields)
-        self.bus.post(thread, SYSTEM, f"Resumed by the human user with {extra_rounds} more round(s)."
-                      if t["kind"] == "discussion" else "Resumed by the human user.", kind="status")
+        self.bus.post(thread, SYSTEM, (f"Resumed by the human user with {extra_rounds} more round(s)."
+                      if t["kind"] == "discussion" else "Resumed by the human user.")
+                      + (f" Cleared out-of-usage state for {', '.join(cleared)}." if cleared else ""),
+                      kind="status")
         res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(thread))}
         if t["kind"] == "discussion":
             res["job"] = self._dispatch(thread, "discussion", {"mode": "start_later"},

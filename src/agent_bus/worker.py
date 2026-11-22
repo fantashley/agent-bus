@@ -23,9 +23,9 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from . import config as cfg
-from . import prompts
+from . import prompts, quota
 from .db import HUMAN, SYSTEM, Bus, BusError
-from .peers import TurnResult, adapter, extract_json
+from .peers import TurnResult, adapter, extract_json, format_usage
 
 LEASE_S = 120
 
@@ -60,6 +60,8 @@ class Worker:
         self.owner = f"{os.uname().nodename}:{os.getpid()}:{secrets.token_hex(2)}"
         self._stop = threading.Event()
         self._lost = threading.Event()
+        self.quota_noticed: set[str] = set()
+        self._quota_lock = threading.Lock()  # round 1 runs peers in parallel
 
     # ------------------------------------------------------------------ plumbing
 
@@ -192,6 +194,11 @@ class Worker:
         t = self.thread()
         cwd, add_dirs = self.workdir(t)
         settings = self.config.peer_settings(agent, ((t["refs"] or {}).get("peer_settings") or {}).get(agent))
+        model = quota.effective_model(self.config, agent, settings)
+        # Out of usage: don't spend a turn finding that out again.
+        block = self.bus.quota_block(agent, quota.model_key(model))
+        if block:
+            return self.blocked(agent, block)
         ad = adapter(agent, self.config, settings)
         resume_id = self.bus.peer_session(self.thread_id, agent) if resume else None
         timeout = max(30.0, min(self.config.turn_timeout_s, self.deadline_left()))
@@ -201,16 +208,62 @@ class Worker:
         tag = self.job["id"]
         res = ad.run(prompt, cwd, timeout, emit, resume_id=resume_id, add_dirs=add_dirs,
                      cancelled=self.cancelled, peer_tag=tag)
-        if not res.ok and resume_id and not res.timed_out and not self.cancelled():
+        # A fresh session can't fix running out of usage; it would only spend more.  Check
+        # again first: another worker may have found this agent out of usage meanwhile.
+        if not res.ok and resume_id and not res.timed_out and not res.quota and not self.cancelled():
+            block = self.bus.quota_block(agent, quota.model_key(model))
+            if block:
+                self.event("turn_end", f"failed: {res.error}" + format_usage(res.usage), agent)
+                return self.blocked(agent, block)
             self.event("error", f"resume failed ({res.error}); starting a fresh session", agent)
             self.set_peer_session(agent, None)
             res = ad.run(fresh_prompt or prompt, cwd, timeout, emit, add_dirs=add_dirs,
                          cancelled=self.cancelled, peer_tag=tag)
-        self.event("turn_end", "ok" if res.ok else f"failed: {res.error}", agent)
-        self.check()
+        self.event("turn_end", ("ok" if res.ok else f"failed: {res.error}") + format_usage(res.usage), agent)
+        self.check()  # a worker that lost its lease records nothing
+        if res.quota:
+            self.record_quota(agent, model, res.quota)
+            # Keep the conversation pinned for a retry after the reset, and never pin the
+            # failed attempt's own session (a first turn that ran out has no context).
+            if resume_id:
+                self.set_peer_session(agent, resume_id)
+            return res
+        if res.ok:
+            # Newer evidence: it has usage again (account-wide, and for this model).
+            with self.fenced():
+                self.bus.clear_quota(agent, quota.model_key(model))
         if res.external_id:
             self.set_peer_session(agent, res.external_id)
         return res
+
+    def blocked(self, agent: str, block: dict) -> TurnResult:
+        """The result of a turn skipped because ``block`` (already read) stops ``agent``."""
+        res = TurnResult(ok=False, error=quota.describe(agent, block),
+                         quota={"resets_at": block["until"], "source": block["source"]})
+        self.quota_notice(agent, block)
+        return res
+
+    def record_quota(self, agent: str, model: str | None, found: dict) -> None:
+        now = time.time()
+        reset = found.get("resets_at")
+        estimated = not (isinstance(reset, (int, float)) and reset > now)
+        until = now + self.config.quota_cooldown_s if estimated else min(max(reset, now + 60), now + 7 * 86400)
+        source = found.get("source") if found.get("source") in quota.REASONS else "heuristic"
+        with self.fenced():  # the cache is shared: only a worker that still holds its lease writes it
+            block = self.bus.set_quota_block(agent, until, source, quota.reason(agent, source),
+                                             scope=quota.scope_for(agent, model), estimated=estimated)
+        found.update(resets_at=until)
+        self.quota_notice(agent, block)
+
+    def quota_notice(self, agent: str, block: dict) -> None:
+        """One thread notice per agent per job, in fixed wording: who is out of usage,
+        until when, and how to retry.  The CLI's own error stays in the progress events."""
+        with self._quota_lock:
+            if agent in self.quota_noticed:
+                return
+            self.quota_noticed.add(agent)
+        self.system(f"{quota.describe(agent, block)}. After that, run `agent-bus resume {self.thread_id}` "
+                    "to retry.")
 
     # --------------------------------------------------------------- discussion
 
@@ -244,7 +297,8 @@ class Worker:
         if mode in ("start", "start_later"):
             if mode == "start":
                 self.round_one(t)
-                self.wait_for_initiator(round_no=1)
+                if not self.quota_stalemate():
+                    self.wait_for_initiator(round_no=1)
             # Round 1 is over, even if the worker stops here (e.g. waiting on an absent
             # initiator): lift blindness so the initiator can read what it must vote on.
             self.set_thread(blind=0)
@@ -254,11 +308,49 @@ class Worker:
                     break
                 if self.only_absent_initiator_missing():
                     break  # more peer rounds can't help; the initiator has to vote
+                if self.quota_stalemate() or self.all_peers_blocked():
+                    break  # no peer can move; wrap_up hands over to the initiator or the human
                 self.later_round()
         elif not self.done() and self.thread()["round"] < self.thread()["max_rounds"]:
             self.set_thread(blind=0)
             self.later_round()  # advance: exactly one more round
+        if self.close_on_stalemate():
+            return
         self.wrap_up()
+
+    def quota_stalemate(self) -> bool:
+        snapshot = quota.stalemate_blocks(self.bus, self.config, self.thread())
+        # The blocks may have come from other jobs: say which peers and until when, from
+        # the same read that made the decision.
+        for p, b in snapshot.items():
+            self.quota_notice(p, b)
+        return bool(snapshot)
+
+    def close_on_stalemate(self) -> bool:
+        """End the discussion as needs_human if out-of-usage peers leave no path to
+        unanimity.  Decided again inside the transaction that changes the status, so a
+        block cleared meanwhile leaves the discussion open."""
+        if not quota.stalemate(self.bus, self.config, self.thread()):
+            return False
+        with self.fenced():
+            t = self.thread()
+            snapshot = quota.stalemate_blocks(self.bus, self.config, t)
+            if not snapshot:
+                return False
+            if not self.bus.transition(self.thread_id, "needs_human"):
+                return True  # something else closed it first
+            for p, b in snapshot.items():
+                self.quota_notice(p, b)
+            init = t["initiator"]
+            self.system("No consensus is possible while out-of-usage peers can't vote again. Needs the "
+                        f"human user.\n{format_dissent(self.bus.dissent(self.thread_id))}",
+                        recipient=None if init == HUMAN else init)
+        return True
+
+    def all_peers_blocked(self) -> bool:
+        t = self.thread()
+        blocked = quota.blocked_peers(self.bus, self.config, t)
+        return bool(blocked) and len(blocked) == len(self.peers(t))
 
     def done(self) -> bool:
         return self.thread()["status"] != "open"
@@ -298,11 +390,12 @@ class Worker:
         start = (t["round"] - 2) % max(1, len(peers))
         for agent in peers[start:] + peers[:start]:
             self.check()
-            if self.done() or self.deadline_left() <= 0:
+            if self.done() or self.deadline_left() <= 0 or self.quota_stalemate():
                 return
             prompt, fresh, upto = self.later_prompt(agent)
             self.contribute(agent, prompt, fresh_prompt=fresh, delivered_upto=upto)
-        self.wait_for_initiator(round_no=t["round"])
+        if not self.quota_stalemate():  # the initiator's vote can't resolve a stalemate
+            self.wait_for_initiator(round_no=t["round"])
 
     def later_prompt(self, agent: str) -> tuple[str, str, int]:
         """(resumed prompt, self-contained fresh prompt, highest message id included).
@@ -335,6 +428,8 @@ class Worker:
                    fresh_prompt: str | None = None, delivered_upto: int | None = None) -> None:
         """Run one turn for ``agent`` and post its proposal or vote."""
         res = self.turn(agent, prompt, resume=resume, fresh_prompt=fresh_prompt)
+        if res.quota:
+            return  # noticed in turn(); no cursor move, no repair, no partial vote
         if delivered_upto is not None and (res.ok or res.text):
             self.mark_delivered(agent, delivered_upto)
         if not res.ok and not res.text:
@@ -346,6 +441,8 @@ class Worker:
             # blind-safe prompt it already had, never the others' proposals.
             repair = prompts.REPAIR_BLIND if blind else prompts.REPAIR
             res2 = self.turn(agent, repair, fresh_prompt=(fresh_prompt or prompt) + "\n\n" + repair)
+            if res2.quota:
+                return  # out of usage mid-repair: post nothing from either attempt
             action = extract_json(res2.text) if res2.text else None
         if not self.valid_action(action, blind):
             self.safe_post(agent, res.text.strip()[:20000] or "(empty reply)", kind="message",
@@ -459,12 +556,19 @@ class Worker:
         self.system(f"Review {'follow-up ' if followup else ''}{'(retry) ' if mode == 'retry' else ''}"
                     f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.")
         res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh)
+        if res.quota:
+            # Head, reviewer and session stay pinned for `agent-bus resume` after the reset.
+            self.finish_thread("needs_human")
+            return
         if res.ok or res.text:
             self.mark_delivered(reviewer, upto)
         verdict = normalize_verdict(extract_json(res.text) if res.text else None)
         if verdict is None and res.ok:
             res2 = self.turn(reviewer, "Reply again with only the JSON verdict object described above.",
                              fresh_prompt=fresh + "\n\nReply with only the JSON verdict object.")
+            if res2.quota:
+                self.finish_thread("needs_human")
+                return
             verdict = normalize_verdict(extract_json(res2.text) if res2.text else None)
         if verdict is None:
             if self.finish_thread("needs_human"):

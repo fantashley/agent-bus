@@ -37,6 +37,12 @@ class TurnResult:
     external_id: str | None = None
     error: str | None = None
     timed_out: bool = False
+    # Token counts from the CLI's own terminal usage report; a counter it didn't give is absent.
+    usage: dict | None = None
+    # Set only on a failed turn that the CLI said was out of usage (issue #26, agreed on
+    # agent-bus thread t-3e260b): {"resets_at": epoch | None, "source": "structured" |
+    # "heuristic"}.
+    quota: dict | None = None
 
 
 @dataclass
@@ -53,6 +59,8 @@ class StreamState:
     external_id: str | None = None
     error: str | None = None
     step_text: dict = field(default_factory=dict)  # per-step text, for clients that stream deltas
+    usage: dict | None = None
+    rate_limit: dict | None = None  # Claude's latest rate_limit_event info
 
 
 Emit = Callable[[str, str], None]  # (kind, text)
@@ -91,6 +99,19 @@ class Adapter:
 
     def parse_line(self, obj: dict, st: StreamState, emit: Emit) -> None:
         raise NotImplementedError
+
+    # Provider wording for "out of usage", matched only against a turn that already failed.
+    # Kept narrow on purpose: a bare 429, "overloaded", or RESOURCE_EXHAUSTED without
+    # quota wording stays an ordinary error.
+    quota_patterns: tuple[str, ...] = ()
+
+    def classify(self, st: StreamState, error: str) -> dict | None:
+        """Whether a failed turn ran out of usage: structured evidence first, then text."""
+        for pat in self.quota_patterns:
+            if re.search(pat, error, re.IGNORECASE):
+                # The raw error stays in the job's progress events, never in the block.
+                return {"resets_at": _reset_from_text(error), "source": "heuristic"}
+        return None
 
     def run(self, prompt: str, cwd: str, timeout: float, emit: Emit, resume_id: str | None = None,
             add_dirs: list[str] | None = None, cancelled: Callable[[], bool] = lambda: False,
@@ -169,8 +190,14 @@ class Adapter:
                               timed_out=True)
         if rc != 0 or st.error:
             err = st.error or f"exit {rc}: {''.join(stderr_tail)[-800:]}"
-            return TurnResult(ok=False, text=text, external_id=st.external_id, error=err)
-        return TurnResult(ok=True, text=text, external_id=st.external_id)
+            try:
+                # err already ends with the stderr tail unless the stream reported its own error.
+                quota = self.classify(st, err + "\n" + "".join(stderr_tail)[-800:] if st.error else err)
+            except Exception:  # noqa: BLE001 - classification is best-effort
+                quota = None
+            return TurnResult(ok=False, text=text, external_id=st.external_id, error=err, usage=st.usage,
+                              quota=quota)
+        return TurnResult(ok=True, text=text, external_id=st.external_id, usage=st.usage)
 
 
 def _killpg(proc: subprocess.Popen) -> None:
@@ -182,6 +209,58 @@ def _killpg(proc: subprocess.Popen) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+
+
+_UNITS = {}
+for _names, _secs in ((("d", "day", "days"), 86400), (("h", "hr", "hrs", "hour", "hours"), 3600),
+                      (("m", "min", "mins", "minute", "minutes"), 60), (("s", "sec", "secs", "second", "seconds"), 1),
+                      (("ms", "millisecond", "milliseconds"), 0.001)):
+    _UNITS.update(dict.fromkeys(_names, _secs))
+
+
+def _reset_from_text(text: str, now: float | None = None) -> float | None:
+    """A reset time the error text states unambiguously: a Unix timestamp after a
+    pipe (Claude's "usage limit reached|1736280000") or a relative "try again in 2 hours,
+    and 5 minutes".  Wall-clock times like "at 3:05 PM" have no date or zone: not trusted.
+    An unknown unit makes the whole duration untrusted."""
+    now = time.time() if now is None else now
+    m = re.search(r"\|\s*(\d{10})\b", text)
+    if m:
+        return float(m.group(1))
+    term = r"\d+\s*[a-z]+"
+    m = re.search(rf"(?:try again|resets?|available again) in ({term}(?:\s*(?:,\s*and|,|and)?\s*{term})*)",
+                  text, re.IGNORECASE)
+    if m:
+        total = 0.0
+        for n, unit in re.findall(r"(\d+)\s*([a-z]+)", m.group(1), re.IGNORECASE):
+            if unit.lower() == "and":
+                continue
+            secs = _UNITS.get(unit.lower())
+            if secs is None:
+                return None
+            total += int(n) * secs
+        return now + total if total else None
+    return None
+
+
+def _num(v: object) -> int | None:
+    return v if type(v) is int and v >= 0 else None
+
+
+def usage_from(raw: object, keys: dict[str, str]) -> dict | None:
+    """Token counters renamed to agent-bus's names ({ours: theirs}); absent ones skipped."""
+    if not isinstance(raw, dict):
+        return None
+    out = {ours: _num(raw.get(theirs)) for ours, theirs in keys.items()}
+    out = {k: v for k, v in out.items() if v is not None}
+    return out or None
+
+
+def format_usage(u: dict | None) -> str:
+    if not u:
+        return ""
+    names = (("input", "in"), ("output", "out"), ("cache_read", "cache"), ("thinking", "thinking"))
+    return " · tokens " + " ".join(f"{label} {u[k]}" for k, label in names if k in u)
 
 
 def _short(text: str, n: int = 240) -> str:
@@ -271,12 +350,45 @@ class ClaudeAdapter(Adapter):
                     inp = block.get("input") or {}
                     hint = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("query") or ""
                     emit("tool", _short(f"{block.get('name')} {hint}".strip()))
+        elif typ == "rate_limit_event" and isinstance(obj.get("rate_limit_info"), dict):
+            st.rate_limit = obj["rate_limit_info"]
         elif typ == "result":
+            st.usage = usage_from(obj.get("usage"), CLAUDE_USAGE)
+            thinking = (obj.get("usage") or {}).get("output_tokens_details") if isinstance(obj.get("usage"), dict) else None
+            if isinstance(thinking, dict) and _num(thinking.get("thinking_tokens")) is not None:
+                st.usage = {**(st.usage or {}), "thinking": thinking["thinking_tokens"]}
             if obj.get("is_error"):
                 st.error = _short(str(obj.get("result") or obj.get("subtype") or "error"), 800)
             if isinstance(obj.get("result"), str):
                 st.final = obj["result"]
 
+    quota_patterns = (r"usage limit reached", r"hit your (?:usage )?limit", r"out of (?:extra )?usage")
+
+    def classify(self, st, error):
+        # Structured: the effective rate-limit status says this request was rejected, and
+        # no overage covers it.  Seen live on Claude Code 2.1.x as status allowed/rejected.
+        info = st.rate_limit
+        if info is not None:
+            # The structured status is authoritative: "allowed", or covered by overage,
+            # means this failure wasn't the usage limit, whatever the error text says.
+            if info.get("status") == "rejected" and not info.get("isUsingOverage"):
+                reset = info.get("resetsAt")
+                return {"resets_at": float(reset) if isinstance(reset, (int, float)) and reset > 0 else None,
+                        "source": "structured"}
+            return None
+        return super().classify(st, error)
+
+
+CLAUDE_USAGE = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cache_read_input_tokens",
+                "cache_write": "cache_creation_input_tokens"}
+CODEX_USAGE = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cached_input_tokens",
+               "thinking": "reasoning_output_tokens"}
+AGY_USAGE = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cache_read_tokens",
+             "thinking": "thinking_tokens"}
+
+# "Individual quota reached. ... Resets in 2h26m14s." seen live from agy 1.5.13 on 2026-11-22.
+_AGY_QUOTA = (r"quota reached", r"quota (?:exceeded|exhausted|has been exhausted)", r"exhausted (?:your|the) quota",
+              r"(?:out of|insufficient|no remaining) (?:ai )?credits", r"usage limit (?:reached|exceeded)")
 
 _CODEX_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -361,14 +473,22 @@ class CodexAdapter(Adapter):
                 emit("tool", _short(f"shell {item.get('command', '')}"))
             elif itype in ("web_search", "mcp_tool_call", "file_change") and typ == "item.started":
                 emit("tool", _short(f"{itype} {item.get('query') or item.get('tool') or ''}"))
+        elif typ == "turn.completed":
+            st.usage = usage_from(obj.get("usage"), CODEX_USAGE)
         elif typ in ("turn.failed", "error"):
             err = obj.get("error") or obj.get("message") or obj
             st.error = _short(json.dumps(err) if not isinstance(err, str) else err, 800)
+
+    # Codex's own usage-limit and quota errors (codex-rs protocol error.rs).
+    quota_patterns = (r"you've hit your usage limit", r"usage_limit_(?:reached|exceeded)", r"insufficient_quota",
+                      r"quota exceeded\. check your plan")
 
 
 class AntigravityAdapter(Adapter):
     agent = "antigravity"
     default_command = cfg.AGENT_INFO["antigravity"]["cli"]
+
+    quota_patterns = _AGY_QUOTA
 
     def check_isolation(self) -> None:
         """agy has no per-session switch for MCP servers, so refuse to run a peer while
@@ -451,6 +571,7 @@ class AntigravityAdapter(Adapter):
         elif ev == "result":
             res = obj.get("result") or {}
             st.external_id = res.get("conversation_id") or st.external_id
+            st.usage = usage_from(res.get("usage"), AGY_USAGE)
             if res.get("status") not in (None, "SUCCESS"):
                 st.error = _short(f"status {res.get('status')}: {res.get('error') or ''}", 800)
             if isinstance(res.get("response"), str):

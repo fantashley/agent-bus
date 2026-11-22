@@ -192,6 +192,9 @@ def cmd_ask(bus: Bus, args: argparse.Namespace) -> int:
                                deadline_minutes=args.deadline, watch=args.watch, peer_settings=settings or None)
     tid = res["thread"]["id"]
     print(f"started {tid} with {', '.join(res['thread']['participants'])} (job {res['job']['id']})")
+    from . import quota
+    for agent, b in (res.get("skipped_peers") or {}).items():
+        print(f"left out {agent}: {quota.describe(agent, {**b, 'scope': b['scope'] or ''})}")
     if res.get("watch"):
         print(f"rex viewers: {json.dumps(res['watch'])}")
     print(f"follow with: agent-bus tail {tid}")
@@ -250,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("agents", help="list the agents available on this machine, and why")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--clear-quota", metavar="AGENT", choices=cfg.AGENTS,
+                   help="forget that AGENT is out of usage (e.g. after upgrading a plan)")
 
     s = sub.add_parser("threads", help="list threads")
     s.add_argument("--all", action="store_true", help="include resolved and cancelled threads")
@@ -369,15 +374,30 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
     if args.cmd == "stream":
         return cmd_stream(bus, args)
     if args.cmd == "agents":
+        from . import quota
         conf = cfg.Config.load()
+        if args.clear_quota:
+            n = bus.conn.execute("DELETE FROM quota_blocks WHERE agent=?", (args.clear_quota,)).rowcount
+            print(f"cleared {n} out-of-usage block(s) for {args.clear_quota}")
+            return 0
         avail = conf.availability()
+        blocks: dict[str, list] = {}
+        for b in bus.quota_blocks():
+            blocks.setdefault(b["agent"], []).append(b)
         if args.json:
+            for a, v in avail.items():
+                if a in blocks:
+                    v["out_of_usage"] = [quota.summary(b) for b in blocks[a]]
             print(json.dumps(avail, indent=2))
             return 0
         source = "config `agents`" if conf.agents is not None else "detected on PATH"
         print(f"agents ({source}):")
         for a, v in avail.items():
             print(f"  {'yes' if v['available'] else 'no ':<4} {a:<12} {v['reason']}")
+            for b in blocks.get(a, []):
+                when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(b["until"]))
+                print(f"       out of usage{' for model ' + b['scope'] if b['scope'] else ''} until {when}"
+                      f"{' (estimated)' if b['estimated'] else ''}: {b['reason'] or 'usage limit reached'}")
         return 0
     if args.cmd == "threads":
         ts = bus.threads(include_closed=args.all)

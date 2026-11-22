@@ -80,6 +80,43 @@ Other effort values, and model names outside a safe character set, are rejected 
 config loads or when the request is made. The flags are passed on resumed turns too, and each
 `turn_start` progress line shows what the turn ran with.
 
+## Out of usage
+
+When a peer's turn fails because its agent ran out of usage, agent-bus notices, stops spending
+turns on it and tells you when it should be back. This was agreed on agent-bus thread t-3e260b.
+
+- **Detection:** only a turn that failed counts, never one that produced a reply.
+  - **Claude Code:** structured. The stream's `rate_limit_event` says the request was rejected
+    (without overage) and gives the reset time.
+  - **Codex and Antigravity:** their own usage-limit or quota wording in the failure. A bare 429,
+    an overload, a context-length error or a `RESOURCE_EXHAUSTED` without quota wording stays
+    an ordinary error. The raw error is kept in the progress events.
+- **Cache:** the agent is marked out of usage until the reset time, clamped to 7 days. With no
+  usable reset time, it's skipped for `quota_cooldown_s`, 15 minutes by default, marked as an
+  estimate. Claude and Codex limits are account-wide; an Antigravity block applies to the model
+  that hit it. Blocks expire on their own, and a successful turn lifts one.
+- **New requests:**
+  - default rosters (`ask` / `start_discussion` without peers) leave the agent out and say so;
+  - naming it as a peer or reviewer fails at once with `USAGE_EXHAUSTED`, giving the reset time.
+- **Running jobs:**
+  - no fresh-session fallback or JSON repair turn after a usage failure;
+  - nothing is posted for that turn, and its delivery cursor doesn't move;
+  - one thread notice names the peer, the reset and how to retry.
+  - **Reviews** go to `needs_human` with the reviewer, head and session kept, ready for
+    `agent-bus resume`.
+  - **Discussions** keep every participant and vote. If the blocked peer already agrees with a
+    proposal, the others can still converge on it. If it backs nothing, or blocked peers back
+    different proposals, the discussion goes to `needs_human` straight away instead of using up
+    rounds.
+- **You:** `agent-bus agents` (and agents' `whoami`) show who's out of usage until when.
+  - `agent-bus resume <thread>` clears the cached block for that thread's peers before retrying;
+  - `agent-bus agents --clear-quota <agent>` clears it everywhere, e.g. after a plan upgrade.
+- **Token use:** each `turn_end` progress line shows the turn's tokens (in, out, cache, thinking),
+  as far as the CLI reports them.
+
+Not yet: near-limit warnings, a usage history report, reading Codex's rollout files for its
+rate-limit windows, automatic retries after a reset, and lowering effort automatically.
+
 ## Watching and stepping in
 
 ```sh
