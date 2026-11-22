@@ -245,6 +245,15 @@ def test_many_newer_ineligible_threads_do_not_hide_an_older_reply(env, no_spawn)
         bus.set_thread(t, blind=0, round=2)
         bus.post(t, "codex", "peer chatter", recipient="claude")
     assert run(bus)
+    # ...and what was announced can actually be read: draining inbox reaches it.
+    me = Service(bus, "claude", bus._one("SELECT id FROM sessions WHERE agent_type='claude'")["id"])
+    seen = []
+    for _ in range(20):
+        batch = me.inbox()["messages"]
+        if not batch:
+            break
+        seen += [m["body"] for m in batch]
+    assert any("the answer" in b for b in seen)
 
 
 def test_unreadable_start_time_of_a_registered_ancestor_binds_nothing(env):

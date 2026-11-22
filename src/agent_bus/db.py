@@ -579,6 +579,20 @@ class Bus:
             "INSERT INTO cursors VALUES (?,?,?) ON CONFLICT(subscriber, thread_id)"
             " DO UPDATE SET last_id=max(last_id, excluded.last_id)", (subscriber, thread_id, last_id))
 
+    def candidate_threads(self, agent_type: str) -> list[dict]:
+        """Threads that can hold unread mail for ``agent_type``: open, or changed in the
+        last day, and involving it.  Not capped, so repeated reads always reach every
+        thread; callers cap messages instead."""
+        cutoff = _now() - 86400
+        rows = self._all("SELECT id FROM threads WHERE status IN ('open','needs_human') OR updated_at >= ?"
+                         " ORDER BY updated_at DESC", cutoff)
+        out = []
+        for r in rows:
+            t = self.thread(r["id"])
+            if self._involves(t, agent_type):
+                out.append(t)
+        return out
+
     def unread(self, subscriber: str, agent_type: str, thread_id: str | None = None,
                limit: int = 50, advance: bool = True) -> list[dict]:
         """Messages for ``agent_type`` newer than this subscriber's cursor.
@@ -590,9 +604,7 @@ class Bus:
         if thread_id:
             threads = [self.thread(thread_id)]
         else:
-            cutoff = _now() - 86400
-            threads = [t for t in self.threads(include_closed=True, agent_type=agent_type, limit=200)
-                       if t["status"] in ("open", "needs_human") or t["updated_at"] >= cutoff]
+            threads = self.candidate_threads(agent_type)
         out: list[dict] = []
         for t in threads:
             last = self._cursor(subscriber, t["id"])

@@ -92,15 +92,10 @@ def unread_all(bus: Bus, session: dict, agent: str) -> list[dict]:
     forever.  Threads last updated before the session started, and not started by it,
     can't hold eligible mail and are skipped unread.
     """
-    cutoff = time.time() - 86400
-    rows = bus._all("SELECT id, updated_at, initiator_session FROM threads"
-                    " WHERE status IN ('open','needs_human') OR updated_at >= ? ORDER BY updated_at DESC", cutoff)
     out: list[dict] = []
-    for r in rows:
-        if r["updated_at"] < session["started_at"] and r["initiator_session"] != session["id"]:
-            continue
-        t = bus.thread(r["id"])
-        if not bus._involves(t, agent):
+    # The same threads inbox() reads from, so anything hinted here can be read there.
+    for t in bus.candidate_threads(agent):
+        if t["updated_at"] < session["started_at"] and t["initiator_session"] != session["id"]:
             continue
         msgs = bus._all("SELECT * FROM messages WHERE thread_id=? AND id>? AND sender!=?"
                         " AND (recipient IS NULL OR recipient=?) ORDER BY id",
