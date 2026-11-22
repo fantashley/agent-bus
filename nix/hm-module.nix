@@ -29,7 +29,7 @@ let
     args = [ "mcp" "--agent" agent ];
   };
 
-  claudeMarketplace = pkgs.runCommand "agent-bus-claude-marketplace" { } ''
+  claudeMarketplace = pkgs.runCommand "agent-bus-claude-marketplace" { } (''
     mkdir -p $out/.claude-plugin $out/plugins/agent-bus/.claude-plugin
     cp ${json.generate "marketplace.json" {
       name = "agent-bus";
@@ -48,7 +48,25 @@ let
     }} $out/plugins/agent-bus/.claude-plugin/plugin.json
     cp ${json.generate "mcp.json" { mcpServers.agent-bus = mcpEntry "claude"; }} \
       $out/plugins/agent-bus/.mcp.json
-  '';
+  '' + lib.optionalString cfg.claude.hooks.enable ''
+    mkdir -p $out/plugins/agent-bus/hooks
+    cp ${claudeHooks} $out/plugins/agent-bus/hooks/hooks.json
+  '');
+
+  # Fixed-hint hooks (v1.5): a constant "you have agent-bus mail" line at prompt submit,
+  # and at most one Stop continuation per human turn. See README "Hooks".
+  hookCmd = event: {
+    type = "command";
+    command = "${bin} hook --client claude --event ${event}";
+    timeout = 5;
+  };
+  claudeHooks = json.generate "hooks.json" {
+    description = "agent-bus: fixed unread-mail hint at turn boundaries";
+    hooks = {
+      UserPromptSubmit = [{ hooks = [ (hookCmd "prompt") ]; }];
+      Stop = [{ hooks = [ (hookCmd "stop") ]; }];
+    };
+  };
 
   antigravityPlugin = pkgs.runCommand "agent-bus-antigravity-plugin" { } ''
     mkdir -p $out
@@ -108,6 +126,18 @@ in
       type = lib.types.bool;
       default = true;
       description = "Register agent-bus with Claude Code (as a local plugin).";
+    };
+    claude.hooks.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Add fixed-hint hooks to the Claude Code plugin. When this session has unread
+        agent-bus mail, a prompt gets a constant hint ("Unread messages are available
+        for this session. Call the agent-bus inbox tool...") as context, and a turn may
+        be kept going once (at most once per human turn) so Claude can read mail that
+        arrived during it. The hint never contains another agent's text. Off by default
+        because it changes how Claude behaves at turn boundaries.
+      '';
     };
     codex.enable = lib.mkOption {
       type = lib.types.bool;
