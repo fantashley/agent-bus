@@ -1,0 +1,29 @@
+// Renovate config for flake.lock and GitHub Actions.
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: ['config:recommended'],
+  timezone: 'UTC',
+  schedule: ['before 9am on monday'],
+  enabledManagers: ['nix', 'github-actions'],
+
+  // Renovate's nix manager is opt-in (beta). flake.lock is refreshed as a
+  // whole with `nix flake update`; per-input PRs are disabled below.
+  nix: { enabled: true },
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ['before 9am on monday'],
+  },
+
+  packageRules: [
+    {
+      description: 'Per-input flake bumps: lockFileMaintenance covers every input in one PR.',
+      matchManagers: ['nix'],
+      matchUpdateTypes: ['major', 'minor', 'patch', 'digest', 'pin', 'pinDigest'],
+      enabled: false,
+    },
+    {
+      matchManagers: ['github-actions'],
+      groupName: 'GitHub Actions',
+    },
+  ],
+}
