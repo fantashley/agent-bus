@@ -40,7 +40,6 @@ HINT = ("agent-bus: Unread messages are available for this session. Call the age
 
 COOLDOWN_S = 30  # minimum gap between hints for newer mail
 DB_TIMEOUT_S = 0.25
-UNREAD_SCAN = 100_000
 
 EVENTS = ("prompt", "stop")
 CLIENTS = ("claude",)  # Codex and Antigravity adapters follow once verified live
@@ -59,9 +58,11 @@ def bind_session(bus: Bus, agent: str, pid: int,
         if not rows:
             continue
         start = start_of(p)
+        if not start:
+            return None  # can't tell whether this registered pid is our client: don't guess
         # A pid recorded by some earlier, long-gone client (pids get reused, and an
         # intermediate shell can land on one) isn't this ancestor: keep walking.
-        same = [dict(r) for r in rows if start and r["client_start"] == start]
+        same = [dict(r) for r in rows if r["client_start"] == start]
         if not same:
             continue
         live = [r for r in same if alive(r["pid"])]
@@ -80,6 +81,33 @@ def _alive(pid: Any) -> bool:
         return False  # another user's process can't be this user's MCP server
     info = procinfo.proc(pid)
     return info is None or info[1] != "Z"
+
+
+def unread_all(bus: Bus, session: dict, agent: str) -> list[dict]:
+    """Every unread message for this session, with Bus.unread's rules (cursor, addressed
+    to the agent or the thread, not its own, blind-round visibility) but no caps.
+
+    Hooks never advance cursors and filter for eligibility afterwards, so any cap on
+    threads or messages would let a backlog of ineligible mail hide eligible mail
+    forever.  Threads last updated before the session started, and not started by it,
+    can't hold eligible mail and are skipped unread.
+    """
+    cutoff = time.time() - 86400
+    rows = bus._all("SELECT id, updated_at, initiator_session FROM threads"
+                    " WHERE status IN ('open','needs_human') OR updated_at >= ? ORDER BY updated_at DESC", cutoff)
+    out: list[dict] = []
+    for r in rows:
+        if r["updated_at"] < session["started_at"] and r["initiator_session"] != session["id"]:
+            continue
+        t = bus.thread(r["id"])
+        if not bus._involves(t, agent):
+            continue
+        msgs = bus._all("SELECT * FROM messages WHERE thread_id=? AND id>? AND sender!=?"
+                        " AND (recipient IS NULL OR recipient=?) ORDER BY id",
+                        t["id"], bus._cursor(session["id"], t["id"]), agent, agent)
+        visible, _blind = bus._visible(t, msgs, agent)
+        out.extend(visible)
+    return out
 
 
 def eligible(bus: Bus, session: dict, msgs: list[dict], stop: bool) -> list[dict]:
@@ -172,11 +200,7 @@ def run(client: str, event: str, payload: str, env: dict | None = None, pid: int
             session = bind_session(bus, client, pid or os.getpid(), **bind)
             if not session:
                 return ""
-            # All unread, not unread's default first 50: eligibility filters after this,
-            # and with cursors never advanced, a full batch of ineligible messages (e.g.
-            # status chatter) would hide later mail forever.  Threads are message-capped,
-            # so this stays small.
-            msgs = bus.unread(session["id"], client, advance=False, limit=UNREAD_SCAN)
+            msgs = unread_all(bus, session, client)
             ok = eligible(bus, session, msgs, stop=event == "stop")
             newest = max((m["id"] for m in ok), default=None)
             if not claim(bus, session["id"], event, newest, time.time() if now is None else now):

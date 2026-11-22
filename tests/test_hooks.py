@@ -233,3 +233,24 @@ def test_opening_current_db_takes_no_write_lock(env):
         Bus(bus.path, timeout=0.1).close()  # must not need it
     finally:
         lock.execute("ROLLBACK")
+
+
+def test_many_newer_ineligible_threads_do_not_hide_an_older_reply(env, no_spawn):
+    """More threads than Bus.unread scans (200), all newer and ineligible."""
+    bus = env["bus"]
+    tid = Service(bus, "claude", session(bus)).send("q", to="codex")["thread"]["id"]
+    Service(bus, "codex", bus.register_session("codex", env={})).send("the answer", thread=tid, to="claude")
+    for i in range(210):  # discussions run by headless peers, involving claude, updated later
+        t = bus.create_thread("discussion", f"d{i}", ["codex", "claude"], "codex")["id"]
+        bus.set_thread(t, blind=0, round=2)
+        bus.post(t, "codex", "peer chatter", recipient="claude")
+    assert run(bus)
+
+
+def test_unreadable_start_time_of_a_registered_ancestor_binds_nothing(env):
+    bus = env["bus"]
+    session(bus, client=400, start="inner")  # nearer client, e.g. a nested Claude
+    session(bus, client=500, start="outer")
+    starts = {400: None, 500: "outer"}  # the nearer one's start time can't be read
+    assert hooks.bind_session(bus, "claude", 999, ancestors_of=lambda pid: [400, 500, 1],
+                              start_of=starts.get, alive=lambda pid: True) is None
