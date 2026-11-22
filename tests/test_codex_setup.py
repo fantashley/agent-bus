@@ -157,3 +157,33 @@ def test_cli_setup_codex_errors_exit_nonzero(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cs.shutil, "which", lambda name: None)
     assert cli.main(["setup-codex", "--bin", "/bin/agent-bus"]) == 1
     assert "codex is not on PATH" in capsys.readouterr().err
+
+
+def test_ensure_keeps_other_forwarded_variables(codex_home):
+    codex_home.write_text(CONFIG.replace('args = ["mcp", "--agent", "codex"]\n',
+                                         'args = ["mcp", "--agent", "codex"]\nenv_vars = ["AGENT_BUS_DB"]\n'))
+    fake = FakeCodex(codex_home)
+    assert cs.ensure("/old/agent-bus", codex="codex", run=fake) == "updated"
+    got = tomllib.loads(codex_home.read_text())["mcp_servers"]["agent-bus"]["env_vars"]
+    assert got == ["AGENT_BUS_DB", *cs.ENV_VARS]
+    assert cs.ensure("/old/agent-bus", codex="codex", run=fake) == "unchanged"
+    # A stale command is re-added by codex (which drops env_vars); they're carried over.
+    assert cs.ensure("/new/agent-bus", codex="codex", run=fake) == "updated"
+    got = tomllib.loads(codex_home.read_text())["mcp_servers"]["agent-bus"]
+    assert got["command"] == "/new/agent-bus" and got["env_vars"] == ["AGENT_BUS_DB", *cs.ENV_VARS]
+
+
+def test_ensure_restores_pre_setup_config_after_stale_command_and_failed_check(codex_home):
+    fake = FakeCodex(codex_home)
+
+    def stubborn(argv, **kw):
+        out = fake(argv, **kw)
+        if argv[2] == "get" and out.returncode == 0:
+            data = json.loads(out.stdout)
+            data["transport"]["env_vars"] = None
+            out = subprocess.CompletedProcess(argv, 0, json.dumps(data), "")
+        return out
+
+    with pytest.raises(cs.SetupError):
+        cs.ensure("/new/agent-bus", codex="codex", run=stubborn)  # remove + add, then fails
+    assert codex_home.read_text() == CONFIG

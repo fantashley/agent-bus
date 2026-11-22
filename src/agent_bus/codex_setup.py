@@ -110,26 +110,46 @@ def _write_atomic(path: Path, text: str) -> None:
         raise
 
 
+def _matches(have: dict | None, want: dict) -> bool:
+    """Same command and args, and every Rex variable forwarded (others may be too)."""
+    return (have is not None and have["command"] == want["command"] and have["args"] == want["args"]
+            and set(want["env_vars"]) <= set(have["env_vars"]))
+
+
 def ensure(bin_path: str, codex: str | None = None, run: Runner = subprocess.run) -> str:
-    """Make Codex's agent-bus entry match; return "unchanged" or "updated"."""
+    """Make Codex's agent-bus entry match; return "unchanged" or "updated".
+
+    Variables the entry already forwards are kept; the Rex ones are added.  On any
+    failure after the first change, config.toml is put back exactly as it was.
+    """
     codex = codex or shutil.which("codex")
     if not codex:
         raise SetupError("codex is not on PATH")
     want = wanted(bin_path)
     have = current(codex, run)
-    if have == want:
+    if _matches(have, want):
         return "unchanged"
-    if have is None or have["command"] != want["command"] or have["args"] != want["args"]:
-        if have is not None:
-            _check(run([codex, "mcp", "remove", NAME], capture_output=True, text=True, timeout=30), "remove")
-        _check(run([codex, "mcp", "add", NAME, "--", bin_path, "mcp", "--agent", "codex"],
-                   capture_output=True, text=True, timeout=30), "add")
+    keep = [v for v in (have or {}).get("env_vars", []) if v not in ENV_VARS]
+    names = keep + ENV_VARS
     path = codex_home() / "config.toml"
-    original = path.read_text(encoding="utf-8")
-    _write_atomic(path, add_env_vars(original))
-    if current(codex, run) != want:
-        _write_atomic(path, original)
-        raise SetupError("Codex didn't read back the agent-bus entry as written; config.toml restored")
+    snapshot = path.read_text(encoding="utf-8") if path.exists() else None
+    try:
+        if have is None or have["command"] != want["command"] or have["args"] != want["args"]:
+            if have is not None:
+                _check(run([codex, "mcp", "remove", NAME], capture_output=True, text=True, timeout=30), "remove")
+            _check(run([codex, "mcp", "add", NAME, "--", bin_path, "mcp", "--agent", "codex"],
+                       capture_output=True, text=True, timeout=30), "add")
+        _write_atomic(path, add_env_vars(path.read_text(encoding="utf-8"), names))
+        if not _matches(current(codex, run), want):
+            raise SetupError("Codex didn't read back the agent-bus entry as written")
+    except BaseException as e:
+        if snapshot is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_atomic(path, snapshot)
+        if isinstance(e, SetupError):
+            raise SetupError(f"{e}; config.toml restored") from e
+        raise
     return "updated"
 
 
