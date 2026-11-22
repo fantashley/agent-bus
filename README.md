@@ -189,15 +189,24 @@ line when this session has unread mail it should act on:
 - **Fails open:** headless peers, a missing or locked database, or bad input mean no output.
   A hook call takes about 60 ms.
 
-Supported now: **Claude Code**, opt-in with `local.agentBus.claude.hooks.enable = true`. This
-adds `hooks/hooks.json` to the agent-bus plugin. It was checked live with Claude Code 2.1.330:
-- the prompt hint;
-- a single stop continuation after mid-turn mail;
-- two simultaneous sessions kept apart;
-- silence for headless peers and when the database is missing.
+Supported now:
+- **Claude Code**, opt-in with `local.agentBus.claude.hooks.enable = true`. This adds
+  `hooks/hooks.json` to the agent-bus plugin. Checked live with Claude Code 2.1.330.
+- **Codex**, opt-in with `local.agentBus.codex.hooks.enable = true`. `agent-bus setup-codex`
+  registers only agent-bus's `UserPromptSubmit` and `Stop` entries in `~/.codex/hooks.json`,
+  pointing at the stable profile path (`<profile>/bin/agent-bus`) so Home Manager rebuilds keep
+  Codex's persisted hook trust (trust them once in Codex's `/hooks` prompt; hook trust is never
+  bypassed). Under `codex --no-daemon`, each session binds cleanly and multiple sessions stay
+  apart; under Codex's shared app-server daemon, binding works for a single session and fails
+  closed (no hint) when multiple sessions share the daemon. Checked live with Codex 0.171.0:
+  - the prompt hint (`additionalContext`);
+  - a single stop continuation after mid-turn mail (`decision: "block"`, `stop_hook_active`);
+  - two simultaneous standalone sessions kept apart, and shared-daemon multi-session failing closed;
+  - an ignored hint not looping;
+  - silence for headless `codex exec` peers (untrusted or trusted) and when the database is missing.
 
-Codex and Antigravity hooks come next, once their hook contracts are checked live. This was
-decided on agent-bus thread t-7d756f.
+Antigravity hooks come next, once its hook contract is checked live. This was decided on
+agent-bus thread t-7d756f.
 
 ## Install (Home Manager)
 
@@ -250,6 +259,6 @@ nix build                  # package (runs the tests)
 ## Not in v1
 
 Interactive peer panes and automatic wake-ups, until a client or Rex can deliver input
-atomically only when it's ready (see above). Still to come in v1.5: Codex and Antigravity
+atomically only when it's ready (see above). Still to come in v1.5: Antigravity
 hooks, writable participants in separate workspaces (`jj workspace` or git worktrees), and
 cross-host discussions.

@@ -225,6 +225,14 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("setup-codex", help="register agent-bus with Codex, forwarding Rex variables")
     s.add_argument("--bin", help="agent-bus executable Codex should run (default: this one)")
+    grp = s.add_mutually_exclusive_group()
+    grp.add_argument("--hooks", action="store_true",
+                     help="register agent-bus fixed-hint hooks in Codex's hooks.json")
+    grp.add_argument("--no-hooks", action="store_true",
+                     help="remove agent-bus hooks from Codex's hooks.json")
+    s.add_argument("--hooks-only", action="store_true",
+                   help="only update Codex's hooks.json; leave config.toml untouched")
+    s.add_argument("--hooks-bin", help="stable agent-bus path for hooks.json (default: --bin)")
 
     s = sub.add_parser("run-job", help="(internal) run a queued job")
     s.add_argument("job")
@@ -306,13 +314,30 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "setup-codex":
         from . import codex_setup
-        me = cfg.self_command()
-        if not args.bin and len(me) != 1:
-            print("agent-bus: setup-codex: can't tell where agent-bus is installed; pass --bin", file=sys.stderr)
-            return 1
-        exe = os.path.abspath(args.bin or me[0])
+        if args.hooks_bin and not args.hooks:
+            p.error("--hooks-bin requires --hooks")
+        if args.hooks_only and not (args.hooks or args.no_hooks):
+            p.error("--hooks-only requires --hooks or --no-hooks")
+        need_exe = (not args.hooks_only) or (args.hooks and not args.hooks_bin)
+        exe = None
+        if need_exe:
+            me = cfg.self_command()
+            if not args.bin and len(me) != 1:
+                print("agent-bus: setup-codex: can't tell where agent-bus is installed; pass --bin", file=sys.stderr)
+                return 1
+            exe = os.path.abspath(args.bin or me[0])
         try:
-            print(f"codex: agent-bus entry {codex_setup.ensure(exe)}")
+            if not args.hooks_only:
+                assert exe is not None
+                print(f"codex: agent-bus entry {codex_setup.ensure(exe)}")
+            if args.hooks:
+                hooks_exe = os.path.abspath(args.hooks_bin) if args.hooks_bin else exe
+                assert hooks_exe is not None
+                state = codex_setup.ensure_hooks(hooks_exe, enable=True)
+                note = " (trust them once in Codex's /hooks prompt)" if state == "updated" else ""
+                print(f"codex: agent-bus hooks {state}{note}")
+            elif args.no_hooks:
+                print(f"codex: agent-bus hooks {codex_setup.ensure_hooks(enable=False)}")
         except (codex_setup.SetupError, OSError, UnicodeError, subprocess.TimeoutExpired) as e:
             print(f"agent-bus: setup-codex: {e}", file=sys.stderr)
             return 1

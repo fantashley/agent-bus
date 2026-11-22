@@ -137,7 +137,7 @@ def test_fails_open(env, monkeypatch, tmp_path):
     assert hooks.run("claude", "prompt", "{}", env={"AGENT_BUS_PEER": "j-1"}, bus=bus, pid=999, **bind_kw()) == ""
     assert run(bus, "prompt", "not json") == ""
     assert run(bus, "prompt", "[1]") == ""
-    assert hooks.run("codex", "prompt", "{}", env={}, bus=bus, pid=999, **bind_kw()) == ""  # not yet supported
+    assert hooks.run("antigravity", "prompt", "{}", env={}, bus=bus, pid=999, **bind_kw()) == ""  # not yet supported
     assert hooks.run("claude", "bogus", "{}", env={}, bus=bus, pid=999, **bind_kw()) == ""
     broken = {"ancestors_of": lambda pid: 1 / 0}
     assert hooks.run("claude", "prompt", "{}", env={}, bus=bus, pid=999, **broken) == ""
@@ -263,3 +263,54 @@ def test_unreadable_start_time_of_a_registered_ancestor_binds_nothing(env):
     starts = {400: None, 500: "outer"}  # the nearer one's start time can't be read
     assert hooks.bind_session(bus, "claude", 999, ancestors_of=lambda pid: [400, 500, 1],
                               start_of=starts.get, alive=lambda pid: True) is None
+
+
+def test_codex_prompt_stop_and_session_isolation(env):
+    bus = env["bus"]
+    s1 = session(bus, agent="codex", client=501, start="t1")
+    s2 = session(bus, agent="codex", client=502, start="t2")
+    claude = Service(bus, "claude", bus.register_session("claude", env={}))
+    tid = Service(bus, "codex", s1).send("question", to="claude")["thread"]["id"]
+    claude.send("answer 1", thread=tid, to="codex")
+
+    # Session 1 gets the prompt hint; session 2 (separate --no-daemon process) does not.
+    prompt_payload = json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": "hi"})
+    out1 = hooks.run("codex", "prompt", prompt_payload, env={}, pid=901, bus=bus, now=100.0,
+                     **bind_kw(client=501, start="t1"))
+    assert json.loads(out1) == {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                                       "additionalContext": hooks.HINT}}
+    assert hooks.run("codex", "prompt", prompt_payload, env={}, pid=902, bus=bus, now=100.0,
+                     **bind_kw(client=502, start="t2")) == ""
+
+    # New mid-turn mail triggers one stop continuation; stop_hook_active suppresses loops.
+    claude.send("answer 2", thread=tid, to="codex")
+    stop_payload = json.dumps({"hook_event_name": "Stop", "stop_hook_active": False})
+    stop_out = hooks.run("codex", "stop", stop_payload, env={}, pid=901, bus=bus, now=200.0,
+                         **bind_kw(client=501, start="t1"))
+    assert json.loads(stop_out) == {"decision": "block", "reason": hooks.HINT}
+    claude.send("answer 3", thread=tid, to="codex")
+    assert hooks.run("codex", "stop", stop_payload, env={}, pid=901, bus=bus, now=300.0,
+                     **bind_kw(client=501, start="t1")) == ""
+    active_payload = json.dumps({"hook_event_name": "Stop", "stop_hook_active": True})
+    assert hooks.run("codex", "stop", active_payload, env={}, pid=901, bus=bus, now=400.0,
+                     **bind_kw(client=501, start="t1")) == ""
+
+    # Headless codex exec peers stay silent.
+    assert hooks.run("codex", "prompt", prompt_payload, env={"AGENT_BUS_PEER": "j-1"}, pid=901,
+                     bus=bus, now=500.0, **bind_kw(client=501, start="t1")) == ""
+
+
+def test_codex_shared_daemon_fails_closed_with_multiple_sessions(env):
+    bus = env["bus"]
+    s1 = session(bus, agent="codex", client=800, start="daemon")
+    claude = Service(bus, "claude", bus.register_session("claude", env={}))
+    tid = Service(bus, "codex", s1).send("q", to="claude")["thread"]["id"]
+    claude.send("a1", thread=tid, to="codex")
+    # Single session under the daemon binds cleanly.
+    assert hooks.run("codex", "prompt", "{}", env={}, pid=901, bus=bus, now=100.0,
+                     **bind_kw(client=800, start="daemon"))
+    # A second live session under the same daemon makes binding ambiguous -> fail closed.
+    session(bus, agent="codex", client=800, start="daemon")
+    claude.send("a2", thread=tid, to="codex")
+    assert hooks.run("codex", "prompt", "{}", env={}, pid=901, bus=bus, now=200.0,
+                     **bind_kw(client=800, start="daemon")) == ""
