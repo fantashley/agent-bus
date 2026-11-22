@@ -45,7 +45,10 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
         # Under Codex's shared app-server daemon, REX_* are the daemon's, not this window's (#6).
         rex_reason = (procinfo.CODEX_SHARED_DAEMON
                       if agent == "codex" and procinfo.shared_codex_daemon(os.getpid()) is not None else None)
-        session_id = bus.register_session(agent, cwd=cwd, repo=cfg.repo_root(cwd), role=role, rex_reason=rex_reason)
+        # The client that started this server, so its hooks can find this session (and only it).
+        client = os.getppid()
+        session_id = bus.register_session(agent, cwd=cwd, repo=cfg.repo_root(cwd), role=role, rex_reason=rex_reason,
+                                          client_pid=client, client_start=procinfo.start_time(client))
     svc = service.Service(bus, agent=agent, session_id=session_id)
     mcp = MCPServer(name="agent-bus", instructions=INSTRUCTIONS)
 

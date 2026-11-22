@@ -211,6 +211,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--agent", required=True, choices=cfg.AGENTS)
     s.add_argument("--role")
 
+    s = sub.add_parser("hook", help="(called by client hooks) print a fixed unread-mail hint at turn boundaries")
+    s.add_argument("--client", required=True)
+    s.add_argument("--event", required=True)
+
     s = sub.add_parser("setup-codex", help="register agent-bus with Codex, forwarding Rex variables")
     s.add_argument("--bin", help="agent-bus executable Codex should run (default: this one)")
 
@@ -276,6 +280,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "mcp":
         from . import mcp_server
         mcp_server.main(args.agent, args.role)
+        return 0
+    if args.cmd == "hook":
+        from . import hooks
+        try:
+            payload = sys.stdin.read() if not sys.stdin.isatty() else ""
+        except (OSError, ValueError):
+            payload = ""
+        out = hooks.run(args.client, args.event, payload)
+        if out:
+            print(out)
         return 0
     if args.cmd == "setup-codex":
         from . import codex_setup

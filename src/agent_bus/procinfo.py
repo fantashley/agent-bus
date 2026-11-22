@@ -39,6 +39,20 @@ def proc(pid: int) -> tuple[int, str] | None:
         return None
 
 
+def start_time(pid: int) -> str | None:
+    """An opaque token for when a process started, so a reused pid isn't mistaken for it."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return "linux:" + f.read().rsplit(")", 1)[1].split()[19]  # field 22, starttime
+    except (OSError, IndexError):
+        pass
+    try:  # macOS and other systems without /proc
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+        return "ps:" + " ".join(out.stdout.split()) if out.returncode == 0 and out.stdout.strip() else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def ancestors(pid: int, limit: int = 32) -> list[int]:
     """Parent, grandparent, ... of ``pid``, stopping at init, on a cycle, or after ``limit``."""
     out, seen = [], {pid}
