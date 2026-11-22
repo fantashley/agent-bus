@@ -38,9 +38,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd TEXT, repo TEXT, role TEXT,
     rex_session TEXT, rex_block TEXT, rex_server TEXT,
     rex_reason TEXT,                    -- why no Rex location was recorded, e.g. codex_shared_daemon
+    client_pid INTEGER, client_start TEXT,  -- the client process that started this MCP server
     pid INTEGER,
     started_at REAL NOT NULL,
     last_seen REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hook_state (  -- fixed-hint hooks, kept apart from read cursors
+    session_id TEXT PRIMARY KEY,
+    last_hinted_msg_id INTEGER NOT NULL DEFAULT 0,
+    last_hint_at REAL NOT NULL DEFAULT 0,
+    turn INTEGER NOT NULL DEFAULT 0,
+    stop_used INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS threads (
     id TEXT PRIMARY KEY,
@@ -181,27 +189,43 @@ class _LockedConn:
 
 
 class Bus:
-    def __init__(self, path: str | os.PathLike | None = None):
+    def __init__(self, path: str | os.PathLike | None = None, timeout: float = 30):
         self.path = Path(path) if path else cfg.db_path()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not self.path.exists():
             fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
             os.close(fd)
         os.chmod(self.path, 0o600)
-        raw = sqlite3.connect(self.path, timeout=30, isolation_level=None, check_same_thread=False)
+        raw = sqlite3.connect(self.path, timeout=timeout, isolation_level=None, check_same_thread=False)
         raw.row_factory = sqlite3.Row
         self.conn = _LockedConn(raw)
+        self.conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
         self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA busy_timeout=30000")
         self._depth = 0
         self.conn.executescript(SCHEMA)
         self._migrate()
 
+    SESSION_COLUMNS = (("rex_reason", "TEXT"), ("client_pid", "INTEGER"), ("client_start", "TEXT"))
+
+    def _needs_migration(self) -> bool:
+        scols = {r["name"] for r in self._all("PRAGMA table_info(sessions)")}
+        tcols = {r["name"] for r in self._all("PRAGMA table_info(threads)")}
+        jobs_sql = self._one("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'")["sql"]
+        return (any(c not in scols for c, _ in self.SESSION_COLUMNS) or "blind" not in tcols
+                or "dedupe_key TEXT UNIQUE" in jobs_sql)
+
     def _migrate(self) -> None:
-        """Bring databases created by older versions up to the current schema."""
+        """Bring databases created by older versions up to the current schema.
+
+        Checked read-only first, so opening an up-to-date database (every hook call
+        does) never takes the write lock."""
+        if not self._needs_migration():
+            return
         with self.tx():
-            if "rex_reason" not in {r["name"] for r in self._all("PRAGMA table_info(sessions)")}:
-                self.conn.execute("ALTER TABLE sessions ADD COLUMN rex_reason TEXT")
+            scols = {r["name"] for r in self._all("PRAGMA table_info(sessions)")}
+            for col, typ in self.SESSION_COLUMNS:
+                if col not in scols:
+                    self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typ}")
             cols = {r["name"] for r in self._all("PRAGMA table_info(threads)")}
             if "blind" not in cols:
                 self.conn.execute("ALTER TABLE threads ADD COLUMN blind INTEGER NOT NULL DEFAULT 0")
@@ -265,7 +289,8 @@ class Bus:
     # ------------------------------------------------------------------ sessions
 
     def register_session(self, agent_type: str, cwd: str | None = None, repo: str | None = None,
-                         role: str | None = None, env: dict | None = None, rex_reason: str | None = None) -> str:
+                         role: str | None = None, env: dict | None = None, rex_reason: str | None = None,
+                         client_pid: int | None = None, client_start: str | None = None) -> str:
         """Record a session.  With ``rex_reason`` set, the inherited REX_* variables are
         known not to describe this session's window, so no Rex location is stored."""
         env = os.environ if env is None else env
@@ -274,9 +299,10 @@ class Bus:
         now = _now()
         self.conn.execute(
             "INSERT INTO sessions (id, agent_type, cwd, repo, role, rex_session, rex_block, rex_server,"
-            " rex_reason, pid, started_at, last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " rex_reason, client_pid, client_start, pid, started_at, last_seen)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (sid, agent_type, cwd, repo, role, loc.get("REX_SESSION"), loc.get("REX_BLOCK"),
-             loc.get("REX_SERVER"), rex_reason, os.getpid(), now, now),
+             loc.get("REX_SERVER"), rex_reason, client_pid, client_start, os.getpid(), now, now),
         )
         return sid
 
@@ -553,6 +579,20 @@ class Bus:
             "INSERT INTO cursors VALUES (?,?,?) ON CONFLICT(subscriber, thread_id)"
             " DO UPDATE SET last_id=max(last_id, excluded.last_id)", (subscriber, thread_id, last_id))
 
+    def candidate_threads(self, agent_type: str) -> list[dict]:
+        """Threads that can hold unread mail for ``agent_type``: open, or changed in the
+        last day, and involving it.  Not capped, so repeated reads always reach every
+        thread; callers cap messages instead."""
+        cutoff = _now() - 86400
+        rows = self._all("SELECT id FROM threads WHERE status IN ('open','needs_human') OR updated_at >= ?"
+                         " ORDER BY updated_at DESC", cutoff)
+        out = []
+        for r in rows:
+            t = self.thread(r["id"])
+            if self._involves(t, agent_type):
+                out.append(t)
+        return out
+
     def unread(self, subscriber: str, agent_type: str, thread_id: str | None = None,
                limit: int = 50, advance: bool = True) -> list[dict]:
         """Messages for ``agent_type`` newer than this subscriber's cursor.
@@ -564,9 +604,7 @@ class Bus:
         if thread_id:
             threads = [self.thread(thread_id)]
         else:
-            cutoff = _now() - 86400
-            threads = [t for t in self.threads(include_closed=True, agent_type=agent_type, limit=200)
-                       if t["status"] in ("open", "needs_human") or t["updated_at"] >= cutoff]
+            threads = self.candidate_threads(agent_type)
         out: list[dict] = []
         for t in threads:
             last = self._cursor(subscriber, t["id"])
