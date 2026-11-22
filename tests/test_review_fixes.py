@@ -548,3 +548,76 @@ def test_codex_server_name_that_cant_be_overridden_fails_closed(env, monkeypatch
     monkeypatch.setattr(adapter, "mcp_servers", lambda cwd: ["agent-bus", "my_srv-2"])
     argv = adapter.invocation("hi", None, str(env["repo"]), []).argv
     assert "mcp_servers.my_srv-2.enabled=false" in argv
+
+
+def test_antigravity_progress_events_from_real_stream():
+    """Recorded `agy --output-format stream-json` output: tool calls show their name and
+    main argument, reply text is emitted per step (no empty lines), and thinking is
+    reported as a token count, since agy doesn't stream its content."""
+    import json
+    from pathlib import Path
+    from agent_bus.peers import AntigravityAdapter, StreamState
+    st, events = StreamState(), []
+    adapter = AntigravityAdapter.__new__(AntigravityAdapter)
+    for line in (Path(__file__).parent / "data" / "agy-stream.jsonl").read_text().splitlines():
+        adapter.parse_line(json.loads(line), st, lambda k, t: events.append((k, t)))
+    assert ("tool", "read_file /repo/README.md") in events
+    texts = [t for k, t in events if k == "text"]
+    assert len(texts) == 1 and "agent-bus" in texts[0]  # the thinking-only step emits no text
+    assert any(k == "thinking" and "thinking tokens" in t for k, t in events)
+    assert st.final and "agent-bus" in st.final and st.external_id
+
+
+def test_antigravity_events_long_text_hints_and_repeated_frames():
+    from agent_bus.peers import AntigravityAdapter, StreamState
+    st, events = StreamState(), []
+    adapter = AntigravityAdapter.__new__(AntigravityAdapter)
+    emit = lambda k, t: events.append((k, t))
+
+    def step(**su):
+        adapter.parse_line({"event": "step_update", "step_update": su}, st, emit)
+
+    tool = {"step_index": 1, "state": "ACTIVE", "step_type": "tool", "tool_name": "search_web",
+            "tool_info": {"name": "search_web", "parameters": {"query": "rex osc 7501"}}}
+    step(**tool)
+    step(**tool)  # a second ACTIVE frame for the same step
+    step(step_index=2, state="ACTIVE", step_type="tool", tool_name="list_dir",
+         tool_info={"parameters": {"DirectoryPath": "/repo/src"}})
+    step(step_index=3, state="ACTIVE", step_type="tool", tool_name="odd", tool_info={"parameters": ["x"]})
+    long = "START " + "word " * 120 + "END"
+    step(step_index=4, state="ACTIVE", step_type="agent_response", text_delta=long)
+    step(step_index=4, state="DONE", step_type="agent_response", usage={"thinking_tokens": 9},
+         duration_seconds=2.0)
+    assert events[:3] == [("tool", "search_web rex osc 7501"), ("tool", "list_dir /repo/src"), ("tool", "odd")]
+    assert events[3] == ("thinking", "9 thinking tokens over 2s")  # thinking comes before its text
+    kind, text = events[4]
+    assert kind == "text" and text.startswith("START") and text.endswith("…")
+
+
+def test_tail_prints_thinking_events(env, capsys):
+    from agent_bus import cli
+    bus = env["bus"]
+    tid = bus.create_thread("chat", "x", ["antigravity"], "human")["id"]
+    bus.add_event(tid, "thinking", "12 thinking tokens over 3s", agent="antigravity")
+    assert cli.main(["tail", tid, "--peer", "antigravity", "--once", "--no-status", "--no-color"]) == 0
+    assert "antigravity thinking: 12 thinking tokens over 3s" in capsys.readouterr().out
+
+
+def test_antigravity_text_is_kept_per_step():
+    """Two response steps (with a tool call between) give two text events, each with only
+    its own step's text, while the final answer still joins them."""
+    from agent_bus.peers import AntigravityAdapter, StreamState
+    st, events = StreamState(), []
+    adapter = AntigravityAdapter.__new__(AntigravityAdapter)
+
+    def step(**su):
+        adapter.parse_line({"event": "step_update", "step_update": su}, st, lambda k, t: events.append((k, t)))
+
+    step(step_index=1, state="ACTIVE", step_type="agent_response", text_delta="Let me check ")
+    step(step_index=1, state="ACTIVE", step_type="agent_response", text_delta="the file.")
+    step(step_index=1, state="DONE", step_type="agent_response")
+    step(step_index=2, state="ACTIVE", step_type="tool", tool_name="read_file", tool_info={"parameters": {"Path": "/r"}})
+    step(step_index=3, state="ACTIVE", step_type="agent_response", text_delta="It says hi.")
+    step(step_index=3, state="DONE", step_type="agent_response")
+    assert [t for k, t in events if k == "text"] == ["Let me check the file.", "It says hi."]
+    assert "".join(st.text_parts) == "Let me check the file.It says hi."
