@@ -168,3 +168,68 @@ def test_cli_prints_hint_or_nothing(env, monkeypatch, capsys):
     assert capsys.readouterr().out == "OUT\n"
     assert cli.main(["hook", "--client", "claude", "--event", "stop"]) == 0
     assert capsys.readouterr().out == ""
+
+
+def test_ineligible_backlog_does_not_hide_later_mail(env):
+    """More than unread()'s default 50 ineligible messages ahead of a real reply."""
+    bus = env["bus"]
+    tid = Service(bus, "claude", session(bus)).send("q", to="codex")["thread"]["id"]
+    for i in range(60):
+        bus.post(tid, SYSTEM, f"progress {i}", kind="status")
+    Service(bus, "codex", bus.register_session("codex", env={})).send("the answer", thread=tid, to="claude")
+    assert run(bus)
+
+
+def test_reused_pid_of_an_old_client_does_not_stop_the_walk(env):
+    bus = env["bus"]
+    bus.register_session("claude", env={}, client_pid=400, client_start="long-ago")  # stale row, pid reused
+    sid = session(bus)  # the real client is pid 500, above the intermediate 400
+    starts = {400: "now-a-shell", 500: "t0"}
+    found = hooks.bind_session(bus, "claude", 999, ancestors_of=lambda pid: [400, 500, 1],
+                               start_of=starts.get, alive=lambda pid: True)
+    assert found and found["id"] == sid
+
+
+def test_ask_question_does_not_prompt_unrelated_sessions(env, no_spawn):
+    bus = env["bus"]
+    session(bus)
+    Service(bus, HUMAN).start_discussion("Which is better?", peers=["claude", "codex"])
+    assert run(bus, "prompt") == "" and run(bus, "stop") == ""
+
+
+def test_thread_of_an_ended_same_agent_session_counts(env):
+    bus = env["bus"]
+    old = session(bus, client=600)
+    tid = Service(bus, "claude", old).send("q", to="codex")["thread"]["id"]
+    bus.conn.execute("UPDATE sessions SET pid=? WHERE id=?", (2 ** 22 + 4321, old))  # that session ended
+    session(bus)
+    Service(bus, "codex", bus.register_session("codex", env={})).send("late answer", thread=tid, to="claude")
+    assert run(bus, "prompt")
+
+
+def test_locked_database_fails_open_quickly(env):
+    import sqlite3
+    import time as _t
+    bus = env["bus"]
+    session(bus)
+    Service(bus, "codex", bus.register_session("codex", env={})).send("x", to="claude")
+    lock = sqlite3.connect(bus.path, isolation_level=None)
+    lock.execute("BEGIN EXCLUSIVE")
+    try:
+        start = _t.monotonic()
+        out = hooks.run("claude", "prompt", "{}", env={}, pid=999, **bind_kw())  # opens its own Bus
+        assert out == "" and _t.monotonic() - start < 2
+    finally:
+        lock.execute("ROLLBACK")
+
+
+def test_opening_current_db_takes_no_write_lock(env):
+    import sqlite3
+    from agent_bus.db import Bus
+    bus = env["bus"]
+    lock = sqlite3.connect(bus.path, isolation_level=None)
+    lock.execute("BEGIN IMMEDIATE")  # another writer holds the write lock
+    try:
+        Bus(bus.path, timeout=0.1).close()  # must not need it
+    finally:
+        lock.execute("ROLLBACK")

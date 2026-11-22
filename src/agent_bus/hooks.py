@@ -40,6 +40,7 @@ HINT = ("agent-bus: Unread messages are available for this session. Call the age
 
 COOLDOWN_S = 30  # minimum gap between hints for newer mail
 DB_TIMEOUT_S = 0.25
+UNREAD_SCAN = 100_000
 
 EVENTS = ("prompt", "stop")
 CLIENTS = ("claude",)  # Codex and Antigravity adapters follow once verified live
@@ -58,7 +59,12 @@ def bind_session(bus: Bus, agent: str, pid: int,
         if not rows:
             continue
         start = start_of(p)
-        live = [dict(r) for r in rows if start and r["client_start"] == start and alive(r["pid"])]
+        # A pid recorded by some earlier, long-gone client (pids get reused, and an
+        # intermediate shell can land on one) isn't this ancestor: keep walking.
+        same = [dict(r) for r in rows if start and r["client_start"] == start]
+        if not same:
+            continue
+        live = [r for r in same if alive(r["pid"])]
         return live[0] if len(live) == 1 else None
     return None
 
@@ -71,7 +77,7 @@ def _alive(pid: Any) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        pass
+        return False  # another user's process can't be this user's MCP server
     info = procinfo.proc(pid)
     return info is None or info[1] != "Z"
 
@@ -85,7 +91,7 @@ def eligible(bus: Bus, session: dict, msgs: list[dict], stop: bool) -> list[dict
     - Otherwise only mail that arrived after the session started, and not on a thread
       another live session of the same agent started (that session's mail).
     - Discussions and reviews this session didn't start are run by headless peers;
-      only a human's message there counts.
+      only a human's message addressed to this agent counts there.
     - At stop, only threads this session started and human messages may hold the
       turn open; other chat waits for the next prompt.
     """
@@ -96,7 +102,10 @@ def eligible(bus: Bus, session: dict, msgs: list[dict], stop: bool) -> list[dict
             continue
         t = bus.thread(m["thread_id"])
         mine = t["initiator_session"] == session["id"]
-        human = m["sender"] == HUMAN
+        # A human's message counts when it's addressed to this agent, or on a plain chat.
+        # The opening question of `agent-bus ask` goes to the whole discussion, which
+        # headless peers handle, so it doesn't prompt unrelated interactive sessions.
+        human = m["sender"] == HUMAN and (m["recipient"] == session["agent_type"] or t["kind"] == "chat")
         if not mine:
             if m["created_at"] < session["started_at"]:
                 continue
@@ -163,7 +172,11 @@ def run(client: str, event: str, payload: str, env: dict | None = None, pid: int
             session = bind_session(bus, client, pid or os.getpid(), **bind)
             if not session:
                 return ""
-            msgs = bus.unread(session["id"], client, advance=False)
+            # All unread, not unread's default first 50: eligibility filters after this,
+            # and with cursors never advanced, a full batch of ineligible messages (e.g.
+            # status chatter) would hide later mail forever.  Threads are message-capped,
+            # so this stays small.
+            msgs = bus.unread(session["id"], client, advance=False, limit=UNREAD_SCAN)
             ok = eligible(bus, session, msgs, stop=event == "stop")
             newest = max((m["id"] for m in ok), default=None)
             if not claim(bus, session["id"], event, newest, time.time() if now is None else now):

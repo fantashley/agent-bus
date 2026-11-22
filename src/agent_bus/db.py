@@ -199,17 +199,31 @@ class Bus:
         raw = sqlite3.connect(self.path, timeout=timeout, isolation_level=None, check_same_thread=False)
         raw.row_factory = sqlite3.Row
         self.conn = _LockedConn(raw)
-        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self._depth = 0
         self.conn.executescript(SCHEMA)
         self._migrate()
 
+    SESSION_COLUMNS = (("rex_reason", "TEXT"), ("client_pid", "INTEGER"), ("client_start", "TEXT"))
+
+    def _needs_migration(self) -> bool:
+        scols = {r["name"] for r in self._all("PRAGMA table_info(sessions)")}
+        tcols = {r["name"] for r in self._all("PRAGMA table_info(threads)")}
+        jobs_sql = self._one("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'")["sql"]
+        return (any(c not in scols for c, _ in self.SESSION_COLUMNS) or "blind" not in tcols
+                or "dedupe_key TEXT UNIQUE" in jobs_sql)
+
     def _migrate(self) -> None:
-        """Bring databases created by older versions up to the current schema."""
+        """Bring databases created by older versions up to the current schema.
+
+        Checked read-only first, so opening an up-to-date database (every hook call
+        does) never takes the write lock."""
+        if not self._needs_migration():
+            return
         with self.tx():
             scols = {r["name"] for r in self._all("PRAGMA table_info(sessions)")}
-            for col, typ in (("rex_reason", "TEXT"), ("client_pid", "INTEGER"), ("client_start", "TEXT")):
+            for col, typ in self.SESSION_COLUMNS:
                 if col not in scols:
                     self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typ}")
             cols = {r["name"] for r in self._all("PRAGMA table_info(threads)")}
