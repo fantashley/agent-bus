@@ -179,16 +179,51 @@ class Config:
         return False
 
 
+def _is_bare_git(d: Path) -> bool:
+    return (d.name != ".git" and (d / "HEAD").is_file() and (d / "objects").is_dir()
+            and ((d / "refs").is_dir() or (d / "reftable").is_dir()))
+
+
+def vcs(path: str | os.PathLike) -> str | None:
+    """Which tool manages the nearest repo containing ``path``: "jj" when its
+    root has a ``.jj`` directory and jj is installed (colocated jj+git repos
+    count), "git" for a git repo (including bare repos, or a colocated repo
+    without jj installed), None outside any repo.  Decided from the filesystem,
+    so a plain git repo never spawns jj."""
+    p = Path(os.path.realpath(os.path.expanduser(str(path))))
+    for d in (p, *p.parents):
+        has_jj = (d / ".jj").is_dir()
+        has_git = (d / ".git").exists() or _is_bare_git(d)
+        if has_jj or has_git:
+            if has_jj and shutil.which("jj"):
+                return "jj"
+            return "git" if has_git else None
+    return None
+
+
 def repo_root(path: str | os.PathLike) -> str:
-    """Return the jj (or git) root containing ``path``, or ``path`` itself."""
+    """Return the jj or git root containing ``path``, or ``path`` itself."""
     path = os.path.realpath(os.path.expanduser(str(path)))
-    for cmd in (["jj", "root", "--ignore-working-copy"], ["git", "rev-parse", "--show-toplevel"]):
+    kind = vcs(path)
+    if kind == "jj":
+        cmds = (["jj", "root", "--ignore-working-copy"],)
+    elif kind == "git":
+        cmds = (["git", "rev-parse", "--show-toplevel"],
+                ["git", "rev-parse", "--is-bare-repository", "--absolute-git-dir"])
+    else:
+        return path
+    for cmd in cmds:
         try:
             out = subprocess.run(cmd, cwd=path, capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.TimeoutExpired):
             continue
         if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip()
+            lines = out.stdout.strip().splitlines()
+            if "--is-bare-repository" in cmd:
+                if len(lines) == 2 and lines[0] == "true":
+                    return lines[1]
+            else:
+                return lines[0]
     return path
 
 

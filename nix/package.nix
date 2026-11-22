@@ -1,4 +1,4 @@
-{ lib, python3Packages, jujutsu, git }:
+{ lib, python3Packages, git, jujutsu, withJujutsu ? true }:
 
 python3Packages.buildPythonApplication {
   pname = "agent-bus";
@@ -14,15 +14,18 @@ python3Packages.buildPythonApplication {
   build-system = [ python3Packages.setuptools ];
   dependencies = [ python3Packages.mcp ];
 
-  # Reviews diff pinned commits with jj (git as a fallback), so both are on the
-  # wrapped program's PATH rather than assumed to be installed.
-  makeWrapperArgs = [ "--suffix" "PATH" ":" (lib.makeBinPath [ jujutsu git ]) ];
+  # Reviews diff pinned commits with the repo's own tool: jj in a jj repo (when
+  # jj is installed), git otherwise. git is always on the wrapped PATH; jj only
+  # when withJujutsu (plain-git users can build without it).
+  makeWrapperArgs = [ "--suffix" "PATH" ":" (lib.makeBinPath ([ git ] ++ lib.optional withJujutsu jujutsu)) ];
 
-  nativeCheckInputs = [ python3Packages.pytestCheckHook jujutsu ];
-  # The review test makes a throwaway jj repo; jj wants a user and a writable home.
+  nativeCheckInputs = [ python3Packages.pytestCheckHook git ] ++ lib.optional withJujutsu jujutsu;
+  # The review tests make throwaway git (and jj) repos, which want a user and a writable home.
   preCheck = ''
     export HOME=$(mktemp -d)
     export JJ_USER=test JJ_EMAIL=test@example.com
+    export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
+    export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
   '';
 
   meta = {

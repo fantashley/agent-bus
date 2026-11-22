@@ -83,8 +83,8 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
         """Post to a thread (or start a new chat thread with `to` when `thread` is omitted).
 
         kind: message | proposal | vote | status. For a vote, set `on` (proposal id such as "P2"),
-        `stance` ("agree" or "object") and `reasons`. `refs` can point at artifacts (jj change id,
-        file paths, PR URL) instead of pasting them.
+        `stance` ("agree" or "object") and `reasons`. `refs` can point at artifacts (change id or
+        branch, file paths, PR URL) instead of pasting them.
         """
         return call(svc.send, body=body, thread=thread, to=to, kind=kind, on=on, stance=stance,
                     reasons=reasons, refs=refs)
@@ -156,10 +156,11 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
                        effort: str | None = None) -> dict[str, Any]:
         """Ask another agent for a read-only review of a pinned change in an allow-listed repo.
 
-        Pin full commit ids (`jj log --no-graph -r @ -T commit_id`). For a follow-up pass, pass the
-        head that reviewer last reviewed as prev_head_commit_id: the request continues the same
-        review thread and resumes the reviewer's own conversation, so it keeps its earlier
-        findings and sees only the interdiff plus any replies you posted on the thread.
+        Pin full commit ids (`git rev-parse HEAD`, or `jj log --no-graph -r @ -T commit_id` in a jj
+        repo); change_id is an optional label (jj change id, branch name, "PR #12"). For a follow-up
+        pass, pass the head that reviewer last reviewed as prev_head_commit_id: the request
+        continues the same review thread and resumes the reviewer's own conversation, so it keeps
+        its earlier findings and sees only the interdiff plus any replies you posted on the thread.
         model/effort optionally set the reviewer's model and reasoning effort for this review
         thread (kept for follow-up passes unless given again).
         """

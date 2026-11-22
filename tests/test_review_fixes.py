@@ -1,6 +1,7 @@
 """Regression tests for the first agent-bus review round (codex + antigravity)."""
 import asyncio
 import json
+import shutil
 import subprocess
 import threading
 import time
@@ -358,7 +359,7 @@ def test_hung_peer_with_big_prompt_times_out(env, monkeypatch):
 
 
 def _jj_repo(repo):
-    if subprocess.run(["jj", "--version"], capture_output=True).returncode != 0:
+    if shutil.which("jj") is None:
         pytest.skip("jj not installed")
     sh = lambda *a: subprocess.run(a, cwd=repo, check=True, capture_output=True, text=True).stdout.strip()  # noqa: E731
     sh("jj", "git", "init")
