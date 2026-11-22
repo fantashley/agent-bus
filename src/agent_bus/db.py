@@ -319,7 +319,7 @@ class Bus:
         t["participants"] = json.loads(t["participants"])
         t["refs"] = _loads(t["refs"])
         # Derived, not stored: a stored flag could be rolled back with an enclosing
-        # transaction.  Ashley's `resume` lifts it by raising max_messages.
+        # transaction.  The human's `resume` lifts it by raising max_messages.
         t["agent_messages"] = self._one(
             "SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender NOT IN (?,?)", tid, HUMAN, SYSTEM)["n"]
         t["limit_reached"] = int(t["agent_messages"] >= t["max_messages"])
@@ -677,7 +677,7 @@ class Bus:
                 "UPDATE jobs SET status='cancelled', updated_at=? WHERE thread_id=? AND status IN ('queued','running')",
                 (_now(), thread_id))
             self.set_thread(thread_id, status="cancelled")
-        self.post(thread_id, SYSTEM, "Cancelled by Ashley.", kind="status")
+        self.post(thread_id, SYSTEM, "Cancelled by the human user.", kind="status")
         return [p for p in pids if p]
 
     # --------------------------------------------------------- peers and events

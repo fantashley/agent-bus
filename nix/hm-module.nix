@@ -7,7 +7,7 @@ self:
 # MCP server with each client without touching their mutable config files:
 #
 # - Claude Code: a local plugin served from a directory marketplace in the
-#   store. When the importing config has the dotfiles `local.claude` options,
+#   store. When the importing config defines `local.claude` options,
 #   it is enabled through local.claude.extraKnownMarketplaces/enabledPlugins;
 #   otherwise wire `local.agentBus.claudeMarketplace` up yourself.
 # - Codex: `codex mcp add` at activation, skipped when the entry already

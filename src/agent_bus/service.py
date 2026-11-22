@@ -1,7 +1,7 @@
 """Operations shared by the MCP server and the CLI.
 
 A :class:`Service` acts on behalf of one identity: an agent session (MCP) or
-Ashley (CLI, ``agent="human"``).  Results are plain dicts ready to serialise.
+the human user (CLI, ``agent="human"``).  Results are plain dicts ready to serialise.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def present(m: dict) -> dict:
     body = m["body"]
     if m["trust"] == "peer_data" and m["sender"] != SYSTEM:
         body = wrap_peer(m["sender"], body)
-    out = {"id": m["id"], "thread": m["thread_id"], "from": "Ashley (human)" if m["sender"] == HUMAN else m["sender"],
+    out = {"id": m["id"], "thread": m["thread_id"], "from": "human" if m["sender"] == HUMAN else m["sender"],
            "kind": m["kind"], "trust": m["trust"], "round": m["round"], "body": body,
            "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(m["created_at"]))}
     if m["recipient"]:
@@ -158,7 +158,7 @@ class Service:
         else:
             # The question is the initiator's own text: it stays peer_data, never system.
             self.bus.post(t["id"], self.agent, question.strip(), session_id=self.session_id)
-        self.bus.post(t["id"], SYSTEM, f"Discussion started by {'Ashley' if self.agent == HUMAN else self.agent} "
+        self.bus.post(t["id"], SYSTEM, f"Discussion started by {'the human user' if self.agent == HUMAN else self.agent} "
                       f"with {', '.join(participants)}; up to {rounds} rounds.", kind="status")
         job = self._dispatch(t["id"], "discussion", {"mode": "start"}, f"{t['id']}:start")
         res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(t["id"])), "job": job}
@@ -176,12 +176,12 @@ class Service:
         if t["kind"] != "discussion":
             raise ValueError(f"{thread} is not a discussion")
         if self.agent not in (t["initiator"], HUMAN):
-            raise BusError("NOT_INITIATOR", "only the initiator (or Ashley) can advance a discussion")
+            raise BusError("NOT_INITIATOR", "only the initiator (or the human user) can advance a discussion")
         if t["status"] != "open":
             raise BusError("THREAD_CLOSED", f"thread is {t['status']}")
         if t["round"] >= t["max_rounds"]:
             raise BusError("THREAD_LIMIT_REACHED",
-                           f"all {t['max_rounds']} rounds are used; Ashley can `agent-bus resume {thread}`")
+                           f"all {t['max_rounds']} rounds are used; run `agent-bus resume {thread}`")
         job = self._dispatch(thread, "discussion", {"mode": "advance"}, f"{thread}:advance:{t['round'] + 1}")
         return {"thread": thread_summary(t), "job": job}
 
@@ -278,7 +278,7 @@ class Service:
     def resume(self, thread: str, extra_rounds: int = 2) -> dict:
         """Human only: lift the turn cap and give a stalled discussion more rounds."""
         if self.agent != HUMAN:
-            raise BusError("HUMAN_ONLY", "only Ashley can resume a thread")
+            raise BusError("HUMAN_ONLY", "only the human user can resume a thread")
         t = self.bus.thread(thread)
         if t["status"] in ("resolved",):
             raise BusError("THREAD_CLOSED", "thread is already resolved")
@@ -290,8 +290,8 @@ class Service:
             fields["max_rounds"] = max(t["max_rounds"], t["round"]) + extra_rounds
             fields["deadline"] = time.time() + self.config.deadline_minutes * 60
         self.bus.set_thread(thread, **fields)
-        self.bus.post(thread, SYSTEM, f"Resumed by Ashley with {extra_rounds} more round(s)."
-                      if t["kind"] == "discussion" else "Resumed by Ashley.", kind="status")
+        self.bus.post(thread, SYSTEM, f"Resumed by the human user with {extra_rounds} more round(s)."
+                      if t["kind"] == "discussion" else "Resumed by the human user.", kind="status")
         res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(thread))}
         if t["kind"] == "discussion":
             res["job"] = self._dispatch(thread, "discussion", {"mode": "start_later"},
@@ -307,7 +307,7 @@ class Service:
 
     def cancel(self, thread: str) -> dict:
         if self.agent != HUMAN:
-            raise BusError("HUMAN_ONLY", "only Ashley can cancel a thread")
+            raise BusError("HUMAN_ONLY", "only the human user can cancel a thread")
         pids = self.bus.cancel_thread(thread)
         killed = []
         for pid in pids:

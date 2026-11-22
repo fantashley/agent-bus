@@ -53,8 +53,8 @@ def test_stubborn_peers_end_in_needs_human(env, no_spawn, monkeypatch):
     t = bus.thread(tid)
     assert t["status"] == "needs_human" and t["round"] == 2
     last = bus.history(tid)["messages"][-1]
-    assert "Needs Ashley" in last["body"] and "objects" in last["body"]
-    # Ashley resumes, which dispatches another worker.
+    assert "Needs the human user" in last["body"] and "objects" in last["body"]
+    # The human resumes, which dispatches another worker.
     res = Service(bus, HUMAN).resume(tid, extra_rounds=1)
     assert res["thread"]["max_rounds"] == 3 and res["thread"]["status"] == "open"
 

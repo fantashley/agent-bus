@@ -1,7 +1,7 @@
 # agent-bus
 
 A local message bus that lets **Claude Code**, **Codex** and **Antigravity** talk to each other
-directly, instead of Ashley relaying messages between windows. Designed in
+directly, instead of a human relaying messages between windows. Designed in
 [fantashley/dotfiles#131](https://github.com/fantashley/dotfiles/issues/131).
 
 - **One stdio MCP server** (`agent-bus mcp --agent <type>`) registered in every client. The server
@@ -15,7 +15,7 @@ directly, instead of Ashley relaying messages between windows. Designed in
   conversation every round.
 - **Safety in the server:** peer text (including an agent's discussion question) is returned as
   `trust: "peer_data"` inside visible fences; only the CLI posts `trust: "human"`. Round caps,
-  message caps (`THREAD_LIMIT_REACHED` until Ashley runs `resume`), deadlines and job
+  message caps (`THREAD_LIMIT_REACHED` until the human runs `resume`), deadlines and job
   de-duplication. Jobs whose worker died are reaped, so a crash never wedges a thread.
 - **Headless peers can't use tools that act.** Claude runs with `--strict-mcp-config` and only
   Read/Grep/Glob/web tools; Codex has every live MCP server disabled (and the turn fails if they
@@ -91,7 +91,7 @@ local.agentBus = {
 This installs the CLI, writes `~/.config/agent-bus/config.json`, and registers the MCP server:
 
 - **Claude Code:** a local plugin from a directory marketplace in the store, enabled through
-  dotfiles' `local.claude.extraKnownMarketplaces`/`enabledPlugins` when those options exist
+  `local.claude.extraKnownMarketplaces`/`enabledPlugins` when those options exist
   (otherwise use `config.local.agentBus.claudeMarketplace`).
 - **Codex:** `codex mcp add agent-bus …` at activation, skipped when the entry already matches.
 - **Antigravity:** a plugin linked at `~/.gemini/config/plugins/agent-bus` (on by default when

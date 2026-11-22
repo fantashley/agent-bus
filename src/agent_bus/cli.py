@@ -1,4 +1,4 @@
-"""The ``agent-bus`` command: MCP server, worker, and Ashley's CLI."""
+"""The ``agent-bus`` command: MCP server, worker, and the human's CLI."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def _color(who: str, text: str, enabled: bool) -> str:
 
 def format_message(m: dict, color: bool) -> str:
     when = time.strftime("%H:%M:%S", time.localtime(m["created_at"]))
-    who = "Ashley" if m["sender"] == HUMAN else ("bus" if m["sender"] == SYSTEM else m["sender"])
+    who = "human" if m["sender"] == HUMAN else ("bus" if m["sender"] == SYSTEM else m["sender"])
     tag = m["kind"]
     if m["data"].get("proposal_id"):
         tag += " " + m["data"]["proposal_id"]
@@ -45,7 +45,7 @@ def thread_status(bus: Bus, thread: str) -> tuple[str, str | None, str]:
     if t["status"] == "resolved":
         return "done", None, f"{thread}: resolved" + (f" on {t['final_proposal']}" if t["final_proposal"] else "")
     if t["status"] == "needs_human":
-        return "blocked", "question", f"{thread}: needs Ashley"
+        return "blocked", "question", f"{thread}: needs human"
     if t["status"] == "cancelled":
         return "idle", None, f"{thread}: cancelled"
     if job:
@@ -58,7 +58,7 @@ def peer_status(bus: Bus, thread: str, peer: str) -> tuple[str, str | None, str]
     if t["status"] == "cancelled":
         return "idle", None, f"{peer}: cancelled"
     if t["status"] == "needs_human":
-        return "blocked", "question", f"{peer}: needs Ashley"
+        return "blocked", "question", f"{peer}: needs human"
     if bus.peer_busy(thread, peer) and bus.active_job(thread):
         return "working", None, f"{peer}: thinking (round {t['round']})"
     st = bus.standings(thread).get(peer)
@@ -132,7 +132,7 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
             last_msg = m["id"]
             if (wanted and m["thread_id"] not in wanted) or m["kind"] not in kinds:
                 continue
-            who = "Ashley" if m["sender"] == HUMAN else m["sender"]
+            who = "human" if m["sender"] == HUMAN else m["sender"]
             extra = m["data"].get("verdict") or m["data"].get("proposal_id") or ""
             print(one_line(f"{m['kind'].upper()} {m['thread_id']} {who} {extra}: {m['body']}", 300), flush=True)
 
@@ -244,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--from-start", action="store_true", help="also report existing messages")
     s.add_argument("--interval", type=float, default=2.0)
 
-    s = sub.add_parser("reply", help="post to a thread as Ashley")
+    s = sub.add_parser("reply", help="post to a thread as the human user")
     s.add_argument("thread")
     s.add_argument("body")
     s.add_argument("--to", choices=cfg.AGENTS)

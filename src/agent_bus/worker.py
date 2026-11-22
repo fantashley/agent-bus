@@ -215,12 +215,12 @@ class Worker:
         repo_note = f" in {t['repo']}" if t["repo"] else ""
         return prompts.PREAMBLE.format(
             agent=agent, thread=t["id"], participants=", ".join(t["participants"]),
-            initiator="Ashley" if t["initiator"] == HUMAN else t["initiator"], repo_note=repo_note)
+            initiator="the human user" if t["initiator"] == HUMAN else t["initiator"], repo_note=repo_note)
 
     def question(self, t: dict) -> str:
-        """The question, fenced as peer data when an agent (not Ashley) asked it."""
+        """The question, fenced as peer data when an agent (not the human user) asked it."""
         q = t["goal"] if t["initiator"] == HUMAN else prompts.wrap_peer(t["initiator"], t["goal"])
-        who = "Ashley" if t["initiator"] == HUMAN else t["initiator"]
+        who = "the human user" if t["initiator"] == HUMAN else t["initiator"]
         return prompts.QUESTION.format(asker=who, question=q) + self.context_note(t)
 
     def context_note(self, t: dict) -> str:
@@ -421,7 +421,7 @@ class Worker:
             return
         reason = "deadline reached" if self.deadline_left() <= 0 else f"{t['max_rounds']} rounds used"
         if self.finish_thread("needs_human"):
-            self.system(f"No consensus ({reason}). Needs Ashley.\n{format_dissent(d)}", recipient=to)
+            self.system(f"No consensus ({reason}). Needs the human user.\n{format_dissent(d)}", recipient=to)
 
     # -------------------------------------------------------------------- review
 
@@ -466,7 +466,7 @@ class Worker:
         if verdict is None:
             if self.finish_thread("needs_human"):
                 self.safe_post(SYSTEM, f"{reviewer} did not return a usable verdict: "
-                               f"{res.error or 'no valid JSON verdict'}. Ashley can `agent-bus resume` to retry.",
+                               f"{res.error or 'no valid JSON verdict'}. Run `agent-bus resume` to retry.",
                                kind="status", recipient=t["initiator"])
             return
         lines = [f"Verdict: {verdict['verdict']}", "", verdict["summary"]]
