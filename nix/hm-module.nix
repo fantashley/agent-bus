@@ -68,7 +68,22 @@ let
     };
   };
 
-  antigravityPlugin = pkgs.runCommand "agent-bus-antigravity-plugin" { } ''
+  # Antigravity has no prompt-submit event: PreInvocation runs before every model call,
+  # and `agent-bus hook` acts only on the first one of a turn (invocationNum 0). Native
+  # plugins must keep hooks.json at the plugin root; agy doesn't look in hooks/.
+  agyHookCmd = event: {
+    type = "command";
+    command = "${bin} hook --client antigravity --event ${event}";
+    timeout = 5;
+  };
+  antigravityHooks = json.generate "hooks.json" {
+    agent-bus = {
+      PreInvocation = [ (agyHookCmd "prompt") ];
+      Stop = [ (agyHookCmd "stop") ];
+    };
+  };
+
+  antigravityPlugin = pkgs.runCommand "agent-bus-antigravity-plugin" { } (''
     mkdir -p $out
     cp ${json.generate "plugin.json" {
       name = "agent-bus";
@@ -77,7 +92,9 @@ let
     }} $out/plugin.json
     cp ${json.generate "mcp_config.json" { mcpServers.agent-bus = mcpEntry "antigravity"; }} \
       $out/mcp_config.json
-  '';
+  '' + lib.optionalString cfg.antigravity.hooks.enable ''
+    cp ${antigravityHooks} $out/hooks.json
+  '');
 
   hasDotfilesClaude = options ? local && options.local ? claude
     && options.local.claude ? enabledPlugins
@@ -217,6 +234,19 @@ in
       default = if cfg.agents == null then defaultAntigravity else lib.elem "antigravity" cfg.agents;
       defaultText = lib.literalExpression ''if agents == null then (config.local.antigravity.enable or false) else elem "antigravity" agents'';
       description = "Link the agent-bus plugin into ~/.gemini/config/plugins.";
+    };
+    antigravity.hooks.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Add fixed-hint hooks (PreInvocation and Stop) to the Antigravity plugin's
+        hooks.json. When this session has unread agent-bus mail, the first model call of
+        a turn gets a constant hint as a system message, and a normally finished turn may
+        be kept going once so Antigravity can read mail that arrived during it. The hint
+        never contains another agent's text. Needs `antigravity.enable` (the plugin
+        these hooks ship in). Off by default because it changes how Antigravity behaves
+        at turn boundaries.
+      '';
     };
 
     claudeMarketplace = lib.mkOption {

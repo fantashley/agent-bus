@@ -137,7 +137,7 @@ def test_fails_open(env, monkeypatch, tmp_path):
     assert hooks.run("claude", "prompt", "{}", env={"AGENT_BUS_PEER": "j-1"}, bus=bus, pid=999, **bind_kw()) == ""
     assert run(bus, "prompt", "not json") == ""
     assert run(bus, "prompt", "[1]") == ""
-    assert hooks.run("antigravity", "prompt", "{}", env={}, bus=bus, pid=999, **bind_kw()) == ""  # not yet supported
+    assert hooks.run("bogus", "prompt", "{}", env={}, bus=bus, pid=999, **bind_kw()) == ""  # unknown client
     assert hooks.run("claude", "bogus", "{}", env={}, bus=bus, pid=999, **bind_kw()) == ""
     broken = {"ancestors_of": lambda pid: 1 / 0}
     assert hooks.run("claude", "prompt", "{}", env={}, bus=bus, pid=999, **broken) == ""
@@ -314,3 +314,83 @@ def test_codex_shared_daemon_fails_closed_with_multiple_sessions(env):
     claude.send("a2", thread=tid, to="codex")
     assert hooks.run("codex", "prompt", "{}", env={}, pid=901, bus=bus, now=200.0,
                      **bind_kw(client=800, start="daemon")) == ""
+
+
+# Payloads as captured live from agy 1.5.13 (common fields trimmed).
+def agy_pre(n):
+    return json.dumps({"hookEventName": "PreInvocation", "conversationId": "c-1", "invocationNum": n,
+                       "initialNumSteps": 1 + 2 * n, "lastUserInput": "hi"})
+
+
+def agy_stop(execution=0, reason="NO_TOOL_CALL", active=False):
+    return json.dumps({"hookEventName": "Stop", "conversationId": "c-1", "executionNum": execution,
+                       "terminationReason": reason, "continuationActive": active, "fullyIdle": True,
+                       "error": ""})
+
+
+def agy(bus, event, payload, now, client=501, start="t1", env=None):
+    return hooks.run("antigravity", event, payload, env=env or {}, pid=901, bus=bus, now=now,
+                     **bind_kw(client=client, start=start))
+
+
+def test_antigravity_prompt_is_only_the_first_invocation_of_a_turn(env):
+    bus = env["bus"]
+    me = session(bus, agent="antigravity", client=501, start="t1")
+    claude = Service(bus, "claude", bus.register_session("claude", env={}))
+    tid = Service(bus, "antigravity", me).send("question", to="claude")["thread"]["id"]
+    claude.send("answer 1", thread=tid, to="antigravity")
+
+    # Later model calls in a turn (after tool calls, or a stop continuation) aren't prompts.
+    assert agy(bus, "prompt", agy_pre(1), now=100.0) == ""
+    out = agy(bus, "prompt", agy_pre(0), now=100.0)
+    assert json.loads(out) == {"injectSteps": [{"systemMessage": {"systemMessage": hooks.HINT}}]}
+    assert "answer" not in out and "claude" not in out
+    assert agy(bus, "prompt", agy_pre(0), now=200.0) == ""  # never the same mail twice
+    # A missing or non-integer invocationNum is not a turn start.
+    claude.send("answer 2", thread=tid, to="antigravity")
+    for bad in ({}, {"invocationNum": False}, {"invocationNum": "0"}, {"invocationNum": None}):
+        assert agy(bus, "prompt", json.dumps(bad), now=300.0) == ""
+    assert agy(bus, "prompt", agy_pre(0), now=300.0)
+
+
+def test_antigravity_stop_continues_once_and_only_on_a_normal_finish(env):
+    bus = env["bus"]
+    me = session(bus, agent="antigravity", client=501, start="t1")
+    claude = Service(bus, "claude", bus.register_session("claude", env={}))
+    tid = Service(bus, "antigravity", me).send("question", to="claude")["thread"]["id"]
+    assert agy(bus, "prompt", agy_pre(0), now=50.0) == ""  # turn starts with no mail
+
+    claude.send("answer 1", thread=tid, to="antigravity")
+    # The user canceled, the turn errored, or a limit was hit: let it stop.
+    for reason in ("USER_CANCELED", "ERROR", "MAX_INVOCATIONS", "MAX_FORCED_INVOCATIONS", None):
+        assert agy(bus, "stop", agy_stop(reason=reason), now=100.0) == ""
+    # Already continuing: agy 1.5.13 leaves continuationActive false, executionNum counts.
+    assert agy(bus, "stop", agy_stop(execution=1), now=100.0) == ""
+    assert agy(bus, "stop", agy_stop(active=True), now=100.0) == ""
+    assert agy(bus, "stop", json.dumps({"terminationReason": "NO_TOOL_CALL"}), now=100.0) == ""
+
+    assert json.loads(agy(bus, "stop", agy_stop(), now=100.0)) == {"decision": "continue",
+                                                                    "reason": hooks.HINT}
+    # Newer mail during the continuation still gets only one continuation this turn,
+    # even if agy reported executionNum 0 again.
+    claude.send("answer 2", thread=tid, to="antigravity")
+    assert agy(bus, "stop", agy_stop(), now=200.0) == ""
+    # The next user turn (invocationNum 0) resets the budget.
+    assert agy(bus, "prompt", agy_pre(0), now=300.0)
+    claude.send("answer 3", thread=tid, to="antigravity")
+    assert agy(bus, "stop", agy_stop(), now=400.0)
+
+
+def test_antigravity_sessions_kept_apart_and_peers_silent(env):
+    bus = env["bus"]
+    s1 = session(bus, agent="antigravity", client=501, start="t1")
+    session(bus, agent="antigravity", client=502, start="t2")
+    claude = Service(bus, "claude", bus.register_session("claude", env={}))
+    tid = Service(bus, "antigravity", s1).send("q", to="claude")["thread"]["id"]
+    claude.send("a", thread=tid, to="antigravity")
+    assert agy(bus, "prompt", agy_pre(0), now=100.0, env={"AGENT_BUS_PEER": "j-1"}) == ""
+    assert agy(bus, "prompt", agy_pre(0), now=100.0, client=502, start="t2") == ""
+    assert agy(bus, "prompt", agy_pre(0), now=100.0)
+    # Bound to an antigravity session only: a claude hook under that client finds nothing.
+    assert hooks.run("claude", "prompt", "{}", env={}, pid=901, bus=bus, now=200.0,
+                     **bind_kw(client=501, start="t1")) == ""
