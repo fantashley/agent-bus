@@ -187,3 +187,173 @@ def test_ensure_restores_pre_setup_config_after_stale_command_and_failed_check(c
     with pytest.raises(cs.SetupError):
         cs.ensure("/new/agent-bus", codex="codex", run=stubborn)  # remove + add, then fails
     assert codex_home.read_text() == CONFIG
+
+
+def test_ensure_hooks_creates_updates_in_place_and_removes_cleanly(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    hooks_path = tmp_path / "hooks.json"
+
+    # Disabling when hooks.json doesn't exist is a no-op and doesn't create the file.
+    assert cs.ensure_hooks(enable=False) == "unchanged"
+    assert not hooks_path.exists()
+
+    # Enabling creates only UserPromptSubmit and Stop entries, and is idempotent.
+    assert cs.ensure_hooks("/profile/bin/agent-bus", enable=True) == "updated"
+    data = json.loads(hooks_path.read_text())
+    assert data == {
+        "hooks": {
+            "UserPromptSubmit": [{"hooks": [{"type": "command",
+                                             "command": "/profile/bin/agent-bus hook --client codex --event prompt",
+                                             "timeout": 5}]}],
+            "Stop": [{"hooks": [{"type": "command",
+                                 "command": "/profile/bin/agent-bus hook --client codex --event stop",
+                                 "timeout": 5}]}],
+        }
+    }
+    assert cs.ensure_hooks("/profile/bin/agent-bus", enable=True) == "unchanged"
+
+    # Disabling removes agent-bus's entries cleanly.
+    assert cs.ensure_hooks(enable=False) == "updated"
+    assert json.loads(hooks_path.read_text()) == {"hooks": {}}
+    assert cs.ensure_hooks(enable=False) == "unchanged"
+
+
+def test_ensure_hooks_preserves_unrelated_hooks_and_indices(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    hooks_path = tmp_path / "hooks.json"
+    existing = {
+        "description": "user hooks",
+        "hooks": {
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/bin/my-hook", "timeout": 10}]}],
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/audit"}]}],
+        },
+    }
+    hooks_path.write_text(json.dumps(existing))
+
+    # Appends after user's existing UserPromptSubmit hook so index 0 stays untouched.
+    assert cs.ensure_hooks("/old/agent-bus", enable=True) == "updated"
+    d = json.loads(hooks_path.read_text())
+    assert d["description"] == "user hooks"
+    assert d["hooks"]["PreToolUse"] == existing["hooks"]["PreToolUse"]
+    assert d["hooks"]["UserPromptSubmit"][0] == existing["hooks"]["UserPromptSubmit"][0]
+    assert d["hooks"]["UserPromptSubmit"][1]["hooks"][0]["command"].startswith("/old/agent-bus ")
+
+    # Updating bin path replaces in place at index 1 (and handles spaces in path).
+    assert cs.ensure_hooks("/my profile/bin/agent-bus", enable=True) == "updated"
+    d = json.loads(hooks_path.read_text())
+    assert len(d["hooks"]["UserPromptSubmit"]) == 2
+    assert d["hooks"]["UserPromptSubmit"][0] == existing["hooks"]["UserPromptSubmit"][0]
+    assert d["hooks"]["UserPromptSubmit"][1]["hooks"][0]["command"] == (
+        "'/my profile/bin/agent-bus' hook --client codex --event prompt"
+    )
+    assert cs.ensure_hooks("/my profile/bin/agent-bus", enable=True) == "unchanged"
+
+    # Disabling removes only agent-bus entries and leaves user hooks intact.
+    assert cs.ensure_hooks(enable=False) == "updated"
+    assert json.loads(hooks_path.read_text()) == existing
+
+
+@pytest.mark.parametrize("bad", ["not json", "[]", '{"hooks": []}', '{"hooks": {"Stop": {}}}'])
+def test_ensure_hooks_refuses_malformed_file(tmp_path, monkeypatch, bad):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    hooks_path = tmp_path / "hooks.json"
+    hooks_path.write_text(bad)
+    with pytest.raises(cs.SetupError):
+        cs.ensure_hooks("/profile/bin/agent-bus", enable=True)
+    assert hooks_path.read_text() == bad
+
+
+def test_cli_setup_codex_hooks_flags(codex_home, monkeypatch, capsys):
+    from agent_bus import cli
+    fake = FakeCodex(codex_home)
+    orig = cs.ensure
+    monkeypatch.setattr(cs, "ensure", lambda exe: orig(exe, codex="codex", run=fake))
+    assert cli.main(["setup-codex", "--bin", "/store/agent-bus", "--hooks",
+                     "--hooks-bin", "/profile/bin/agent-bus"]) == 0
+    out = capsys.readouterr().out
+    assert "agent-bus hooks updated" in out and "/hooks" in out
+    hooks_path = codex_home.parent / "hooks.json"
+    assert "/profile/bin/agent-bus hook --client codex --event prompt" in hooks_path.read_text()
+    assert cli.main(["setup-codex", "--bin", "/store/agent-bus", "--no-hooks"]) == 0
+    assert "agent-bus hooks updated" in capsys.readouterr().out
+    assert json.loads(hooks_path.read_text()) == {"hooks": {}}
+    # --hooks-only updates hooks.json without touching config.toml or needing codex on PATH.
+    assert cli.main(["setup-codex", "--hooks-only", "--hooks", "--hooks-bin", "/profile/bin/agent-bus"]) == 0
+    assert "agent-bus hooks updated" in capsys.readouterr().out
+    assert cli.main(["setup-codex", "--hooks-only", "--no-hooks"]) == 0
+    assert "agent-bus hooks updated" in capsys.readouterr().out
+    assert json.loads(hooks_path.read_text()) == {"hooks": {}}
+    with pytest.raises(SystemExit) as e:
+        cli.main(["setup-codex", "--bin", "/store/agent-bus", "--hooks-bin", "/profile/bin/agent-bus"])
+    assert e.value.code == 2
+    with pytest.raises(SystemExit) as e:
+        cli.main(["setup-codex", "--hooks-only"])
+    assert e.value.code == 2
+
+
+def test_ensure_hooks_preserves_indices_when_unrelated_hooks_follow(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    hooks_path = tmp_path / "hooks.json"
+    other = {"hooks": [{"type": "command", "command": "/usr/bin/other", "timeout": 10}]}
+    # Agent-bus is at index 0, followed by an unrelated user hook at index 1 (and a duplicate at index 1 -> 2).
+    initial = {
+        "hooks": {
+            "UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": "/profile/bin/agent-bus hook --client codex --event prompt",
+                            "timeout": 15}]},
+                {"hooks": [{"type": "command", "command": "/old/agent-bus hook --client codex --event prompt",
+                            "timeout": 5}]},
+                other,
+            ],
+        }
+    }
+    hooks_path.write_text(json.dumps(initial))
+
+    # Deduplicating on enable keeps index 0 (and its custom timeout), leaves a placeholder at index 1,
+    # and keeps `other` at index 2 so its Codex trust key doesn't shift.
+    assert cs.ensure_hooks("/profile/bin/agent-bus", enable=True) == "updated"
+    d = json.loads(hooks_path.read_text())
+    assert len(d["hooks"]["UserPromptSubmit"]) == 3
+    assert d["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"] == 15
+    assert d["hooks"]["UserPromptSubmit"][1] == {"hooks": []}
+    assert d["hooks"]["UserPromptSubmit"][2] == other
+    assert cs.ensure_hooks("/profile/bin/agent-bus", enable=True) == "unchanged"
+
+    # Disabling leaves a placeholder at index 0 so `other` stays at index 2.
+    assert cs.ensure_hooks(enable=False) == "updated"
+    d = json.loads(hooks_path.read_text())
+    assert d["hooks"]["UserPromptSubmit"] == [{"hooks": []}, {"hooks": []}, other]
+
+    # Re-enabling reuses slot 0 and keeps `other` at index 2.
+    assert cs.ensure_hooks("/profile/bin/agent-bus", enable=True) == "updated"
+    d = json.loads(hooks_path.read_text())
+    assert d["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].startswith("/profile/bin/agent-bus ")
+    assert d["hooks"]["UserPromptSubmit"][2] == other
+
+
+def test_ensure_hooks_refuses_to_shift_handler_in_shared_group(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    hooks_path = tmp_path / "hooks.json"
+    hooks_path.write_text(json.dumps({
+        "hooks": {
+            "Stop": [{"hooks": [
+                {"type": "command", "command": "/profile/bin/agent-bus hook --client codex --event stop", "timeout": 5},
+                {"type": "command", "command": "/usr/bin/after", "timeout": 5},
+            ]}]
+        }
+    }))
+    with pytest.raises(cs.SetupError, match="precedes an unrelated hook"):
+        cs.ensure_hooks(enable=False)
+
+
+def test_ensure_hooks_supports_custom_executable_names(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    hooks_path = tmp_path / "hooks.json"
+    custom = "/profile/bin/agent-bus-custom"
+    assert cs.ensure_hooks(custom, enable=True) == "updated"
+    assert cs.ensure_hooks(custom, enable=True) == "unchanged"
+    d = json.loads(hooks_path.read_text())
+    assert len(d["hooks"]["UserPromptSubmit"]) == 1
+    assert d["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == f"{custom} hook --client codex --event prompt"
+    assert cs.ensure_hooks(enable=False) == "updated"
+    assert json.loads(hooks_path.read_text()) == {"hooks": {}}

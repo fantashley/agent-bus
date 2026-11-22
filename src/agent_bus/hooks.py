@@ -42,7 +42,7 @@ COOLDOWN_S = 30  # minimum gap between hints for newer mail
 DB_TIMEOUT_S = 0.25
 
 EVENTS = ("prompt", "stop")
-CLIENTS = ("claude",)  # Codex and Antigravity adapters follow once verified live
+CLIENTS = ("claude", "codex")  # Antigravity adapter follows once verified live
 
 
 def bind_session(bus: Bus, agent: str, pid: int,
@@ -167,9 +167,9 @@ def claim(bus: Bus, session_id: str, event: str, newest: int | None, now: float)
 
 
 def output(client: str, event: str) -> str:
-    if client == "claude" and event == "prompt":
+    if client in ("claude", "codex") and event == "prompt":
         return json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": HINT}})
-    if client == "claude" and event == "stop":
+    if client in ("claude", "codex") and event == "stop":
         return json.dumps({"decision": "block", "reason": HINT})
     return ""
 

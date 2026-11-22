@@ -199,6 +199,19 @@ in
       defaultText = lib.literalExpression ''agents == null || elem "codex" agents'';
       description = "Register agent-bus with Codex (`agent-bus setup-codex`) when codex is on PATH.";
     };
+    codex.hooks.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Add fixed-hint hooks to Codex's hooks.json (UserPromptSubmit and Stop) via
+        `agent-bus setup-codex`. Points hooks at the stable profile path so Home
+        Manager rebuilds keep Codex's persisted hook trust; trust them once in
+        Codex's own prompt (never bypasses hook trust). When false, activation
+        removes agent-bus's own entries from hooks.json while leaving unrelated
+        hooks untouched. Off by default because it changes how Codex behaves at
+        turn boundaries.
+      '';
+    };
     antigravity.enable = lib.mkOption {
       type = lib.types.bool;
       default = if cfg.agents == null then defaultAntigravity else lib.elem "antigravity" cfg.agents;
@@ -237,7 +250,17 @@ in
         if command -v codex >/dev/null 2>&1; then
           # Adds or fixes only the agent-bus entry, including env_vars so the server
           # can see which Rex block it's in; a no-op when it already matches.
-          run ${lib.escapeShellArg bin} setup-codex --bin ${lib.escapeShellArg bin}
+          ${if cfg.codex.hooks.enable then ''
+            run ${lib.escapeShellArg bin} setup-codex --bin ${lib.escapeShellArg bin} \
+              --hooks --hooks-bin ${lib.escapeShellArg "${config.home.profileDirectory}/bin/agent-bus"}
+          '' else ''
+            run ${lib.escapeShellArg bin} setup-codex --bin ${lib.escapeShellArg bin}
+            if [ -e "''${CODEX_HOME:-$HOME/.codex}/hooks.json" ]; then
+              if ! run ${lib.escapeShellArg bin} setup-codex --hooks-only --no-hooks; then
+                echo "agent-bus: warning: could not clean up Codex hooks.json; continuing activation" >&2
+              fi
+            fi
+          ''}
         else
           verboseEcho "agent-bus: codex not on PATH; skipping Codex MCP registration"
         fi
