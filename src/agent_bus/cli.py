@@ -11,7 +11,7 @@ import textwrap
 import time
 
 from . import config as cfg
-from . import rex
+from . import hooks, rex
 from .db import HUMAN, SYSTEM, Bus, BusError
 from .service import Service, present, thread_summary
 
@@ -52,6 +52,10 @@ def thread_status(bus: Bus, thread: str) -> tuple[str, str | None, str]:
         return "idle", None, f"{thread}: cancelled"
     if job:
         return "working", None, f"{thread}: round {t['round']}/{t['max_rounds']}"
+    # Waiting on an interactive session that has mail here: only the human can nudge it (#20).
+    waiting = hooks.mail_waiting(bus, thread)
+    if waiting:
+        return "blocked", "question", "; ".join(f"{w['agent']} has mail on {thread}" for w in waiting)
     return "idle", None, f"{thread}: waiting"
 
 
@@ -77,6 +81,8 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
     color = rex.stdout_is_tty() and not args.no_color
     # OSC 7501 status is a Rex feature: only emit it inside Rex.
     status = (not args.no_status) and rex.stdout_is_tty() and bool(os.environ.get("REX_SESSION"))
+    notify = args.notify and rex.stdout_is_tty()
+    notices = hooks.MailNotices()
     last_msg = last_ev = 0
     last_status = None
     t = bus.thread(args.thread)
@@ -98,6 +104,10 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
                         who = e["agent"] or "worker"
                         print(_color(SYSTEM, f"  · {who} {e['kind']}: {e['text']}", color), flush=True)
             st = peer_status(bus, args.thread, args.peer) if args.peer else thread_status(bus, args.thread)
+            if notify and not args.peer:
+                for w in notices.new(hooks.mail_waiting(bus, args.thread)):
+                    sys.stdout.write(rex.notify("agent-bus", hooks.describe_mail(w)))
+                    sys.stdout.flush()
             if status and st != last_status:
                 ident = f"bus.{args.peer}" if args.peer else None
                 sys.stdout.write(rex.osc7501(st[0], msg=st[2], kind=st[1], id=ident))
@@ -126,6 +136,8 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
     preexisting = {r["id"] for r in bus._all("SELECT id FROM jobs WHERE status='failed'")}
     reported: set[str] = set()
     first = True
+    mail = "mail" in kinds
+    notices = hooks.MailNotices()
     one_line = lambda text, n: " ".join(str(text).split())[:n]  # noqa: E731
 
     def drain() -> None:
@@ -165,6 +177,10 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
                 if status.get(t["id"]) != t["status"] and not first and t["status"] != "open":
                     print(one_line(f"THREAD {t['id']} {t['status']}: {t['goal']}", 200), flush=True)
                 status[t["id"]] = t["status"]
+            if mail:
+                # Only watched threads count, before a notice is recorded.
+                for w in notices.new(hooks.mail_waiting(bus, wanted or None)):
+                    print(one_line(f"MAIL {hooks.describe_mail(w)}", 300), flush=True)
             failures()
             first = False
             if wanted and all(settled(t) for t in wanted):
@@ -266,11 +282,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--once", action="store_true", help="print and exit")
     s.add_argument("--no-status", action="store_true", help="don't emit OSC 7501 status")
     s.add_argument("--no-color", action="store_true")
+    s.add_argument("--notify", action="store_true",
+                   help="desktop notification (OSC 777/9) when an interactive session has mail on this thread")
 
     s = sub.add_parser("stream", help="print one line per verdict/final/status change (for notifications)")
     s.add_argument("threads", nargs="*", help="only these threads; exit once they're all closed")
-    s.add_argument("--kinds", default="review_verdict,final",
-                   help="message kinds to report (default: review_verdict,final)")
+    s.add_argument("--kinds", default="review_verdict,final,mail",
+                   help="message kinds to report, plus `mail` for interactive sessions with unread mail "
+                        "(default: review_verdict,final,mail)")
     s.add_argument("--from-start", action="store_true", help="also report existing messages")
     s.add_argument("--interval", type=float, default=2.0)
 

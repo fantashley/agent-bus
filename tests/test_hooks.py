@@ -14,8 +14,14 @@ def session(bus, agent="claude", client=500, start="t0"):
     return sid
 
 
+# Start times of the fake clients other sessions in these tests were registered with,
+# so an owner check sees each process's own start time (as procinfo would).
+KNOWN_STARTS = {501: "t1", 502: "t2"}
+
+
 def bind_kw(client=500, start="t0"):
-    return {"ancestors_of": lambda pid: [400, client, 1], "start_of": lambda pid: start,
+    return {"ancestors_of": lambda pid: [400, client, 1],
+            "start_of": lambda pid: start if pid == client else KNOWN_STARTS.get(pid, "t0"),
             "alive": lambda pid: True}
 
 

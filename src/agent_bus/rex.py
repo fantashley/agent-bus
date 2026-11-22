@@ -35,6 +35,13 @@ def osc7501(state: str, msg: str | None = None, id: str | None = None, title: st
     return "\x1b]7501;" + ":".join(pairs) + "\x1b\\"
 
 
+def notify(title: str, body: str) -> str:
+    """A desktop notification for terminals that support OSC 777 (notify) or OSC 9."""
+    clean = lambda text, n: "".join(ch if ch.isprintable() and ch not in ";\x07" else " "  # noqa: E731
+                                    for ch in " ".join(text.split()))[:n]
+    return f"\x1b]777;notify;{clean(title, 64)};{clean(body, 256)}\x07\x1b]9;{clean(body, 256)}\x07"
+
+
 def _b64(text: str, limit: int) -> str:
     clean = "".join(ch if ch.isprintable() else " " for ch in " ".join(text.split()))
     data = clean.encode()[:limit].decode(errors="ignore").encode()

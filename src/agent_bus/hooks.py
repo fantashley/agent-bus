@@ -113,7 +113,8 @@ def unread_all(bus: Bus, session: dict, agent: str) -> list[dict]:
     return out
 
 
-def eligible(bus: Bus, session: dict, msgs: list[dict], stop: bool) -> list[dict]:
+def eligible(bus: Bus, session: dict, msgs: list[dict], stop: bool,
+             owner_live: Callable[[dict], bool] | None = None) -> list[dict]:
     """Unread messages that should prompt *this* session.
 
     - Broadcast system status (progress chatter) never counts; system notices meant
@@ -144,7 +145,9 @@ def eligible(bus: Bus, session: dict, msgs: list[dict], stop: bool) -> list[dict
             if other and t["initiator"] == session["agent_type"]:
                 if other not in owner_alive:
                     row = bus.session(other)
-                    owner_alive[other] = bool(row and _alive(row["pid"]))
+                    # The same test as for notices: a reused pid of a long-gone
+                    # session must not claim this mail.
+                    owner_alive[other] = bool(row and (owner_live or session_live)(row))
                 if owner_alive[other]:
                     continue
             if t["kind"] in ("discussion", "review") and not human:
@@ -223,7 +226,9 @@ def run(client: str, event: str, payload: str, env: dict | None = None, pid: int
             if not session:
                 return ""
             msgs = unread_all(bus, session, client)
-            ok = eligible(bus, session, msgs, stop=event == "stop")
+            start_of = bind.get("start_of", procinfo.start_time)
+            ok = eligible(bus, session, msgs, stop=event == "stop",
+                          owner_live=lambda r: session_live(r, start_of=start_of))
             newest = max((m["id"] for m in ok), default=None)
             if not claim(bus, session["id"], event, newest, time.time() if now is None else now):
                 return ""
@@ -233,3 +238,76 @@ def run(client: str, event: str, payload: str, env: dict | None = None, pid: int
                 bus.close()
     except Exception:  # noqa: BLE001 - a hook must never break the client's turn
         return ""
+
+
+# ------------------------------------------------------------- telling the human (#20)
+#
+# Hooks cover sessions whose client fires a turn-boundary hook.  An idle session
+# gets no hook, and only the human can nudge it.  These helpers let a watcher the
+# human runs (`agent-bus stream`, `agent-bus tail`) say "codex has mail on t-…",
+# with the same eligibility rules as the hooks, and nothing is ever typed into a
+# terminal.  Read-only: no cursor moves, no presence refresh.
+
+
+def session_live(row: dict, start_of: Callable[[int], str | None] = procinfo.start_time) -> bool:
+    """The session's own client is still running: its MCP server is alive (the cheap
+    check first) and its client has the recorded pid *and* start time, so a reused pid
+    doesn't count.  Rows without a recorded client (from agent-bus versions before
+    hooks) can't be verified and never count: restart that client to be announced."""
+    if not (row.get("client_pid") and row.get("client_start")):
+        return False
+    return _alive(row["pid"]) and start_of(row["client_pid"]) == row["client_start"]
+
+
+def mail_waiting(bus: Bus, threads: set[str] | str | None = None,
+                 live: Callable[[dict], bool] = session_live) -> list[dict]:
+    """Live interactive sessions with eligible unread mail (only on ``threads``, if
+    given): [{session, agent, threads, newest, signature, rex_block}].  ``signature``
+    is the session's read-cursor position, read in the same snapshot as its mail:
+    notify once per signature."""
+    if isinstance(threads, str):
+        threads = {threads}
+    candidates = [dict(r) for r in bus._all(
+        "SELECT * FROM sessions WHERE client_pid IS NOT NULL AND client_start IS NOT NULL ORDER BY started_at")]
+    out = []
+    for s in candidates:
+        if s["agent_type"] not in cfg.AGENTS or not live(s):
+            continue
+        with bus.snapshot():  # the mail and the cursors it was read against, together
+            msgs = unread_all(bus, s, s["agent_type"])
+            if threads:
+                msgs = [m for m in msgs if m["thread_id"] in threads]
+            ok = eligible(bus, s, msgs, stop=False, owner_live=live)
+            if not ok:
+                continue
+            cursors = tuple((r["thread_id"], r["last_id"]) for r in
+                            bus._all("SELECT thread_id, last_id FROM cursors WHERE subscriber=?"
+                                     " ORDER BY thread_id", s["id"]))
+        out.append({"session": s["id"], "agent": s["agent_type"],
+                    "threads": sorted({m["thread_id"] for m in ok}),
+                    "newest": max(m["id"] for m in ok), "signature": cursors,
+                    "rex_block": s.get("rex_block")})
+    return out
+
+
+class MailNotices:
+    """At most one notice per session per read-cursor position: after a notice, the
+    same session is announced again only once it has read something and still (or
+    again) has eligible mail."""
+
+    def __init__(self) -> None:
+        self.seen: dict[str, tuple] = {}
+
+    def new(self, waiting: list[dict]) -> list[dict]:
+        fresh = []
+        for w in waiting:
+            if self.seen.get(w["session"]) != w["signature"]:
+                self.seen[w["session"]] = w["signature"]
+                fresh.append(w)
+        return fresh
+
+
+def describe_mail(w: dict) -> str:
+    """Fixed wording only: agent, session, thread ids and Rex block.  Never peer text."""
+    where = f" (Rex {w['rex_block']})" if w.get("rex_block") else ""
+    return f"{w['agent']} has unread agent-bus mail on {', '.join(w['threads'])}: session {w['session']}{where}"
