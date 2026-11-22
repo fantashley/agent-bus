@@ -100,7 +100,7 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
             if args.peer or args.events:
                 for e in bus.events(args.thread, after_id=last_ev, agent=args.peer):
                     last_ev = e["id"]
-                    if e["kind"] in ("text", "tool", "thinking", "turn_start", "turn_end", "error"):
+                    if e["kind"] in ("text", "tool", "thinking", "turn_start", "turn_end", "error", "format"):
                         who = e["agent"] or "worker"
                         print(_color(SYSTEM, f"  · {who} {e['kind']}: {e['text']}", color), flush=True)
             st = peer_status(bus, args.thread, args.peer) if args.peer else thread_status(bus, args.thread)
@@ -400,6 +400,10 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
             print(f"cleared {n} out-of-usage block(s) for {args.clear_quota}")
             return 0
         avail = conf.availability()
+        from .peers import cli_version
+        for a, v in avail.items():
+            if v["available"]:
+                v["version"] = cli_version(bus, a, conf.peer_command(a))
         blocks: dict[str, list] = {}
         for b in bus.quota_blocks():
             blocks.setdefault(b["agent"], []).append(b)
@@ -412,7 +416,8 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         source = "config `agents`" if conf.agents is not None else "detected on PATH"
         print(f"agents ({source}):")
         for a, v in avail.items():
-            print(f"  {'yes' if v['available'] else 'no ':<4} {a:<12} {v['reason']}")
+            print(f"  {'yes' if v['available'] else 'no ':<4} {a:<12} {v['reason']}"
+                  + (f" ({v['version']})" if v.get("version") else ""))
             for b in blocks.get(a, []):
                 when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(b["until"]))
                 print(f"       out of usage{' for model ' + b['scope'] if b['scope'] else ''} until {when}"

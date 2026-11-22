@@ -17,6 +17,7 @@ from mcp.server.mcpserver import MCPServer
 from . import config as cfg
 from . import procinfo, quota, service
 from .db import Bus, BusError
+from .peers import cli_version
 
 INSTRUCTIONS = """\
 agent-bus connects you to the other coding agents installed on this machine (whichever of Claude Code,
@@ -74,6 +75,8 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
             return {"agent": agent, "session_id": session_id, "cwd": cwd,
                     "available_agents": [a for a, v in avail.items() if v["available"] and a != agent],
                     "unavailable_agents": {a: v["reason"] for a, v in avail.items() if not v["available"]},
+                    "versions": {a: cli_version(bus, a, svc.config.peer_command(a))
+                                 for a, v in avail.items() if v["available"] and a != agent},
                     "out_of_usage": [{"agent": b["agent"], **quota.summary(b)}
                                      for b in bus.quota_blocks() if b["agent"] != agent]}
         return call(me)
