@@ -205,8 +205,30 @@ Supported now:
   - an ignored hint not looping;
   - silence for headless `codex exec` peers (untrusted or trusted) and when the database is missing.
 
-Antigravity hooks come next, once its hook contract is checked live. This was decided on
-agent-bus thread t-7d756f.
+- **Antigravity**, opt-in with `local.agentBus.antigravity.hooks.enable = true` (along with
+  `local.agentBus.antigravity.enable`, which links the plugin; without it nothing is installed).
+  This adds `hooks.json` at the agent-bus plugin's root, which is the only place agy loads a
+  native plugin's hooks. Antigravity has no prompt-submit event:
+  - **Prompt:** `PreInvocation` runs before every model call, so only the first call of a turn
+    (`invocationNum` 0) counts as a prompt. The hint is injected as a system message.
+  - **Stop:** a turn may continue (`decision: "continue"`) only after a normal finish
+    (`terminationReason` `NO_TOOL_CALL`), never after a cancel, an error or a hit limit.
+  - **Loop guard:** agy 1.5.13 leaves `continuationActive` false even while a Stop hook keeps
+    a turn going, so `executionNum > 0` also counts as already continuing. agent-bus's own
+    one-stop-per-turn budget applies on top of that.
+  - **History:** agy keeps injected system messages in the conversation, as Claude Code and
+    Codex keep `additionalContext`. In the live checks, later turns with nothing new didn't
+    call `inbox` because of an earlier hint.
+
+  Each session binds through the `agy` process, which starts both its hooks and its agent-bus
+  server, in the TUI and in `agy -p`. Checked live with agy 1.5.13:
+  - the prompt hint;
+  - a single stop continuation after mid-turn mail;
+  - a hint the agent ignored not looping or repeating on the next turn;
+  - two TUI sessions in one project kept apart;
+  - silence for headless `agy -p` peers and when the database is missing.
+
+Hooks were agreed on agent-bus thread t-7d756f.
 
 ## Install (Home Manager)
 
@@ -259,6 +281,6 @@ nix build                  # package (runs the tests)
 ## Not in v1
 
 Interactive peer panes and automatic wake-ups, until a client or Rex can deliver input
-atomically only when it's ready (see above). Still to come in v1.5: Antigravity
-hooks, writable participants in separate workspaces (`jj workspace` or git worktrees), and
+atomically only when it's ready (see above). Still to come in v1.5: writable
+participants in separate workspaces (`jj workspace` or git worktrees), and
 cross-host discussions.

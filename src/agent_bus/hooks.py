@@ -17,6 +17,14 @@ turns it starts itself when a background task finishes, so the one-stop budget
 resets there too.  The hook still can't loop on its own: it never hints twice
 for the same mail, and newer mail waits out the cooldown.
 
+Antigravity (agy 1.5.13, checked live) has no prompt-submit event.  Its
+``PreInvocation`` fires before every model call, so only ``invocationNum == 0``
+(the first call of a user turn) counts as a prompt.  Its ``Stop`` payload's
+``continuationActive`` stayed false through ten forced continuations in a row, so
+``executionNum > 0`` (a Stop hook already kept this turn going) is checked too, and
+only a normal finish (``terminationReason == "NO_TOOL_CALL"``) may continue: never a
+user cancel, an error or a hit limit.
+
 Everything fails open: a missing database, lock contention, malformed input,
 an unknown client or event, or a session that can't be bound to exactly one
 bus session all mean no output and exit 0, so the client carries on normally.
@@ -42,7 +50,7 @@ COOLDOWN_S = 30  # minimum gap between hints for newer mail
 DB_TIMEOUT_S = 0.25
 
 EVENTS = ("prompt", "stop")
-CLIENTS = ("claude", "codex")  # Antigravity adapter follows once verified live
+CLIENTS = ("claude", "codex", "antigravity")
 
 
 def bind_session(bus: Bus, agent: str, pid: int,
@@ -166,7 +174,26 @@ def claim(bus: Bus, session_id: str, event: str, newest: int | None, now: float)
         return True
 
 
+def _first(x: Any) -> bool:
+    return type(x) is int and x == 0  # not JSON false, not a missing field
+
+
+def wanted(client: str, event: str, data: dict) -> bool:
+    """Whether this hook call is a turn boundary that may hint, from its payload alone."""
+    if client == "antigravity":
+        if event == "prompt":
+            return _first(data.get("invocationNum"))
+        return (not data.get("continuationActive") and _first(data.get("executionNum"))
+                and data.get("terminationReason") == "NO_TOOL_CALL")
+    # Claude Code and Codex: already continuing because of a stop hook.
+    return not (event == "stop" and data.get("stop_hook_active"))
+
+
 def output(client: str, event: str) -> str:
+    if client == "antigravity" and event == "prompt":
+        return json.dumps({"injectSteps": [{"systemMessage": {"systemMessage": HINT}}]})
+    if client == "antigravity" and event == "stop":
+        return json.dumps({"decision": "continue", "reason": HINT})
     if client in ("claude", "codex") and event == "prompt":
         return json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": HINT}})
     if client in ("claude", "codex") and event == "stop":
@@ -184,8 +211,8 @@ def run(client: str, event: str, payload: str, env: dict | None = None, pid: int
         data = json.loads(payload) if payload.strip() else {}
         if not isinstance(data, dict):
             return ""
-        if event == "stop" and data.get("stop_hook_active"):
-            return ""  # already continuing because of a stop hook
+        if not wanted(client, event, data):
+            return ""
         own = bus is None
         if own:
             if not cfg.db_path().exists():
