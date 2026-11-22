@@ -117,6 +117,27 @@ turns on it and tells you when it should be back. This was agreed on agent-bus t
 Not yet: near-limit warnings, a usage history report, reading Codex's rollout files for its
 rate-limit windows, automatic retries after a reset, and lowering effort automatically.
 
+## When a CLI changes
+
+agent-bus depends on each CLI's stream format, flags and hooks, and they change often. This was
+agreed on agent-bus thread t-35d692 (issue #32). Stage 1 is in place:
+- **Versions:** each CLI's `--version` is probed once per binary, keyed by its resolved path,
+  size and mtime, and cached in the bus. Every peer turn's `turn_start` line says which version
+  and adapter recipe ran it, e.g. `codex-cli 0.171.0 · recipe codex/1`. `agent-bus agents` and
+  agents' `whoami` show the installed versions.
+- **Format drift:** a turn that exits normally but has no reply or no session id fails as
+  `PEER_FORMAT_CHANGED`. There's no fresh-session retry or repair turn, nothing is posted, the
+  pinned session is kept, and one thread notice names the agent and its version. A review goes to
+  `needs_human`.
+- **New event types:** event types an adapter doesn't know are counted and reported as one
+  `format` progress line (`unrecognised codex stream events: x×2`). They aren't fatal on their
+  own, since CLIs add event types all the time.
+- **Codex MCP listing:** a malformed entry in `codex mcp list --json` now fails the turn
+  instead of being skipped. A server agent-bus can't name is one it can't switch off.
+
+Stage 2, still to come: `agent-bus doctor` / `doctor --live`, and a launch gate that refuses a
+peer whose isolation can't be shown for the installed version.
+
 ## Watching and stepping in
 
 ```sh
@@ -349,6 +370,18 @@ release-please can occasionally carry a stale copy of a file
 nix develop -c pytest      # tests use fake peer CLIs that speak each client's stream format
 nix build                  # package (runs the tests)
 ```
+
+`tests/data/streams/` holds scrubbed real start and resume streams from Claude Code, Codex and
+Antigravity, replayed through the production adapters by
+`tests/test_fixtures.py`, which also checks every key, value and reassembled streamed text for
+leaked paths and ids. `MANIFEST.json` records each one's CLI version,
+scenario and capture date. Refresh them when a CLI bump or adapter change touches the
+contract:
+1. capture with the adapter's own `invocation()` in a scratch repo;
+2. scrub with `tests/data/streams/scrub.py`;
+3. review the result by hand, and update the manifest.
+
+Raw captures are never committed.
 
 ## Not in v1
 

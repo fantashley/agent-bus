@@ -1,0 +1,59 @@
+{
+  "_doc": "Scrubbed real CLI streams (issue #32), each captured with the adapter's own invocation() (the production recipe) in a scratch repo, scrubbed with scrub.py and reviewed by hand. Replay only checks that today's parser handles these streams; the recipe is recorded per entry. Refresh when a CLI bump or adapter contract change is accepted, or when fixing drift.",
+  "fixtures": [
+    {
+      "file": "claude-start.jsonl",
+      "agent": "claude",
+      "cli": "Claude Code 2.1.330",
+      "captured": "2026-11-22",
+      "scenario": "first turn: one Read tool call, then a text reply",
+      "final": "pineapple",
+      "recipe": "claude/1"
+    },
+    {
+      "file": "claude-resume.jsonl",
+      "agent": "claude",
+      "cli": "Claude Code 2.1.330",
+      "captured": "2026-11-22",
+      "scenario": "--resume of claude-start, recalling the file it read",
+      "final": "notes.txt",
+      "recipe": "claude/1"
+    },
+    {
+      "file": "codex-start.jsonl",
+      "agent": "codex",
+      "cli": "codex-cli 0.171.0",
+      "captured": "2026-11-22",
+      "scenario": "first turn: a read-only shell command in the read-only sandbox, then a reply",
+      "final": "pineapple",
+      "recipe": "codex/1"
+    },
+    {
+      "file": "codex-resume.jsonl",
+      "agent": "codex",
+      "cli": "codex-cli 0.171.0",
+      "captured": "2026-11-22",
+      "scenario": "exec resume of codex-start, recalling the file it read",
+      "final": "notes.txt",
+      "recipe": "codex/1"
+    },
+    {
+      "file": "antigravity-start.jsonl",
+      "agent": "antigravity",
+      "cli": "agy 1.5.13",
+      "captured": "2026-11-22",
+      "scenario": "first turn: one read_file tool call in plan mode with --sandbox, then a text reply",
+      "final": "pineapple",
+      "recipe": "antigravity/1"
+    },
+    {
+      "file": "antigravity-resume.jsonl",
+      "agent": "antigravity",
+      "cli": "agy 1.5.13",
+      "captured": "2026-11-22",
+      "scenario": "--conversation resume of antigravity-start, recalling the file it read",
+      "final": "notes.txt",
+      "recipe": "antigravity/1"
+    }
+  ]
+}

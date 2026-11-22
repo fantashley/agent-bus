@@ -25,7 +25,7 @@ from typing import Iterator
 from . import config as cfg
 from . import prompts, quota
 from .db import HUMAN, SYSTEM, Bus, BusError
-from .peers import TurnResult, adapter, extract_json, format_usage
+from .peers import TurnResult, adapter, cli_version, extract_json, format_usage
 
 LEASE_S = 120
 
@@ -203,14 +203,19 @@ class Worker:
         resume_id = self.bus.peer_session(self.thread_id, agent) if resume else None
         timeout = max(30.0, min(self.config.turn_timeout_s, self.deadline_left()))
         shown = "".join(f" · {k} {v}" for k, v in settings.items())
-        self.event("turn_start", f"round {t['round']}" + (" (resumed)" if resume_id else "") + shown, agent)
+        # Which CLI build and adapter recipe ran this turn, so drift can be tied to an upgrade (#32).
+        version = cli_version(self.bus, agent, ad.command, cwd=cwd)
+        self.event("turn_start", f"round {t['round']}" + (" (resumed)" if resume_id else "") + shown
+                   + f" · {version} · recipe {agent}/{ad.recipe}", agent)
         emit = lambda kind, text: self.event(kind, text, agent)  # noqa: E731
         tag = self.job["id"]
         res = ad.run(prompt, cwd, timeout, emit, resume_id=resume_id, add_dirs=add_dirs,
                      cancelled=self.cancelled, peer_tag=tag)
         # A fresh session can't fix running out of usage; it would only spend more.  Check
         # again first: another worker may have found this agent out of usage meanwhile.
-        if not res.ok and resume_id and not res.timed_out and not res.quota and not self.cancelled():
+        # Nor can it fix a changed output format.
+        if (not res.ok and resume_id and not res.timed_out and not res.quota and not res.format_changed
+                and not self.cancelled()):
             block = self.bus.quota_block(agent, quota.model_key(model))
             if block:
                 self.event("turn_end", f"failed: {res.error}" + format_usage(res.usage), agent)
@@ -225,6 +230,11 @@ class Worker:
             self.record_quota(agent, model, res.quota)
             # Keep the conversation pinned for a retry after the reset, and never pin the
             # failed attempt's own session (a first turn that ran out has no context).
+            if resume_id:
+                self.set_peer_session(agent, resume_id)
+            return res
+        if res.format_changed:
+            self.format_notice(agent, version, res.error or "")
             if resume_id:
                 self.set_peer_session(agent, resume_id)
             return res
@@ -254,6 +264,22 @@ class Worker:
                                              scope=quota.scope_for(agent, model), estimated=estimated)
         found.update(resets_at=until)
         self.quota_notice(agent, block)
+
+    def format_notice(self, agent: str, version: str, error: str) -> None:
+        """One notice per agent per job when its output no longer matches what agent-bus
+        parses.  Fixed wording plus the CLI's version; the raw output stays in events."""
+        reason = "without a reply or a session id"
+        for what in ("without a reply or a session id", "without a reply", "without a session id"):
+            if what in error:
+                reason = what
+                break
+        with self._quota_lock:
+            if ("format", agent) in self.quota_noticed:
+                return
+            self.quota_noticed.add(("format", agent))
+        self.system(f"PEER_FORMAT_CHANGED: {agent} ({version}) exited normally {reason}, so its output "
+                    "format has probably changed. The progress events have the details; `agent-bus agents` "
+                    f"shows the installed version. Run `agent-bus resume {self.thread_id}` once it's fixed.")
 
     def quota_notice(self, agent: str, block: dict) -> None:
         """One thread notice per agent per job, in fixed wording: who is out of usage,
@@ -428,7 +454,7 @@ class Worker:
                    fresh_prompt: str | None = None, delivered_upto: int | None = None) -> None:
         """Run one turn for ``agent`` and post its proposal or vote."""
         res = self.turn(agent, prompt, resume=resume, fresh_prompt=fresh_prompt)
-        if res.quota:
+        if res.quota or res.format_changed:
             return  # noticed in turn(); no cursor move, no repair, no partial vote
         if delivered_upto is not None and (res.ok or res.text):
             self.mark_delivered(agent, delivered_upto)
@@ -441,8 +467,8 @@ class Worker:
             # blind-safe prompt it already had, never the others' proposals.
             repair = prompts.REPAIR_BLIND if blind else prompts.REPAIR
             res2 = self.turn(agent, repair, fresh_prompt=(fresh_prompt or prompt) + "\n\n" + repair)
-            if res2.quota:
-                return  # out of usage mid-repair: post nothing from either attempt
+            if res2.quota or res2.format_changed:
+                return  # out of usage or format drift mid-repair: post nothing from either attempt
             action = extract_json(res2.text) if res2.text else None
         if not self.valid_action(action, blind):
             self.safe_post(agent, res.text.strip()[:20000] or "(empty reply)", kind="message",
@@ -556,8 +582,9 @@ class Worker:
         self.system(f"Review {'follow-up ' if followup else ''}{'(retry) ' if mode == 'retry' else ''}"
                     f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.")
         res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh)
-        if res.quota:
-            # Head, reviewer and session stay pinned for `agent-bus resume` after the reset.
+        if res.quota or res.format_changed:
+            # Head, reviewer and session stay pinned for `agent-bus resume` after the reset
+            # (or once the adapter handles the new format).
             self.finish_thread("needs_human")
             return
         if res.ok or res.text:
@@ -566,7 +593,7 @@ class Worker:
         if verdict is None and res.ok:
             res2 = self.turn(reviewer, "Reply again with only the JSON verdict object described above.",
                              fresh_prompt=fresh + "\n\nReply with only the JSON verdict object.")
-            if res2.quota:
+            if res2.quota or res2.format_changed:
                 self.finish_thread("needs_human")
                 return
             verdict = normalize_verdict(extract_json(res2.text) if res2.text else None)

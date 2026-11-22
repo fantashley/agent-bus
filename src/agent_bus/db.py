@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS cli_versions (  -- `<cli> --version`, once per binary identity (#32)
+    identity TEXT PRIMARY KEY,          -- real path, size and mtime
+    agent TEXT NOT NULL,
+    path TEXT NOT NULL,
+    version TEXT NOT NULL,              -- the CLI's own version line, or "unknown"
+    probed_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS quota_blocks (  -- an agent out of usage (issue #26)
     agent TEXT NOT NULL,
     scope TEXT NOT NULL DEFAULT '',     -- '' for the whole account, else the model it applies to
@@ -763,6 +770,23 @@ class Bus:
         return [p for p in pids if p]
 
     # --------------------------------------------------------- peers and events
+
+    # ------------------------------------------------------------ CLI versions
+
+    def cli_version(self, identity: str) -> str | None:
+        row = self._one("SELECT version FROM cli_versions WHERE identity=?", identity)
+        return row["version"] if row else None
+
+    def set_cli_version(self, identity: str, agent: str, path: str, version: str) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO cli_versions (identity, agent, path, version, probed_at)"
+                          " VALUES (?,?,?,?,?)", (identity, agent, path, version, _now()))
+
+    def latest_cli_versions(self) -> dict[str, dict]:
+        """The most recently probed version per agent."""
+        out: dict[str, dict] = {}
+        for r in self._all("SELECT * FROM cli_versions ORDER BY probed_at"):
+            out[r["agent"]] = dict(r)
+        return out
 
     # ---------------------------------------------------------------- quota
 
