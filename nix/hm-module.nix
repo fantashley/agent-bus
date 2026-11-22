@@ -95,9 +95,18 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-      defaultText = lib.literalExpression "agent-bus.packages.\${system}.default";
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.${if cfg.jujutsu.enable then "default" else "agent-bus-git"};
+      defaultText = lib.literalExpression ''agent-bus.packages.''${system}.''${if jujutsu.enable then "default" else "agent-bus-git"}'';
       description = "The agent-bus package.";
+    };
+
+    jujutsu.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Bundle jj with agent-bus, for reviews in jj repositories. Plain git repos never
+        use it; turn it off if you don't use jj.
+      '';
     };
 
     repos = lib.mkOption {

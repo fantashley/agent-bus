@@ -11,6 +11,8 @@
     {
       packages = forAll (pkgs: rec {
         agent-bus = pkgs.callPackage ./nix/package.nix { };
+        # For plain git users: no jj on the wrapped PATH or in the tests.
+        agent-bus-git = pkgs.callPackage ./nix/package.nix { withJujutsu = false; };
         default = agent-bus;
       });
 
@@ -20,6 +22,7 @@
         package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         # The package build never evaluates the home-manager module, so at least
         # make sure it parses (importing it does).
+        package-git = self.packages.${pkgs.stdenv.hostPlatform.system}.agent-bus-git;
         hm-module = builtins.seq (import ./nix/hm-module.nix) (pkgs.runCommand "hm-module-parses" { } "touch $out");
       });
 

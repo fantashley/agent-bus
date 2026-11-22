@@ -17,7 +17,8 @@ from . import rex, worker
 from .db import HUMAN, SYSTEM, Bus, BusError, wrap_peer
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-CHANGE_RE = re.compile(r"^[a-z0-9]{1,64}$")
+# A label for the change under review: a jj change id, a git branch name, or e.g. "PR #12".
+CHANGE_RE = re.compile(r"[A-Za-z0-9#][A-Za-z0-9 ._/#:+-]{0,99}")
 
 
 def present(m: dict) -> dict:
@@ -219,8 +220,9 @@ class Service:
                             ("prev_head_commit_id", prev_head_commit_id)):
             if value is not None and not COMMIT_RE.match(value):
                 raise ValueError(f"{name} must be a full 40-character commit id")
-        if change_id is not None and not CHANGE_RE.match(change_id):
-            raise ValueError("change_id must be a jj change id (lowercase letters and digits)")
+        if change_id is not None and (not CHANGE_RE.fullmatch(change_id) or change_id != change_id.strip()):
+            raise ValueError("change_id must be a short label: a jj change id, a git branch name, "
+                             "or e.g. \"PR #12\" (letters, digits, space and ._/#:+-, up to 100 characters)")
         repo_path = self._allowed_repo(repo)
         refs = {"reviewer": reviewer, "repo": repo_path, "change_id": change_id,
                 "base_commit_id": base_commit_id, "head_commit_id": head_commit_id,

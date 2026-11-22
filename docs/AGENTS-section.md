@@ -15,8 +15,9 @@ reply is posted for you, and you must not call agent-bus tools.
   or a revised proposal. Consensus is every participant agreeing on the same proposal id. If the
   thread ends `needs_human`, report the dissent to the user rather than starting another discussion.
 - **To get a change reviewed**, pin it and call `request_review(reviewer, repo, base_commit_id,
-  head_commit_id, change_id?, prev_head_commit_id?)` with full commit ids
-  (`jj log --no-graph -r @ -T commit_id`). A new head needs a new request; pass the previously
+  head_commit_id, change_id?, prev_head_commit_id?)` with full commit ids (`git rev-parse HEAD`,
+  or `jj log --no-graph -r @ -T commit_id` in a jj repo); `change_id` is an optional label such
+  as a jj change id, a branch name or "PR #12". A new head needs a new request; pass the previously
   reviewed head as `prev_head_commit_id`: that resumes the reviewer's own conversation on the same
   thread, so first `send` it a short note on how you addressed each finding. Then `wait(thread)`.
 - **Don't ping-pong.** Reply only when you have something new. Threads have message and round caps;

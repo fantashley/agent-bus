@@ -506,17 +506,33 @@ class Worker:
             frm, heading = refs["prev_head_commit_id"], "Interdiff since the head you last reviewed:"
         else:
             frm, heading = refs["base_commit_id"], "Diff from base to head:"
+        kind = cfg.vcs(repo)
+        jj_argv = ["jj", "diff", "--ignore-working-copy", "--git", "--from", frm, "--to", refs["head_commit_id"]]
+        git_argv = ["git", "diff", "--no-ext-diff", "--no-textconv", frm, refs["head_commit_id"]]
+        if kind == "jj":
+            # In a colocated repo, --ignore-working-copy skips importing plain git commits,
+            # so fall back to git diff if jj cannot resolve the pinned commit ids.
+            attempts = [("jj", jj_argv)]
+            if os.path.exists(os.path.join(repo, ".git")):
+                attempts.append(("git", git_argv))
+        elif kind == "git":
+            attempts = [("git", git_argv)]
+        else:
+            raise RuntimeError(f"could not compute diff: {repo} is not a jj or git repository")
+        last_err = ""
         out = None
-        for argv in (["jj", "diff", "--ignore-working-copy", "--git", "--from", frm, "--to", refs["head_commit_id"]],
-                     ["git", "diff", "--no-ext-diff", frm, refs["head_commit_id"]]):
+        for tool, argv in attempts:
             try:
                 out = subprocess.run(argv, cwd=repo, capture_output=True, text=True, timeout=120)
-            except FileNotFoundError:
+            except (OSError, subprocess.TimeoutExpired) as e:
+                last_err = f"{tool}: {e}"
+                out = None
                 continue
             if out.returncode == 0:
                 break
+            last_err = f"{tool}: {out.stderr[:500]}"
         if out is None or out.returncode != 0:
-            raise RuntimeError(f"could not compute diff: {(out.stderr if out else 'jj and git not found')[:500]}")
+            raise RuntimeError(f"could not compute diff with {last_err}")
         diff = out.stdout
         limit = self.config.max_diff_bytes
         if len(diff.encode()) > limit:

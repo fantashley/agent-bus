@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 
 import pytest
@@ -98,7 +99,7 @@ def test_present_initiator_takes_part(env, no_spawn):
 
 def test_review_round_trip(env, no_spawn):
     repo = env["repo"]
-    if subprocess.run(["jj", "--version"], capture_output=True).returncode != 0:
+    if shutil.which("jj") is None:
         pytest.skip("jj not installed")
     sh = lambda *a: subprocess.run(a, cwd=repo, check=True, capture_output=True, text=True).stdout.strip()  # noqa: E731
     sh("jj", "git", "init")

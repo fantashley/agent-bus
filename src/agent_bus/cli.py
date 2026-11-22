@@ -75,7 +75,8 @@ def peer_status(bus: Bus, thread: str, peer: str) -> tuple[str, str | None, str]
 
 def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
     color = rex.stdout_is_tty() and not args.no_color
-    status = (not args.no_status) and rex.stdout_is_tty()
+    # OSC 7501 status is a Rex feature: only emit it inside Rex.
+    status = (not args.no_status) and rex.stdout_is_tty() and bool(os.environ.get("REX_SESSION"))
     last_msg = last_ev = 0
     last_status = None
     t = bus.thread(args.thread)

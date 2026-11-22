@@ -44,9 +44,12 @@ waits in its inbox for its vote.
 
 ## Reviews
 
-`request_review(reviewer, repo, base_commit_id, head_commit_id, …)` pins full commit ids. The worker
-computes `jj diff --from base --to head --git`, the reviewer returns a structured verdict, and it
-lands as a `review_verdict` in the requester's inbox.
+`request_review(reviewer, repo, base_commit_id, head_commit_id, …)` pins full commit ids (works the
+same in jj and plain git repos). The worker computes the diff with the repo's own tool:
+`jj diff --git` when the repo has a `.jj` directory and jj is installed, otherwise `git diff`.
+jj is optional: plain git repos never run it. The reviewer returns a structured verdict, and it
+lands as a `review_verdict` in the requester's inbox. `change_id` is an optional label: a jj change
+id, a branch name or `PR #12`.
 
 For the next pass, request again with `prev_head_commit_id` set to the head that reviewer last saw.
 That continues the **same thread** and **resumes the reviewer's own conversation**, so it remembers
@@ -248,4 +251,5 @@ nix build                  # package (runs the tests)
 
 Interactive peer panes and automatic wake-ups, until a client or Rex can deliver input
 atomically only when it's ready (see above). Still to come in v1.5: Codex and Antigravity
-hooks, writable participants in separate `jj workspace`s, and cross-host discussions.
+hooks, writable participants in separate workspaces (`jj workspace` or git worktrees), and
+cross-host discussions.
