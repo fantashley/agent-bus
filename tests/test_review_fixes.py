@@ -601,3 +601,23 @@ def test_tail_prints_thinking_events(env, capsys):
     bus.add_event(tid, "thinking", "12 thinking tokens over 3s", agent="antigravity")
     assert cli.main(["tail", tid, "--peer", "antigravity", "--once", "--no-status", "--no-color"]) == 0
     assert "antigravity thinking: 12 thinking tokens over 3s" in capsys.readouterr().out
+
+
+def test_antigravity_text_is_kept_per_step():
+    """Two response steps (with a tool call between) give two text events, each with only
+    its own step's text, while the final answer still joins them."""
+    from agent_bus.peers import AntigravityAdapter, StreamState
+    st, events = StreamState(), []
+    adapter = AntigravityAdapter.__new__(AntigravityAdapter)
+
+    def step(**su):
+        adapter.parse_line({"event": "step_update", "step_update": su}, st, lambda k, t: events.append((k, t)))
+
+    step(step_index=1, state="ACTIVE", step_type="agent_response", text_delta="Let me check ")
+    step(step_index=1, state="ACTIVE", step_type="agent_response", text_delta="the file.")
+    step(step_index=1, state="DONE", step_type="agent_response")
+    step(step_index=2, state="ACTIVE", step_type="tool", tool_name="read_file", tool_info={"parameters": {"Path": "/r"}})
+    step(step_index=3, state="ACTIVE", step_type="agent_response", text_delta="It says hi.")
+    step(step_index=3, state="DONE", step_type="agent_response")
+    assert [t for k, t in events if k == "text"] == ["Let me check the file.", "It says hi."]
+    assert "".join(st.text_parts) == "Let me check the file.It says hi."
