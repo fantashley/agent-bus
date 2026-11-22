@@ -51,6 +51,7 @@ class StreamState:
     final: str | None = None
     external_id: str | None = None
     error: str | None = None
+    step_text: dict = field(default_factory=dict)  # per-step text, for clients that stream deltas
 
 
 Emit = Callable[[str, str], None]  # (kind, text)
@@ -333,12 +334,27 @@ class AntigravityAdapter(Adapter):
         elif ev == "step_update":
             su = obj.get("step_update") or {}
             st.external_id = su.get("conversation_id") or st.external_id
-            if su.get("step_type") == "agent_response" and su.get("text_delta"):
-                st.text_parts.append(su["text_delta"])
-            elif su.get("state") == "ACTIVE" and su.get("step_type") not in (None, "user_input", "agent_response"):
-                emit("tool", _short(str(su.get("step_type"))))
-            if su.get("step_type") == "agent_response" and su.get("state") == "DONE":
-                emit("text", _short("".join(st.text_parts)[-400:]))
+            kind, state, idx = su.get("step_type"), su.get("state"), su.get("step_index")
+            if kind == "agent_response":
+                if su.get("text_delta"):
+                    st.text_parts.append(su["text_delta"])
+                    st.step_text.setdefault(idx, []).append(su["text_delta"])
+                if state == "DONE":
+                    text = "".join(st.step_text.pop(idx, []))
+                    if text.strip():
+                        emit("text", _short(text[-400:]))
+                    # agy reports how much it thought, not what: say that much.
+                    usage = su.get("usage") or {}
+                    if usage.get("thinking_tokens"):
+                        secs = su.get("duration_seconds")
+                        emit("thinking", f"{usage['thinking_tokens']} thinking tokens"
+                             + (f" over {secs:.0f}s" if isinstance(secs, (int, float)) else ""))
+            elif kind == "tool" and state == "ACTIVE":
+                info = su.get("tool_info") or {}
+                name = su.get("tool_name") or info.get("name") or "tool"
+                emit("tool", _short(f"{name} {_agy_hint(info.get('parameters') or {})}".strip()))
+            elif state == "ACTIVE" and kind not in (None, "user_input", "agent_response"):
+                emit("tool", _short(str(kind)))
         elif ev == "result":
             res = obj.get("result") or {}
             st.external_id = res.get("conversation_id") or st.external_id
@@ -346,6 +362,15 @@ class AntigravityAdapter(Adapter):
                 st.error = _short(f"status {res.get('status')}: {res.get('error') or ''}", 800)
             if isinstance(res.get("response"), str):
                 st.final = res["response"]
+
+
+def _agy_hint(params: dict) -> str:
+    """The most telling argument of an agy tool call (its parameter names are PascalCase)."""
+    for key in ("CommandLine", "Command", "Path", "AbsolutePath", "File", "Pattern", "Query", "SearchPath", "Url"):
+        val = params.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return ""
 
 
 ADAPTERS = {a.agent: a for a in (ClaudeAdapter, CodexAdapter, AntigravityAdapter)}

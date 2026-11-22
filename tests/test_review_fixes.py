@@ -548,3 +548,21 @@ def test_codex_server_name_that_cant_be_overridden_fails_closed(env, monkeypatch
     monkeypatch.setattr(adapter, "mcp_servers", lambda cwd: ["agent-bus", "my_srv-2"])
     argv = adapter.invocation("hi", None, str(env["repo"]), []).argv
     assert "mcp_servers.my_srv-2.enabled=false" in argv
+
+
+def test_antigravity_progress_events_from_real_stream():
+    """Recorded `agy --output-format stream-json` output: tool calls show their name and
+    main argument, reply text is emitted per step (no empty lines), and thinking is
+    reported as a token count, since agy doesn't stream its content."""
+    import json
+    from pathlib import Path
+    from agent_bus.peers import AntigravityAdapter, StreamState
+    st, events = StreamState(), []
+    adapter = AntigravityAdapter.__new__(AntigravityAdapter)
+    for line in (Path(__file__).parent / "data" / "agy-stream.jsonl").read_text().splitlines():
+        adapter.parse_line(json.loads(line), st, lambda k, t: events.append((k, t)))
+    assert ("tool", "read_file /repo/README.md") in events
+    texts = [t for k, t in events if k == "text"]
+    assert texts and all(t.strip() for t in texts) and "agent-bus" in texts[-1]
+    assert any(k == "thinking" and "thinking tokens" in t for k, t in events)
+    assert st.final and "agent-bus" in st.final and st.external_id
