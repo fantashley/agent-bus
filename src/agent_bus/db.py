@@ -113,6 +113,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS quota_blocks (  -- an agent out of usage (issue #26)
+    agent TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT '',     -- '' for the whole account, else the model it applies to
+    until REAL NOT NULL,
+    estimated INTEGER NOT NULL DEFAULT 0,  -- 1 when no reset time was given (a cooldown)
+    source TEXT NOT NULL,               -- structured | heuristic
+    reason TEXT,
+    observed_at REAL NOT NULL,
+    PRIMARY KEY (agent, scope)
+);
 CREATE TABLE IF NOT EXISTS peer_sessions (
     thread_id TEXT NOT NULL,
     agent TEXT NOT NULL,
@@ -725,6 +735,44 @@ class Bus:
         return [p for p in pids if p]
 
     # --------------------------------------------------------- peers and events
+
+    # ---------------------------------------------------------------- quota
+
+    def set_quota_block(self, agent: str, until: float, source: str, reason: str | None = None,
+                        scope: str = "", estimated: bool = False) -> dict:
+        """Record that ``agent`` is out of usage until ``until``.  Newer evidence for the
+        same scope replaces older."""
+        now = _now()
+        self.conn.execute(
+            "INSERT INTO quota_blocks (agent, scope, until, estimated, source, reason, observed_at)"
+            " VALUES (?,?,?,?,?,?,?) ON CONFLICT(agent, scope) DO UPDATE SET until=excluded.until,"
+            " estimated=excluded.estimated, source=excluded.source, reason=excluded.reason,"
+            " observed_at=excluded.observed_at",
+            (agent, scope or "", until, int(estimated), source, reason, now))
+        # The row as written, even if it has already expired (e.g. a zero cooldown).
+        return {"agent": agent, "scope": scope or "", "until": until, "estimated": int(estimated),
+                "source": source, "reason": reason, "observed_at": now}
+
+    def quota_block(self, agent: str, model: str | None = None) -> dict | None:
+        """The active block that stops ``agent`` (running ``model``, if one is set): an
+        account-wide one or one for that model, whichever lasts longer.  Expired blocks
+        are ignored (and pruned lazily by quota_blocks())."""
+        rows = self._all("SELECT * FROM quota_blocks WHERE agent=? AND until>? AND scope IN ('', ?)"
+                         " ORDER BY until DESC", agent, _now(), model or "")
+        return dict(rows[0]) if rows else None
+
+    def quota_blocks(self) -> list[dict]:
+        """Every active block; expired ones are deleted."""
+        now = _now()
+        if self._one("SELECT 1 FROM quota_blocks WHERE until<=? LIMIT 1", now):
+            self.conn.execute("DELETE FROM quota_blocks WHERE until<=?", (now,))
+        return [dict(r) for r in self._all("SELECT * FROM quota_blocks ORDER BY agent, scope")]
+
+    def clear_quota(self, agent: str, model: str | None = None) -> int:
+        """Lift ``agent``'s account-wide block, and its block for ``model`` if given."""
+        cur = self.conn.execute("DELETE FROM quota_blocks WHERE agent=? AND scope IN ('', ?)",
+                                (agent, model or ""))
+        return cur.rowcount if cur.rowcount is not None else 0
 
     def peer_session(self, thread_id: str, agent: str) -> str | None:
         row = self._one("SELECT external_id FROM peer_sessions WHERE thread_id=? AND agent=?", thread_id, agent)

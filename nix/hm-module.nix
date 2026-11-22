@@ -185,7 +185,7 @@ in
       example = { max_rounds = 3; deadline_minutes = 20; };
       description = ''
         Extra keys for config.json: max_rounds, deadline_minutes,
-        turn_timeout_s, initiator_grace_s, max_messages, max_diff_bytes,
+        turn_timeout_s, initiator_grace_s, quota_cooldown_s, max_messages, max_diff_bytes,
         `peers.<agent>.{command,args}` to override how a peer CLI is run, and
         `peers.antigravity.allow_mcp = true` to let Antigravity peers run even
         though its other MCP servers can't be switched off per session.

@@ -15,7 +15,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from . import config as cfg
-from . import procinfo, service
+from . import procinfo, quota, service
 from .db import Bus, BusError
 
 INSTRUCTIONS = """\
@@ -73,7 +73,9 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
             avail = svc.config.availability()
             return {"agent": agent, "session_id": session_id, "cwd": cwd,
                     "available_agents": [a for a, v in avail.items() if v["available"] and a != agent],
-                    "unavailable_agents": {a: v["reason"] for a, v in avail.items() if not v["available"]}}
+                    "unavailable_agents": {a: v["reason"] for a, v in avail.items() if not v["available"]},
+                    "out_of_usage": [{"agent": b["agent"], **quota.summary(b)}
+                                     for b in bus.quota_blocks() if b["agent"] != agent]}
         return call(me)
 
     @mcp.tool()

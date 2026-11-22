@@ -62,6 +62,7 @@ DEFAULTS = {
     "deadline_minutes": 30,
     "turn_timeout_s": 600,
     "initiator_grace_s": 180,
+    "quota_cooldown_s": 900,
     "max_messages": 60,
     "max_diff_bytes": 200_000,
     "peers": {},
@@ -97,6 +98,8 @@ class Config:
     deadline_minutes: int = 30
     turn_timeout_s: int = 600
     initiator_grace_s: int = 180
+    # How long an out-of-usage agent is skipped when its CLI gave no reset time (#26).
+    quota_cooldown_s: int = 900
     max_messages: int = 60
     max_diff_bytes: int = 200_000
     # Per-agent overrides: {"claude": {"command": "/path/claude", "args": [...]}}
