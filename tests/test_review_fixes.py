@@ -563,6 +563,41 @@ def test_antigravity_progress_events_from_real_stream():
         adapter.parse_line(json.loads(line), st, lambda k, t: events.append((k, t)))
     assert ("tool", "read_file /repo/README.md") in events
     texts = [t for k, t in events if k == "text"]
-    assert texts and all(t.strip() for t in texts) and "agent-bus" in texts[-1]
+    assert len(texts) == 1 and "agent-bus" in texts[0]  # the thinking-only step emits no text
     assert any(k == "thinking" and "thinking tokens" in t for k, t in events)
     assert st.final and "agent-bus" in st.final and st.external_id
+
+
+def test_antigravity_events_long_text_hints_and_repeated_frames():
+    from agent_bus.peers import AntigravityAdapter, StreamState
+    st, events = StreamState(), []
+    adapter = AntigravityAdapter.__new__(AntigravityAdapter)
+    emit = lambda k, t: events.append((k, t))
+
+    def step(**su):
+        adapter.parse_line({"event": "step_update", "step_update": su}, st, emit)
+
+    tool = {"step_index": 1, "state": "ACTIVE", "step_type": "tool", "tool_name": "search_web",
+            "tool_info": {"name": "search_web", "parameters": {"query": "rex osc 7501"}}}
+    step(**tool)
+    step(**tool)  # a second ACTIVE frame for the same step
+    step(step_index=2, state="ACTIVE", step_type="tool", tool_name="list_dir",
+         tool_info={"parameters": {"DirectoryPath": "/repo/src"}})
+    step(step_index=3, state="ACTIVE", step_type="tool", tool_name="odd", tool_info={"parameters": ["x"]})
+    long = "START " + "word " * 120 + "END"
+    step(step_index=4, state="ACTIVE", step_type="agent_response", text_delta=long)
+    step(step_index=4, state="DONE", step_type="agent_response", usage={"thinking_tokens": 9},
+         duration_seconds=2.0)
+    assert events[:3] == [("tool", "search_web rex osc 7501"), ("tool", "list_dir /repo/src"), ("tool", "odd")]
+    assert events[3] == ("thinking", "9 thinking tokens over 2s")  # thinking comes before its text
+    kind, text = events[4]
+    assert kind == "text" and text.startswith("START") and text.endswith("…")
+
+
+def test_tail_prints_thinking_events(env, capsys):
+    from agent_bus import cli
+    bus = env["bus"]
+    tid = bus.create_thread("chat", "x", ["antigravity"], "human")["id"]
+    bus.add_event(tid, "thinking", "12 thinking tokens over 3s", agent="antigravity")
+    assert cli.main(["tail", tid, "--peer", "antigravity", "--once", "--no-status", "--no-color"]) == 0
+    assert "antigravity thinking: 12 thinking tokens over 3s" in capsys.readouterr().out

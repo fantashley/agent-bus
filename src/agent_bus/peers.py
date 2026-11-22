@@ -340,21 +340,28 @@ class AntigravityAdapter(Adapter):
                     st.text_parts.append(su["text_delta"])
                     st.step_text.setdefault(idx, []).append(su["text_delta"])
                 if state == "DONE":
-                    text = "".join(st.step_text.pop(idx, []))
-                    if text.strip():
-                        emit("text", _short(text[-400:]))
-                    # agy reports how much it thought, not what: say that much.
-                    usage = su.get("usage") or {}
+                    # agy reports how much it thought, not what: say that much, before the
+                    # text it led to.
+                    usage = su.get("usage") if isinstance(su.get("usage"), dict) else {}
                     if usage.get("thinking_tokens"):
                         secs = su.get("duration_seconds")
                         emit("thinking", f"{usage['thinking_tokens']} thinking tokens"
                              + (f" over {secs:.0f}s" if isinstance(secs, (int, float)) else ""))
-            elif kind == "tool" and state == "ACTIVE":
-                info = su.get("tool_info") or {}
-                name = su.get("tool_name") or info.get("name") or "tool"
-                emit("tool", _short(f"{name} {_agy_hint(info.get('parameters') or {})}".strip()))
-            elif state == "ACTIVE" and kind not in (None, "user_input", "agent_response"):
-                emit("tool", _short(str(kind)))
+                    text = "".join(st.step_text.pop(idx, []))
+                    if text.strip():
+                        emit("text", _short(text))
+            elif state == "ACTIVE" and kind not in (None, "user_input"):
+                # A long-running step can send several ACTIVE frames; report it once.
+                key = ("active", idx)
+                if idx is not None and key in st.step_text:
+                    return
+                st.step_text[key] = True
+                if kind == "tool":
+                    info = su.get("tool_info") if isinstance(su.get("tool_info"), dict) else {}
+                    name = su.get("tool_name") or info.get("name") or "tool"
+                    emit("tool", _short(f"{name} {_agy_hint(info.get('parameters'))}".strip()))
+                else:
+                    emit("tool", _short(str(kind)))
         elif ev == "result":
             res = obj.get("result") or {}
             st.external_id = res.get("conversation_id") or st.external_id
@@ -364,10 +371,18 @@ class AntigravityAdapter(Adapter):
                 st.final = res["response"]
 
 
-def _agy_hint(params: dict) -> str:
-    """The most telling argument of an agy tool call (its parameter names are PascalCase)."""
-    for key in ("CommandLine", "Command", "Path", "AbsolutePath", "File", "Pattern", "Query", "SearchPath", "Url"):
-        val = params.get(key)
+_AGY_HINT_KEYS = ("commandline", "command", "path", "absolutepath", "file", "directorypath", "searchdirectory",
+                  "pattern", "query", "searchpath", "url")
+
+
+def _agy_hint(params) -> str:
+    """The most telling argument of an agy tool call.  Most parameter names are
+    PascalCase, some lowercase (search_web's ``query``), so match case-insensitively."""
+    if not isinstance(params, dict):
+        return ""
+    lowered = {str(k).lower(): v for k, v in params.items()}
+    for key in _AGY_HINT_KEYS:
+        val = lowered.get(key)
         if isinstance(val, str) and val:
             return val
     return ""
