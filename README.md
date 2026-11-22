@@ -327,6 +327,22 @@ You don't need all three agents. agent-bus works with whichever of them a machin
 - **Checking:** `agent-bus agents` shows what's available and why. Agents see it through the
   `whoami` tool.
 
+## Releases
+
+PRs are squash-merged, and the PR title becomes the commit on `main`, so it must be a
+[Conventional Commit](https://www.conventionalcommits.org/): `feat: …`, `fix(peers): …`,
+`docs: …`, with `!` for a breaking change. CI checks the title. On every push to `main`,
+[release-please](https://github.com/googleapis/release-please) keeps a release PR open that
+bumps the version (`pyproject.toml`, `src/agent_bus/__init__.py`, `nix/package.nix`) and
+updates `CHANGELOG.md`; merging it tags `vX.Y.Z` and publishes the GitHub release. `feat`
+bumps the minor version, `fix`, `perf` and `revert` the patch, and a breaking change the
+major. Other types (`docs`, `chore`, `ci`, …) are hidden from the changelog
+(`changelog-sections` in `release-please-config.json`), so they don't trigger a release on
+their own. Before merging a release PR, wait until no release-please run is queued or running and the
+PR shows a successful refresh against the current `main`, then check that the PR's diff only touches version numbers and the changelog:
+release-please can occasionally carry a stale copy of a file
+([release-please#2890](https://github.com/googleapis/release-please/issues/2890)).
+
 ## Development
 
 ```sh

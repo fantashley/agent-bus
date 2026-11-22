@@ -1,0 +1,34 @@
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  # Labels are issue resources: without this, the release PR can't get its
+  # `autorelease: pending` label, and a merged release PR is then never tagged.
+  issues: write
+
+# One run at a time (a newer queued run may replace an older pending one, which
+# is fine: each run reads the current main). release-please 17.x can write a stale
+# snapshot of a file over a newer main if main moves mid-run
+# (googleapis/release-please#2890); always-update in the config lets the next run
+# rewrite the release PR even when its notes didn't change.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # Keeps a release PR open that bumps the version in pyproject.toml,
+      # src/agent_bus/__init__.py and nix/package.nix and updates CHANGELOG.md
+      # from the conventional commit titles on main. Merging it tags vX.Y.Z
+      # and publishes the GitHub release.
+      - uses: googleapis/release-please-action@v5
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

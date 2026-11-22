@@ -2,7 +2,7 @@
 
 python3Packages.buildPythonApplication {
   pname = "agent-bus";
-  version = "0.1.0";
+  version = "0.1.0"; # x-release-please-version
   pyproject = true;
   src = lib.cleanSourceWith {
     src = ../.;
