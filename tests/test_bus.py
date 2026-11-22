@@ -157,3 +157,27 @@ def test_threads_cli_has_headers_and_aligned_columns(env, no_spawn, capsys):
     assert lines[1].index("open") == lines[0].index("STATUS")
     assert lines[1].split()[-1] == "claude,codex" and lines[1].split()[4] == "-"
     assert lines[2].strip() == "a goal"
+
+
+def test_threads_cli_widens_columns_and_shows_workers(env, no_spawn, capsys):
+    from agent_bus import cli
+    bus = env["bus"]
+    assert cli.main(["threads", "--all"]) == 0
+    assert capsys.readouterr().out.strip() == "no threads"
+    t = bus.create_thread("discussion", "  a   spaced\n goal ", ["claude", "codex", "antigravity"], "human")
+    bus.set_thread(t["id"], status="needs_human")
+    t2 = bus.create_thread("review", "r", ["claude", "codex"], "claude")
+    bus.create_job(t2["id"], "review", {}, "k")  # a queued worker
+    assert cli.main(["threads"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    head = lines[0]
+    cols = [head.index(h) for h in ("STATUS", "KIND", "ROUND", "WORKER", "PARTICIPANTS")]
+    rows = {ln.split()[0]: ln for ln in lines[1:] if ln.startswith("t-")}
+    import re
+    for ln in rows.values():
+        # Every column starts where its header does, however wide the values are.
+        assert [m.start() for m in re.finditer(r"\S+", ln)][1:6] == cols
+    assert "needs_human" in rows[t["id"]] and "discussion" in rows[t["id"]]
+    assert rows[t2["id"]].split()[4] == "queued"
+    goal = lines[lines.index(rows[t["id"]]) + 1]
+    assert goal.strip() == "a spaced goal" and goal.startswith(" " * cols[0])
