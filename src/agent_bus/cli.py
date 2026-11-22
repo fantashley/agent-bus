@@ -280,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
         exe = os.path.abspath(args.bin or me[0])
         try:
             print(f"codex: agent-bus entry {codex_setup.ensure(exe)}")
-        except (codex_setup.SetupError, OSError, subprocess.TimeoutExpired) as e:
+        except (codex_setup.SetupError, OSError, UnicodeError, subprocess.TimeoutExpired) as e:
             print(f"agent-bus: setup-codex: {e}", file=sys.stderr)
             return 1
         return 0

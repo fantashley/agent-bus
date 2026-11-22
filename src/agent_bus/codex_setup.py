@@ -52,24 +52,39 @@ def current(codex: str, run: Runner = subprocess.run) -> dict | None:
 _HEADER = re.compile(r'^\s*\[\s*mcp_servers\s*\.\s*(?:"agent-bus"|\'agent-bus\'|agent-bus)\s*\]\s*(?:#.*)?$')
 
 
+_ENV_KEY = re.compile(r"""\s*(?:env_vars|"env_vars"|'env_vars')\s*=""")
+
+
+def _parse(text: str, what: str) -> dict:
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise SetupError(f"{what} is not valid TOML ({e}); not editing it") from e
+
+
 def add_env_vars(text: str, names: list[str] = ENV_VARS) -> str:
     """Return ``text`` with ``env_vars`` set in the ``[mcp_servers.agent-bus]`` table.
 
     Only that table changes; the result must parse and every other key must be
-    unchanged, or this raises.
+    unchanged, or this raises :class:`SetupError`.
     """
-    before = tomllib.loads(text)
+    before = _parse(text, "Codex's config.toml")
     lines = text.splitlines(keepends=True)
     start = next((i for i, line in enumerate(lines) if _HEADER.match(line)), None)
     if start is None:
         raise SetupError("no [mcp_servers.agent-bus] table in Codex's config.toml")
     end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
-    body = [line for line in lines[start + 1:end] if not re.match(r"\s*env_vars\s*=", line)]
-    if any(re.match(r"\s*env_vars\s*=", line) and "]" not in line for line in lines[start + 1:end]):
-        raise SetupError("env_vars in Codex's config.toml spans lines; not editing it")
+    old = [line for line in lines[start + 1:end] if _ENV_KEY.match(line)]
+    for line in old:
+        try:  # a value spread over several lines doesn't parse on its own
+            tomllib.loads(line)
+        except tomllib.TOMLDecodeError:
+            raise SetupError("env_vars in Codex's config.toml spans lines; not editing it") from None
+    body = [line for line in lines[start + 1:end] if not _ENV_KEY.match(line)]
+    header = lines[start] if lines[start].endswith("\n") else lines[start] + "\n"
     new_line = "env_vars = " + json.dumps(names) + "\n"
-    out = "".join(lines[:start + 1] + [new_line] + body + lines[end:])
-    after = tomllib.loads(out)
+    out = "".join(lines[:start] + [header, new_line] + body + lines[end:])
+    after = _parse(out, "the edited config.toml")
     entry = after.get("mcp_servers", {}).get(NAME, {})
     if entry.get("env_vars") != names:
         raise SetupError("could not set env_vars in Codex's config.toml")
@@ -85,7 +100,7 @@ def add_env_vars(text: str, names: list[str] = ENV_VARS) -> str:
 def _write_atomic(path: Path, text: str) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config.toml.")
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
         os.chmod(tmp, path.stat().st_mode & 0o777)
         os.replace(tmp, path)
@@ -110,7 +125,7 @@ def ensure(bin_path: str, codex: str | None = None, run: Runner = subprocess.run
         _check(run([codex, "mcp", "add", NAME, "--", bin_path, "mcp", "--agent", "codex"],
                    capture_output=True, text=True, timeout=30), "add")
     path = codex_home() / "config.toml"
-    original = path.read_text()
+    original = path.read_text(encoding="utf-8")
     _write_atomic(path, add_env_vars(original))
     if current(codex, run) != want:
         _write_atomic(path, original)

@@ -117,3 +117,43 @@ def test_ensure_restores_config_when_codex_disagrees(codex_home):
     with pytest.raises(cs.SetupError):
         cs.ensure("/old/agent-bus", codex="codex", run=stubborn)
     assert codex_home.read_text() == CONFIG
+
+
+def test_add_env_vars_edge_cases():
+    # Header at EOF without a trailing newline.
+    out = cs.add_env_vars('[mcp_servers.agent-bus]')
+    assert tomllib.loads(out)["mcp_servers"]["agent-bus"]["env_vars"] == cs.ENV_VARS
+    # A quoted key is replaced, not duplicated.
+    text = CONFIG.replace('args = ["mcp", "--agent", "codex"]\n',
+                          'args = ["mcp", "--agent", "codex"]\n"env_vars" = ["OLD"]\n')
+    assert tomllib.loads(cs.add_env_vars(text))["mcp_servers"]["agent-bus"]["env_vars"] == cs.ENV_VARS
+    # A multi-line value with "]" in a comment on its first line is refused.
+    text = CONFIG.replace('args = ["mcp", "--agent", "codex"]\n',
+                          'args = ["mcp", "--agent", "codex"]\nenv_vars = [ # ]\n  "A",\n]\n')
+    with pytest.raises(cs.SetupError):
+        cs.add_env_vars(text)
+    # Invalid TOML is a SetupError, not a traceback.
+    with pytest.raises(cs.SetupError):
+        cs.add_env_vars("[mcp_servers.agent-bus\n")
+
+
+def test_add_env_vars_keeps_env_subtable():
+    text = CONFIG.replace("[profiles.p]", '[mcp_servers.agent-bus.env]\nFOO = "1"\n\n[profiles.p]')
+    d = tomllib.loads(cs.add_env_vars(text))["mcp_servers"]["agent-bus"]
+    assert d["env_vars"] == cs.ENV_VARS and d["env"] == {"FOO": "1"}
+
+
+def test_ensure_fresh_install(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    p = tmp_path / "config.toml"
+    p.write_text("")
+    fake = FakeCodex(p)
+    assert cs.ensure("/bin/agent-bus", codex="codex", run=fake) == "updated"
+    assert tomllib.loads(p.read_text())["mcp_servers"]["agent-bus"]["env_vars"] == cs.ENV_VARS
+
+
+def test_cli_setup_codex_errors_exit_nonzero(tmp_path, monkeypatch, capsys):
+    from agent_bus import cli
+    monkeypatch.setattr(cs.shutil, "which", lambda name: None)
+    assert cli.main(["setup-codex", "--bin", "/bin/agent-bus"]) == 1
+    assert "codex is not on PATH" in capsys.readouterr().err

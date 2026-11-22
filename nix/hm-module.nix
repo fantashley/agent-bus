@@ -148,6 +148,7 @@ in
         else
           verboseEcho "agent-bus: codex not on PATH; skipping Codex MCP registration"
         fi
+      '';
     })
 
     (lib.mkIf cfg.claude.enable (lib.optionalAttrs hasDotfilesClaude {
