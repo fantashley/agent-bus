@@ -143,3 +143,17 @@ def test_cancel(env, no_spawn):
     assert bus.jobs(tid)[0]["status"] == "cancelled"
     with pytest.raises(BusError):
         bus.post(tid, "codex", "late", kind="message")
+
+
+def test_threads_cli_has_headers_and_aligned_columns(env, no_spawn, capsys):
+    from agent_bus import cli
+    assert cli.main(["threads"]) == 0
+    assert "no open threads" in capsys.readouterr().out
+    claude = Service(env["bus"], "claude", env["bus"].register_session("claude"))
+    claude.send("a goal", to="codex")
+    assert cli.main(["threads"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split() == ["THREAD", "STATUS", "KIND", "ROUND", "WORKER", "PARTICIPANTS"]
+    assert lines[1].index("open") == lines[0].index("STATUS")
+    assert lines[1].split()[-1] == "claude,codex" and lines[1].split()[4] == "-"
+    assert lines[2].strip() == "a goal"
