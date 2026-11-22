@@ -188,12 +188,15 @@ class Worker:
         same prompt when the caller passes none.
         """
         self.check()
+        self.config.require_available(agent, "peer")
         t = self.thread()
         cwd, add_dirs = self.workdir(t)
-        ad = adapter(agent, self.config)
+        settings = self.config.peer_settings(agent, ((t["refs"] or {}).get("peer_settings") or {}).get(agent))
+        ad = adapter(agent, self.config, settings)
         resume_id = self.bus.peer_session(self.thread_id, agent) if resume else None
         timeout = max(30.0, min(self.config.turn_timeout_s, self.deadline_left()))
-        self.event("turn_start", f"round {t['round']}" + (" (resumed)" if resume_id else ""), agent)
+        shown = "".join(f" · {k} {v}" for k, v in settings.items())
+        self.event("turn_start", f"round {t['round']}" + (" (resumed)" if resume_id else "") + shown, agent)
         emit = lambda kind, text: self.event(kind, text, agent)  # noqa: E731
         tag = self.job["id"]
         res = ad.run(prompt, cwd, timeout, emit, resume_id=resume_id, add_dirs=add_dirs,

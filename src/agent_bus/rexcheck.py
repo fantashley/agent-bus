@@ -23,11 +23,12 @@ import time
 from datetime import datetime
 from typing import Any, Callable
 
+from . import config as cfg
 from . import procinfo
 from .db import Bus
 
 # OSC 7501 app names each client reports (measured on Rex with all three).
-APPS = {"claude": "claude-code", "codex": "codex", "antigravity": "antigravity"}
+APPS = {a: info["app"] for a, info in cfg.AGENT_INFO.items()}
 
 PASS, FAIL, INFO, UNAVAILABLE = "pass", "fail", "info", "unavailable"
 
