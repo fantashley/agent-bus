@@ -168,7 +168,10 @@ class Service:
                            "then loop wait(thread) and vote or revise until the thread is resolved or "
                            "needs_human. If your turn has to end, the outcome will be in your inbox.")
         if watch:
-            res["watch"] = rex.open_viewers(t["id"], peers)
+            # An agent's viewers go next to its own recorded block, not wherever its MCP
+            # server's environment points (under Codex's shared daemon that's another window).
+            sess = self.bus.session(self.session_id) if self.session_id else None
+            res["watch"] = rex.open_viewers(t["id"], peers, location=sess)
         return res
 
     def advance_discussion(self, thread: str) -> dict:

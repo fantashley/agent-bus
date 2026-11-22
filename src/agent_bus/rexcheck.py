@@ -23,6 +23,7 @@ import time
 from datetime import datetime
 from typing import Any, Callable
 
+from . import procinfo
 from .db import Bus
 
 # OSC 7501 app names each client reports (measured on Rex with all three).
@@ -60,22 +61,9 @@ def _rex(run: Runner, server: str | None, *args: str) -> dict:
     return data
 
 
-def _proc(pid: int) -> tuple[int, str] | None:
-    """(parent pid, state letter) of a process, or None if it can't be read."""
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            # Fields after the parenthesised command name (which may contain spaces).
-            rest = f.read().rsplit(")", 1)[1].split()
-            return int(rest[1]), rest[0]
-    except (OSError, IndexError, ValueError):
-        pass
-    try:  # macOS and other systems without /proc
-        out = subprocess.run(["ps", "-o", "ppid=,stat=", "-p", str(pid)], capture_output=True, text=True,
-                             timeout=5)
-        ppid, stat = out.stdout.split()
-        return int(ppid), stat[:1]
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
+# Module-level names so tests can stub process inspection.
+_proc = procinfo.proc
+_ancestors = procinfo.ancestors
 
 
 def _alive(pid: Any) -> bool:
@@ -89,20 +77,6 @@ def _alive(pid: Any) -> bool:
         pass
     info = _proc(pid)
     return info is None or info[1] != "Z"  # a zombie has exited
-
-
-def _ancestors(pid: int, limit: int = 32) -> list[int]:
-    """Parent, grandparent, ... of ``pid`` (stopping at init), so a client that starts its
-    MCP servers through a helper process still counts as the session's client."""
-    out, seen = [], {pid}
-    while len(out) < limit:
-        info = _proc(pid)
-        if not info or info[0] <= 1 or info[0] in seen:
-            break
-        pid = info[0]
-        seen.add(pid)
-        out.append(pid)
-    return out
 
 
 def _epoch(ts: Any) -> float | None:
@@ -134,6 +108,8 @@ def check(bus: Bus, session_id: str | None = None, block: str | None = None, age
 
     session = None
     server = None
+    client_pids: list[int] = []
+    alive = False
     if session_id:
         session = bus.session(session_id)
         if not session:
@@ -143,7 +119,17 @@ def check(bus: Bus, session_id: str | None = None, block: str | None = None, age
         agent = session["agent_type"]
         block = block or session["rex_block"]
         server = session["rex_server"]
-        if session["rex_session"] and session["rex_block"]:
+        alive = _alive(session["pid"])
+        client_pids = _ancestors(session["pid"]) if alive else []
+        # Rows registered before agent-bus recorded the reason are diagnosed live.
+        daemon = session.get("rex_reason") == procinfo.CODEX_SHARED_DAEMON or (
+            agent == "codex" and alive and not session.get("rex_reason")
+            and procinfo.shared_codex_daemon(session["pid"], ancestors_of=lambda _pid: client_pids) is not None)
+        if daemon:
+            add("rex_env", FAIL, "no usable Rex location: this Codex session's MCP server was started by "
+                "Codex's shared app-server daemon, whose environment belongs to whichever block started the "
+                "daemon, not this window. Start Codex with `codex --no-daemon` for a Rex-aware session")
+        elif session["rex_session"] and session["rex_block"]:
             add("rex_env", PASS, "REX_SESSION and REX_BLOCK were recorded when the session registered")
         else:
             hint = (" (Codex needs env_vars on its agent-bus entry: run `agent-bus setup-codex`, then restart codex)"
@@ -154,10 +140,8 @@ def check(bus: Bus, session_id: str | None = None, block: str | None = None, age
         raise ValueError("pass --agent (claude, codex or antigravity) with --block")
     report = {"session": session_id, "agent": agent, "block": block, "checks": checks}
 
-    client_pids: list[int] = []
     if session:
-        if _alive(session["pid"]):
-            client_pids = _ancestors(session["pid"])
+        if alive:
             add("mcp_server", PASS, f"server pid {session['pid']} is running")
         else:
             add("mcp_server", FAIL, f"server pid {session['pid']} is not running; the session has ended")

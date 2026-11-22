@@ -15,7 +15,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from . import config as cfg
-from . import service
+from . import procinfo, service
 from .db import Bus, BusError
 
 INSTRUCTIONS = """\
@@ -40,7 +40,12 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
     # Set by the worker on headless peers: they contribute only through their reply,
     # never through tools (no posting, no new jobs, no peeking at blind proposals).
     peer_job = os.environ.get("AGENT_BUS_PEER")
-    session_id = None if peer_job else bus.register_session(agent, cwd=cwd, repo=cfg.repo_root(cwd), role=role)
+    session_id = None
+    if not peer_job:
+        # Under Codex's shared app-server daemon, REX_* are the daemon's, not this window's (#6).
+        rex_reason = (procinfo.CODEX_SHARED_DAEMON
+                      if agent == "codex" and procinfo.shared_codex_daemon(os.getpid()) is not None else None)
+        session_id = bus.register_session(agent, cwd=cwd, repo=cfg.repo_root(cwd), role=role, rex_reason=rex_reason)
     svc = service.Service(bus, agent=agent, session_id=session_id)
     mcp = MCPServer(name="agent-bus", instructions=INSTRUCTIONS)
 

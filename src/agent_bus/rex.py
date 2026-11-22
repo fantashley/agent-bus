@@ -41,21 +41,41 @@ def _b64(text: str, limit: int) -> str:
     return base64.b64encode(data).decode()
 
 
-def open_viewers(thread: str, peers: list[str] | None = None) -> dict:
-    """Open a labelled thread watcher split, plus one output-only viewer per peer."""
-    if not in_rex():
+SHARED_DAEMON_NOTE = ("not opening viewers: this Codex session runs under Codex's shared app-server daemon, so its "
+                      "Rex location is the daemon's, not this window's. Run `agent-bus watch {thread}` from a Rex "
+                      "shell, or start Codex with `codex --no-daemon`")
+
+
+def open_viewers(thread: str, peers: list[str] | None = None, location: dict | None = None) -> dict:
+    """Open a labelled thread watcher split, plus one output-only viewer per peer.
+
+    ``location`` is the calling session's recorded Rex location (rex_session,
+    rex_block, rex_reason).  When given, it is used instead of this process's
+    environment, which for a session under Codex's shared daemon is the daemon's.
+    A session with a rex_reason gets no viewers at all, never a split of some other block.
+    """
+    if location is not None:
+        if location.get("rex_reason"):
+            return {"opened": [], "note": SHARED_DAEMON_NOTE.format(thread=thread)}
+        if not (location.get("rex_session") and location.get("rex_block")) or shutil.which("rex") is None:
+            return {"opened": [], "note": "this session has no recorded Rex location (or rex is not on PATH)"}
+        anchor = location["rex_block"]
+    elif not in_rex():
         return {"opened": [], "note": "not running inside Rex (REX_SESSION unset or rex not on PATH)"}
+    else:
+        anchor = os.environ.get("REX_BLOCK")
     me = cfg.self_command()
     opened, errors = [], []
     specs = [("Agent Bus " + thread, [*me, "tail", thread], None)]
     for p in peers or []:
         specs.append((f"bus:{thread}/{p}", [*me, "tail", thread, "--peer", p], p))
-    anchor = os.environ.get("REX_BLOCK")
     for i, (label, cmd, _peer) in enumerate(specs):
         argv = ["rex", "split", "--split", "below" if i == 0 else "right", "--focus=false",
                 "--label", label, "--shell", "none", "--json"]
         if anchor:
             argv += ["-b", anchor]
+        if location and location.get("rex_server"):
+            argv[1:1] = ["-S", location["rex_server"]]
         argv += ["--", *cmd]
         try:
             out = subprocess.run(argv, capture_output=True, text=True, timeout=15)

@@ -13,6 +13,10 @@ self:
 # - Codex: `agent-bus setup-codex` at activation, which runs `codex mcp add`
 #   and sets env_vars on that one entry (so REX_* reach the server), skipped
 #   when the entry already matches; the rest of ~/.codex/config.toml is left alone.
+#   env_vars forwards the environment of whatever starts the server: under
+#   Codex's shared app-server daemon (the TUI's default) that's the daemon, so
+#   Rex-aware interactive Codex sessions need `codex --no-daemon`. This module
+#   doesn't change how codex is launched or its features (see README).
 # - Antigravity: a plugin directory linked at ~/.gemini/config/plugins/agent-bus.
 
 let

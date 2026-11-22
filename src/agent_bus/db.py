@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_type TEXT NOT NULL,
     cwd TEXT, repo TEXT, role TEXT,
     rex_session TEXT, rex_block TEXT, rex_server TEXT,
+    rex_reason TEXT,                    -- why no Rex location was recorded, e.g. codex_shared_daemon
     pid INTEGER,
     started_at REAL NOT NULL,
     last_seen REAL NOT NULL
@@ -199,6 +200,8 @@ class Bus:
     def _migrate(self) -> None:
         """Bring databases created by older versions up to the current schema."""
         with self.tx():
+            if "rex_reason" not in {r["name"] for r in self._all("PRAGMA table_info(sessions)")}:
+                self.conn.execute("ALTER TABLE sessions ADD COLUMN rex_reason TEXT")
             cols = {r["name"] for r in self._all("PRAGMA table_info(threads)")}
             if "blind" not in cols:
                 self.conn.execute("ALTER TABLE threads ADD COLUMN blind INTEGER NOT NULL DEFAULT 0")
@@ -262,15 +265,18 @@ class Bus:
     # ------------------------------------------------------------------ sessions
 
     def register_session(self, agent_type: str, cwd: str | None = None, repo: str | None = None,
-                         role: str | None = None, env: dict | None = None) -> str:
+                         role: str | None = None, env: dict | None = None, rex_reason: str | None = None) -> str:
+        """Record a session.  With ``rex_reason`` set, the inherited REX_* variables are
+        known not to describe this session's window, so no Rex location is stored."""
         env = os.environ if env is None else env
+        loc = {} if rex_reason else env
         sid = "s-" + secrets.token_hex(4)
         now = _now()
         self.conn.execute(
             "INSERT INTO sessions (id, agent_type, cwd, repo, role, rex_session, rex_block, rex_server,"
-            " pid, started_at, last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (sid, agent_type, cwd, repo, role, env.get("REX_SESSION"), env.get("REX_BLOCK"),
-             env.get("REX_SERVER"), os.getpid(), now, now),
+            " rex_reason, pid, started_at, last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sid, agent_type, cwd, repo, role, loc.get("REX_SESSION"), loc.get("REX_BLOCK"),
+             loc.get("REX_SERVER"), rex_reason, os.getpid(), now, now),
         )
         return sid
 

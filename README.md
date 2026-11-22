@@ -107,6 +107,26 @@ It exits non-zero if any check fails. Claude Code and Antigravity pass `REX_*` t
 Codex filters its MCP servers' environment, so `agent-bus setup-codex` (run by the home-manager
 module) sets `env_vars` on Codex's agent-bus entry.
 
+**Interactive Codex in Rex: use `codex --no-daemon`.** By default the Codex TUI connects to a
+shared, long-running `codex app-server --managed-daemon`, and the daemon starts MCP servers
+(observed with Codex 0.171.0). So the agent-bus server inherits the daemon's `REX_*`, which
+belong to whatever block started the daemon, not the window you're typing in. When agent-bus
+detects that the server runs under such a daemon, it records no Rex location for the session
+(reason `codex_shared_daemon`). `rex-check` then says so, and `start_discussion(watch=true)`
+opens no viewer panes instead of splitting some other block. `codex --no-daemon`, or choosing
+"Run without daemon this time" at Codex's prompt, gives each window its own server with that
+window's environment, and every `rex-check` check passes. Turning off the `daemon_auto_start`
+feature isn't a quiet alternative: with a daemon already running, Codex asks whether to restart
+the shared daemon for every client. Messaging, discussions, reviews, `agent-bus watch` from a
+shell, and headless `codex exec` peers work either way.
+
+Detection is best-effort. It matches a Codex executable running `app-server` with
+`--managed-daemon` or a non-stdio `--listen`, anywhere above the server. If a process's arguments
+can't be read, or a future Codex starts the daemon differently, a stale location can still be
+recorded. In that case `rex-check`'s `client` check (the status owner must be one of the server's
+own parents) still catches it. Whether the daemon could pass each client's environment to MCP
+servers is an open question for Codex, not a known impossibility.
+
 ## Install (Home Manager)
 
 ```nix
