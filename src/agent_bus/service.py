@@ -67,8 +67,10 @@ class Service:
              refs: dict | None = None) -> dict:
         if not body or not body.strip():
             raise ValueError("body is empty")
-        if to is not None and to not in cfg.AGENTS:
-            raise ValueError(f"`to` must be one of {', '.join(cfg.AGENTS)}")
+        if to is not None:
+            if to not in cfg.AGENTS:
+                raise ValueError(f"`to` must be one of {', '.join(cfg.AGENTS)}")
+            self.config.require_available(to, "recipient")
         if kind not in ("message", "proposal", "vote", "status"):
             raise ValueError("kind must be message, proposal, vote or status")
         if thread is None:
@@ -134,14 +136,19 @@ class Service:
                          deadline_minutes: int | None = None, watch: bool = False) -> dict:
         if not question or not question.strip():
             raise ValueError("question is empty")
-        if peers is None:
-            peers = [a for a in cfg.AGENTS if a != self.agent]
+        defaulted = peers is None
+        if defaulted:
+            peers = [a for a in self.config.available_agents() if a != self.agent]
         for p in peers:
             if p not in cfg.AGENTS:
                 raise ValueError(f"unknown peer {p!r}; expected one of {', '.join(cfg.AGENTS)}")
             if p == self.agent:
                 raise ValueError("you are already a participant; list only the other agents as peers")
+            self.config.require_available(p, "peer")
         if not peers:
+            if defaulted:
+                which = "no agent" if self.agent == HUMAN else "no other agent"
+                raise ValueError(f"a discussion needs at least one peer ({which} is available on this machine)")
             raise ValueError("a discussion needs at least one peer")
         repo_path = self._allowed_repo(repo) if repo else None
         rounds = max(1, min(int(max_rounds or self.config.max_rounds), 10))
@@ -185,6 +192,9 @@ class Service:
         if t["round"] >= t["max_rounds"]:
             raise BusError("THREAD_LIMIT_REACHED",
                            f"all {t['max_rounds']} rounds are used; run `agent-bus resume {thread}`")
+        for p in t["participants"]:
+            if p != t["initiator"]:
+                self.config.require_available(p, "peer")
         job = self._dispatch(thread, "discussion", {"mode": "advance"}, f"{thread}:advance:{t['round'] + 1}")
         return {"thread": thread_summary(t), "job": job}
 
@@ -193,6 +203,7 @@ class Service:
                        focus: str | None = None) -> dict:
         if reviewer not in cfg.AGENTS or reviewer == self.agent:
             raise ValueError("reviewer must be one of the other agents")
+        self.config.require_available(reviewer, "reviewer")
         for name, value in (("base_commit_id", base_commit_id), ("head_commit_id", head_commit_id),
                             ("prev_head_commit_id", prev_head_commit_id)):
             if value is not None and not COMMIT_RE.match(value):
@@ -285,6 +296,14 @@ class Service:
         t = self.bus.thread(thread)
         if t["status"] in ("resolved",):
             raise BusError("THREAD_CLOSED", "thread is already resolved")
+        if t["kind"] == "discussion":
+            for p in t["participants"]:
+                if p != t["initiator"]:
+                    self.config.require_available(p, "peer")
+        elif t["kind"] == "review":
+            reviewer = (t["refs"] or {}).get("reviewer")
+            if reviewer:
+                self.config.require_available(reviewer, "reviewer")
         fields: dict[str, Any] = {"status": "open"}
         count = self.bus._one("SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender NOT IN (?,?)",
                               thread, HUMAN, SYSTEM)["n"]

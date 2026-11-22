@@ -201,6 +201,19 @@ This installs the CLI, writes `~/.config/agent-bus/config.json`, and registers t
 
 Add [`docs/AGENTS-section.md`](docs/AGENTS-section.md) to the shared global agent rules.
 
+### Which agents
+
+You don't need all three agents. agent-bus works with whichever of them a machine has:
+- **Configured:** set `local.agentBus.agents = [ "claude" "codex" ];` (or `"agents"` in
+  `config.json`). The list is authoritative.
+- **Detected:** with no list, an agent counts as available when its CLI is found: its
+  `peers.<agent>.command`, or `claude`/`codex`/`agy` on PATH.
+- **Effect:** discussions and `ask` default to the available agents, and naming an unavailable
+  one fails up front with `AGENT_UNAVAILABLE`. The Home Manager module only registers agent-bus
+  with listed clients.
+- **Checking:** `agent-bus agents` shows what's available and why. Agents see it through the
+  `whoami` tool.
+
 ## Development
 
 ```sh

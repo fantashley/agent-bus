@@ -179,11 +179,11 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
 
 def cmd_ask(bus: Bus, args: argparse.Namespace) -> int:
     svc = Service(bus, HUMAN)
-    peers = [p.strip() for p in args.with_.split(",")] if args.with_ else list(cfg.AGENTS)
+    peers = ([p.strip() for p in args.with_.split(",")] if args.with_.strip() else []) if args.with_ is not None else None
     res = svc.start_discussion(args.prompt, peers=peers, repo=args.repo, max_rounds=args.rounds,
                                deadline_minutes=args.deadline, watch=args.watch)
     tid = res["thread"]["id"]
-    print(f"started {tid} with {', '.join(peers)} (job {res['job']['id']})")
+    print(f"started {tid} with {', '.join(res['thread']['participants'])} (job {res['job']['id']})")
     if res.get("watch"):
         print(f"rex viewers: {json.dumps(res['watch'])}")
     print(f"follow with: agent-bus tail {tid}")
@@ -223,12 +223,15 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("ask", help="start a discussion between agents")
     s.add_argument("prompt")
-    s.add_argument("--with", dest="with_", help="comma-separated agents (default: all three)")
+    s.add_argument("--with", dest="with_", help="comma-separated agents (default: every available agent)")
     s.add_argument("--repo", help="allow-listed repo the agents may read")
     s.add_argument("--rounds", type=int, help="max rounds (default from config, 4)")
     s.add_argument("--deadline", type=int, help="deadline in minutes (default from config, 30)")
     s.add_argument("--watch", action="store_true", help="open Rex viewer panes")
     s.add_argument("--wait", action="store_true", help="block until the worker finishes, then print the thread")
+
+    s = sub.add_parser("agents", help="list the agents available on this machine, and why")
+    s.add_argument("--json", action="store_true")
 
     s = sub.add_parser("threads", help="list threads")
     s.add_argument("--all", action="store_true", help="include resolved and cancelled threads")
@@ -330,6 +333,17 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         return cmd_tail(bus, args)
     if args.cmd == "stream":
         return cmd_stream(bus, args)
+    if args.cmd == "agents":
+        conf = cfg.Config.load()
+        avail = conf.availability()
+        if args.json:
+            print(json.dumps(avail, indent=2))
+            return 0
+        source = "config `agents`" if conf.agents is not None else "detected on PATH"
+        print(f"agents ({source}):")
+        for a, v in avail.items():
+            print(f"  {'yes' if v['available'] else 'no ':<4} {a:<12} {v['reason']}")
+        return 0
     if args.cmd == "threads":
         ts = bus.threads(include_closed=args.all)
         if args.json:
@@ -361,7 +375,7 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
             _print_history(bus, args.thread, color)
         return 0
     if args.cmd == "reply":
-        bus.post(args.thread, HUMAN, args.body, recipient=args.to)
+        svc.send(args.body, thread=args.thread, to=args.to)
         print(f"posted to {args.thread}")
         return 0
     if args.cmd == "cancel":

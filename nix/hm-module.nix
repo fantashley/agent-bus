@@ -82,6 +82,7 @@ let
   hasDotfilesClaude = options ? local && options.local ? claude
     && options.local.claude ? enabledPlugins
     && options.local.claude ? extraKnownMarketplaces;
+  listed = agent: cfg.agents == null || lib.elem agent cfg.agents;
   defaultAntigravity = (options ? local && options.local ? antigravity)
     && config.local.antigravity.enable or false;
 in
@@ -109,6 +110,17 @@ in
       '';
     };
 
+    agents = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf (lib.types.enum [ "claude" "codex" "antigravity" ]));
+      default = null;
+      example = [ "claude" "codex" ];
+      description = ''
+        The agents available on this machine. Discussions and reviews default to
+        these, naming any other agent fails up front, and registration is only done
+        for these clients. Null detects them at runtime (a CLI found on PATH counts).
+      '';
+    };
+
     settings = lib.mkOption {
       type = json.type;
       default = { };
@@ -124,7 +136,8 @@ in
 
     claude.enable = lib.mkOption {
       type = lib.types.bool;
-      default = true;
+      default = listed "claude";
+      defaultText = lib.literalExpression ''agents == null || elem "claude" agents'';
       description = "Register agent-bus with Claude Code (as a local plugin).";
     };
     claude.hooks.enable = lib.mkOption {
@@ -141,13 +154,14 @@ in
     };
     codex.enable = lib.mkOption {
       type = lib.types.bool;
-      default = true;
+      default = listed "codex";
+      defaultText = lib.literalExpression ''agents == null || elem "codex" agents'';
       description = "Register agent-bus with Codex (`agent-bus setup-codex`) when codex is on PATH.";
     };
     antigravity.enable = lib.mkOption {
       type = lib.types.bool;
-      default = defaultAntigravity;
-      defaultText = lib.literalExpression "config.local.antigravity.enable or false";
+      default = if cfg.agents == null then defaultAntigravity else lib.elem "antigravity" cfg.agents;
+      defaultText = lib.literalExpression ''if agents == null then (config.local.antigravity.enable or false) else elem "antigravity" agents'';
       description = "Link the agent-bus plugin into ~/.gemini/config/plugins.";
     };
 
@@ -163,7 +177,8 @@ in
     {
       home.packages = [ cfg.package ];
       xdg.configFile."agent-bus/config.json".source =
-        json.generate "agent-bus-config.json" ({ inherit (cfg) repos; } // cfg.settings);
+        json.generate "agent-bus-config.json" ({ inherit (cfg) repos; }
+          // lib.optionalAttrs (cfg.agents != null) { inherit (cfg) agents; } // cfg.settings);
     }
 
     (lib.mkIf cfg.antigravity.enable {

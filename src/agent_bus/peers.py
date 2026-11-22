@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from . import config as cfg
 from .config import Config
 from .db import new_uuid
 
@@ -171,7 +172,7 @@ def _short(text: str, n: int = 240) -> str:
 
 class ClaudeAdapter(Adapter):
     agent = "claude"
-    default_command = "claude"
+    default_command = cfg.AGENT_INFO["claude"]["cli"]
     # Read-only tools only. No Bash at all: `jj`/`git` accept flags (--tool, --output,
     # --ext-diff) that run commands or write files, and reviews get the diff in the prompt.
     allowed_tools = ["Read", "Grep", "Glob", "WebSearch", "WebFetch"]
@@ -217,7 +218,7 @@ _CODEX_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
 class CodexAdapter(Adapter):
     agent = "codex"
-    default_command = "codex"
+    default_command = cfg.AGENT_INFO["codex"]["cli"]
 
     def mcp_servers(self, cwd: str) -> list[str]:
         """Live MCP servers as codex would load them in ``cwd`` (project config included).
@@ -283,7 +284,7 @@ class CodexAdapter(Adapter):
 
 class AntigravityAdapter(Adapter):
     agent = "antigravity"
-    default_command = "agy"
+    default_command = cfg.AGENT_INFO["antigravity"]["cli"]
 
     def check_isolation(self) -> None:
         """agy has no per-session switch for MCP servers, so refuse to run a peer while

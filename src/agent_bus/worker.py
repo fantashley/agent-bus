@@ -188,6 +188,7 @@ class Worker:
         same prompt when the caller passes none.
         """
         self.check()
+        self.config.require_available(agent, "peer")
         t = self.thread()
         cwd, add_dirs = self.workdir(t)
         ad = adapter(agent, self.config)
