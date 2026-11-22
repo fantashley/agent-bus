@@ -8,6 +8,11 @@ Behaviour is driven by env vars so tests can script outcomes:
                   CLI's own shape (FAKE_EXHAUSTED_LATER: the same, but only after round 1;
                   FAKE_EXHAUSTED_REPAIR: only on a "reply again with only the JSON" repair turn)
   FAKE_BEHAVIOUR=nojson  reply without any JSON, to every prompt but a repair
+  FAKE_BEHAVIOUR=silent  exit 0 after the session start, with no reply (format drift);
+                  FAKE_SILENT_REPAIR=agents does the same only on a repair turn, and
+                  FAKE_STRAY adds a non-JSON stdout line
+  FAKE_BEHAVIOUR=newevents  also emit event types no adapter knows
+  FAKE_MCP_LIST   what `codex mcp list --json` prints
 Round-1 prompts get a proposal; later prompts agree with the lowest proposal id
 mentioned (or object, for `stubborn`).
 """
@@ -21,6 +26,10 @@ agent = os.environ["FAKE_AGENT"]
 behaviour = os.environ.get("FAKE_BEHAVIOUR", "consensus")
 argv = sys.argv[1:]
 
+if argv == ["--version"]:  # agent-bus probes this once per binary (issue #32); not a turn
+    print(os.environ.get("FAKE_VERSION", f"fake-{agent} 0.0.0"))
+    sys.exit(0)
+
 if agent == "codex":
     # Like the real CLI: a quoted key in a -c override names a different server, which
     # then has no transport.
@@ -33,8 +42,9 @@ if agent == "codex":
     while len(rest) >= 2 and rest[0] == "-c":
         rest = rest[2:]
     if rest[:2] == ["mcp", "list"]:
-        print(json.dumps([{"name": "agent-bus", "enabled": True}, {"name": "github", "enabled": True},
-                          {"name": "off", "enabled": False}]))
+        print(os.environ.get("FAKE_MCP_LIST") or json.dumps(
+            [{"name": "agent-bus", "enabled": True}, {"name": "github", "enabled": True},
+             {"name": "off", "enabled": False}]))
         sys.exit(0)
 
 if behaviour == "hang":
@@ -105,6 +115,20 @@ if (listed("FAKE_EXHAUSTED") or (listed("FAKE_EXHAUSTED_LATER") and "round 1, wh
                                            "error": "Individual quota reached. Please upgrade your subscription "
                                                     "to increase your limits. Resets in 2h26m14s."}})
     sys.exit(1)
+
+if behaviour == "silent" or (repair and listed("FAKE_SILENT_REPAIR")):
+    if agent == "claude":
+        out({"type": "system", "subtype": "init", "session_id": sid})
+    elif agent == "codex":
+        out({"type": "thread.started", "thread_id": sid})
+    else:
+        out({"event": "init", "conversation_id": sid})
+    if os.environ.get("FAKE_STRAY"):
+        print("warning: something unstructured", flush=True)
+    sys.exit(0)
+if behaviour == "newevents":
+    out({"type": "brand_new_event"} if agent != "antigravity" else {"event": "brand_new_event"})
+    out({"type": "brand_new_event"} if agent != "antigravity" else {"event": "brand_new_event"})
 
 if agent == "claude":
     out({"type": "system", "subtype": "init", "session_id": sid})

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -39,6 +40,9 @@ class TurnResult:
     timed_out: bool = False
     # Token counts from the CLI's own terminal usage report; a counter it didn't give is absent.
     usage: dict | None = None
+    # The CLI exited normally but its output lacked what agent-bus needs (a reply, a
+    # session id): its format probably changed (issue #32, PEER_FORMAT_CHANGED).
+    format_changed: bool = False
     # Set only on a failed turn that the CLI said was out of usage (issue #26, agreed on
     # agent-bus thread t-3e260b): {"resets_at": epoch | None, "source": "structured" |
     # "heuristic"}.
@@ -61,6 +65,8 @@ class StreamState:
     step_text: dict = field(default_factory=dict)  # per-step text, for clients that stream deltas
     usage: dict | None = None
     rate_limit: dict | None = None  # Claude's latest rate_limit_event info
+    unknown: dict = field(default_factory=dict)  # event type -> count, for types the adapter doesn't know
+    stray: int = 0  # non-JSON stdout lines (diagnostics), counted only
 
 
 Emit = Callable[[str, str], None]  # (kind, text)
@@ -69,6 +75,16 @@ Emit = Callable[[str, str], None]  # (kind, text)
 class Adapter:
     agent: str
     default_command: str
+    # Bump when the invocation or what the parser relies on changes, so a version's
+    # recorded evidence is tied to the recipe it was gathered with (issue #32).
+    recipe: str = "1"
+    # Stream event types this adapter understands.  Anything else is counted and
+    # reported, never fatal on its own: CLIs add event types often.
+    known_events: frozenset = frozenset()
+
+    def event_type(self, obj: dict) -> str | None:
+        t = obj.get("type")
+        return t if isinstance(t, str) else None
 
     def __init__(self, config: Config, settings: dict | None = None):
         self.config = config
@@ -175,15 +191,30 @@ class Adapter:
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
-                st.text_parts.append(line + "\n")
+                # Unstructured stdout is diagnostics, never the reply (issue #32).
+                st.stray += 1  # counted only: a wrapper's output may hold secrets
                 continue
             if isinstance(obj, dict):
+                typ = self.event_type(obj)
+                if typ not in self.known_events:
+                    key = (typ or "(none)")[:40]
+                    st.unknown[key] = st.unknown.get(key, 0) + 1
                 try:
                     self.parse_line(obj, st, emit)
                 except Exception as e:  # never let a format change kill the worker
                     emit("error", f"unparsed event: {e}")
         rc = proc.wait()
         killer_done.set()
+        if not isinstance(st.external_id, str) or not st.external_id.strip():
+            st.external_id = None  # only a non-empty string can be pinned and resumed
+        if not isinstance(st.final, str):
+            st.final = None
+        st.text_parts = [p for p in st.text_parts if isinstance(p, str)]
+        if st.stray:
+            emit("format", f"{st.stray} non-JSON stdout line(s) from {self.agent} (not shown)")
+        if st.unknown:
+            emit("format", f"unrecognised {self.agent} stream events: "
+                 + ", ".join(f"{k}×{n}" for k, n in sorted(st.unknown.items())[:10]))
         text = st.final if st.final is not None else "".join(st.text_parts)
         if timed_out:
             return TurnResult(ok=False, text=text, external_id=st.external_id, error="turn timed out",
@@ -197,7 +228,76 @@ class Adapter:
                 quota = None
             return TurnResult(ok=False, text=text, external_id=st.external_id, error=err, usage=st.usage,
                               quota=quota)
+        # Exited normally: the reply and a session id to resume are both required.
+        missing = [what for what, ok in (("a reply", text.strip()), ("a session id", st.external_id)) if not ok]
+        if missing:
+            return TurnResult(ok=False, text=text, external_id=st.external_id, usage=st.usage, format_changed=True,
+                              error=f"PEER_FORMAT_CHANGED: {self.agent} exited normally without "
+                                    + " or ".join(missing))
         return TurnResult(ok=True, text=text, external_id=st.external_id, usage=st.usage)
+
+
+def cli_identity(command: str, cwd: str | None = None) -> tuple[str, str] | None:
+    """(path to launch, identity) of the CLI a turn in ``cwd`` would run.  The identity
+    is the resolved real path plus its size and mtime, so a rebuilt or upgraded binary
+    is a new identity.  A
+    relative command, or a relative PATH entry, is resolved against ``cwd`` as the
+    turn's own launch would.  None if it can't be found."""
+    base = cwd or os.getcwd()
+    if os.path.sep in command:
+        found = command if os.path.isabs(command) else os.path.join(base, command)
+        found = found if os.access(found, os.X_OK) else None
+    else:
+        path = os.pathsep.join(e if os.path.isabs(e) else os.path.join(base, e or ".")
+                               for e in os.environ.get("PATH", os.defpath).split(os.pathsep))
+        found = shutil.which(command, path=path)
+    if not found:
+        return None
+    # Fingerprint the resolved binary, but keep the path the turn would launch: a
+    # wrapper may dispatch on its own name or find files relative to it.
+    real = os.path.realpath(found)
+    try:
+        st = os.stat(real)
+    except OSError:
+        return None
+    # Both paths are in the identity: aliases of one binary that dispatch on their
+    # name are probed separately.
+    return found, f"{found}->{real}:{st.st_size}:{st.st_mtime_ns}"
+
+
+def cli_version(bus, agent: str, command: str, cwd: str | None = None) -> str:
+    """The CLI's own ``--version`` line, probed once per binary identity and cached in
+    the bus (issue #32).  "unknown" when it can't be found or doesn't say.  A miss is
+    probed under a per-binary file lock, so concurrent jobs don't race to different
+    answers."""
+    ident = cli_identity(command, cwd)
+    if ident is None:
+        return "unknown"
+    launch, key = ident
+    cached = bus.cli_version(key)
+    if cached is not None:
+        return cached
+    import fcntl
+    import hashlib
+    lock_dir = Path(bus.path).parent / "locks"  # next to the cache itself
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock = lock_dir / f"version-{hashlib.sha256(key.encode()).hexdigest()[:16]}.lock"
+    with open(lock, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        cached = bus.cli_version(key)  # another process may have probed while we waited
+        if cached is not None:
+            return cached
+        version = "unknown"
+        try:
+            out = subprocess.run([launch, "--version"], cwd=cwd, capture_output=True, text=True, timeout=10,
+                                 stdin=subprocess.DEVNULL, env={**os.environ, "AGENT_BUS_PEER": "version-probe"})
+            line = next((ln.strip() for ln in (out.stdout or out.stderr).splitlines() if ln.strip()), "")
+            if out.returncode == 0 and line:
+                version = "".join(ch for ch in line if ch.isprintable())[:80]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        bus.set_cli_version(key, agent, launch, version)
+        return version
 
 
 def _killpg(proc: subprocess.Popen) -> None:
@@ -315,6 +415,7 @@ def _strip_flags(args: list[str], flags: set[str], config_keys: set[str] = froze
 
 class ClaudeAdapter(Adapter):
     agent = "claude"
+    known_events = frozenset({"system", "assistant", "user", "result", "rate_limit_event", "stream_event"})
     default_command = cfg.AGENT_INFO["claude"]["cli"]
     # Read-only tools only. No Bash at all: `jj`/`git` accept flags (--tool, --output,
     # --ext-diff) that run commands or write files, and reviews get the diff in the prompt.
@@ -395,6 +496,8 @@ _CODEX_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
 class CodexAdapter(Adapter):
     agent = "codex"
+    known_events = frozenset({"thread.started", "turn.started", "item.started", "item.updated", "item.completed",
+                              "turn.completed", "turn.failed", "error"})
     default_command = cfg.AGENT_INFO["codex"]["cli"]
 
     def mcp_servers(self, cwd: str) -> list[str]:
@@ -414,6 +517,15 @@ class CodexAdapter(Adapter):
             raise PeerSetupError(f"could not list codex MCP servers to disable them: {e}") from e
         if not isinstance(data, list):
             raise PeerSetupError("unexpected `codex mcp list --json` output")
+        # Every entry must be well formed: a server we can't name is one we can't switch
+        # off, so a malformed entry fails the turn instead of being skipped (issue #32).
+        for i, d in enumerate(data):
+            # Name the entry and field only: a record can carry env vars or credential URLs.
+            bad = ("not an object" if not isinstance(d, dict)
+                   else "missing or empty `name`" if not isinstance(d.get("name"), str) or not d["name"]
+                   else "`enabled` is not true/false" if not isinstance(d.get("enabled", True), bool) else None)
+            if bad:
+                raise PeerSetupError(f"unexpected entry #{i} in `codex mcp list --json`: {bad}")
         # Only servers that exist: overriding a missing one creates a half-defined entry
         # that codex rejects ("invalid transport").  agent-bus itself is also covered by
         # the AGENT_BUS_PEER guard even if it isn't listed here.
@@ -486,6 +598,11 @@ class CodexAdapter(Adapter):
 
 class AntigravityAdapter(Adapter):
     agent = "antigravity"
+    known_events = frozenset({"init", "step_update", "result"})
+
+    def event_type(self, obj):
+        t = obj.get("event")
+        return t if isinstance(t, str) else None
     default_command = cfg.AGENT_INFO["antigravity"]["cli"]
 
     quota_patterns = _AGY_QUOTA
