@@ -22,6 +22,7 @@ from typing import Callable
 from . import config as cfg
 from .config import Config
 from .db import new_uuid
+from .prompts import AGY_HEADLESS
 
 # argv entries above this size go through stdin or a file instead.
 MAX_ARG = 100_000
@@ -47,6 +48,8 @@ class TurnResult:
     # agent-bus thread t-3e260b): {"resets_at": epoch | None, "source": "structured" |
     # "heuristic"}.
     quota: dict | None = None
+    # The CLI's stream explains why a normally exited turn produced no reply.
+    incomplete: bool = False
 
 
 @dataclass
@@ -67,6 +70,9 @@ class StreamState:
     rate_limit: dict | None = None  # Claude's latest rate_limit_event info
     unknown: dict = field(default_factory=dict)  # event type -> count, for types the adapter doesn't know
     stray: int = 0  # non-JSON stdout lines (diagnostics), counted only
+    pending: dict = field(default_factory=dict)  # step index -> tool name, for tool steps with no end state
+    failed_tools: set = field(default_factory=set)  # names of tool steps that ended in an error
+    denied: list = field(default_factory=list)  # actions the CLI reported denying (sanitised labels)
 
 
 Emit = Callable[[str, str], None]  # (kind, text)
@@ -115,6 +121,11 @@ class Adapter:
 
     def parse_line(self, obj: dict, st: StreamState, emit: Emit) -> None:
         raise NotImplementedError
+
+    def incomplete(self, st: StreamState) -> str | None:
+        """Why a normally-exited turn without a reply stopped partway, when the stream
+        itself shows it; None leaves it to the format-drift check."""
+        return None
 
     # Provider wording for "out of usage", matched only against a turn that already failed.
     # Kept narrow on purpose: a bare 429, "overloaded", or RESOURCE_EXHAUSTED without
@@ -230,6 +241,12 @@ class Adapter:
                               quota=quota)
         # Exited normally: the reply and a session id to resume are both required.
         missing = [what for what, ok in (("a reply", text.strip()), ("a session id", st.external_id)) if not ok]
+        # Only the reply missing: the stream itself may show why the turn stopped early.  A
+        # missing session id, or a stopped turn nothing explains, stays drift.
+        why = self.incomplete(st) if missing == ["a reply"] else None
+        if why:
+            return TurnResult(ok=False, text=text, external_id=st.external_id, usage=st.usage, incomplete=True,
+                              error=f"PEER_TURN_INCOMPLETE: {self.agent} {why}")
         if missing:
             return TurnResult(ok=False, text=text, external_id=st.external_id, usage=st.usage, format_changed=True,
                               error=f"PEER_FORMAT_CHANGED: {self.agent} exited normally without "
@@ -602,6 +619,8 @@ class CodexAdapter(Adapter):
 
 class AntigravityAdapter(Adapter):
     agent = "antigravity"
+    # 2: headless tool guidance in every prompt; denied actions reported as an incomplete turn.
+    recipe = "2"
     known_events = frozenset({"init", "step_update", "result"})
 
     def event_type(self, obj):
@@ -644,13 +663,16 @@ class AntigravityAdapter(Adapter):
             argv += ["--conversation", resume_id]
         argv += self.setting_args()
         argv += self.extra_args()
+        # Every turn, resumed or not, says which tools work unattended (recipe 2).
+        prompt = AGY_HEADLESS + prompt
         # agy takes the prompt as the value of --print; there is no stdin mode
         # for plain text, so very long prompts go through a file.
         if len(prompt.encode()) > MAX_ARG:
             path = os.path.join(add_dirs[0] if add_dirs else cwd, f"prompt-{new_uuid()}.md")
             with open(path, "w") as f:
                 f.write(prompt)
-            prompt = f"Your full instructions are in the file {path}. Read it and follow it exactly."
+            prompt = (AGY_HEADLESS + f"Your full instructions are in the file {path}. "
+                      "Read it with read_file and follow it exactly.")
         argv += ["--print", prompt]
         return Invocation(argv=argv, external_id=resume_id)
 
@@ -662,6 +684,17 @@ class AntigravityAdapter(Adapter):
             su = obj.get("step_update") or {}
             st.external_id = su.get("conversation_id") or st.external_id
             kind, state, idx = su.get("step_type"), su.get("state"), su.get("step_index")
+            if kind == "tool" and isinstance(idx, int):
+                # A tool step ends DONE (fixtures) or ERROR (a denied run_command, agy 1.5.13
+                # probe 2026-11-23).  Only one with no end state is still pending at exit.
+                info = su.get("tool_info") if isinstance(su.get("tool_info"), dict) else {}
+                name = su.get("tool_name") or info.get("name") or "tool"
+                if state == "ACTIVE":
+                    st.pending[idx] = name
+                else:
+                    st.pending.pop(idx, None)
+                    if state == "ERROR":
+                        st.failed_tools.add(_safe_name(name))
             if kind == "agent_response":
                 if su.get("text_delta"):
                     st.text_parts.append(su["text_delta"])
@@ -697,6 +730,32 @@ class AntigravityAdapter(Adapter):
                 st.error = _short(f"status {res.get('status')}: {res.get('error') or ''}", 800)
             if isinstance(res.get("response"), str):
                 st.final = res["response"]
+            # Actions agy auto-denied because a headless turn can't ask for approval.
+            denied = res.get("denied_actions")
+            for d in denied if isinstance(denied, list) else []:
+                if isinstance(d, dict) and d.get("action"):
+                    st.denied.append(_safe_name(d.get("action"))
+                                     + (f" ({_safe_name(d['display_name'])})" if d.get("display_name") else ""))
+
+    def incomplete(self, st):
+        # agy 1.5.13 in plan mode with --sandbox (live probe, 2026-11-23): a terminal command
+        # needs approval, so headless it is auto-denied.  The run_command step ends ERROR,
+        # the result is SUCCESS with an empty response and lists denied_actions, and agy
+        # exits 0.  Names only in the diagnostic, never arguments.
+        tools = f"; failed tool(s): {', '.join(sorted(st.failed_tools))}" if st.failed_tools else ""
+        if st.denied:
+            return (f"ended its turn without a reply after it auto-denied {len(st.denied)} action(s) that need "
+                    f"approval a headless turn can't give: {', '.join(st.denied)}{tools}")
+        # Every event understood, but a tool call never reached an end state.
+        if st.pending and not st.unknown:
+            names = sorted({_safe_name(n) for n in st.pending.values()})
+            return f"ended its turn without a reply while tool call(s) were unfinished: {', '.join(names)}{tools}"
+        return None  # nothing in the stream explains it: format drift
+
+
+def _safe_name(value: object) -> str:
+    """A CLI-supplied identifier fit for a thread notice."""
+    return re.sub(r"[^A-Za-z0-9_.:-]", "", str(value))[:40] or "?"
 
 
 _AGY_HINT_KEYS = ("commandline", "command", "path", "absolutepath", "file", "directorypath", "searchdirectory",

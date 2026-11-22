@@ -213,9 +213,10 @@ class Worker:
                      cancelled=self.cancelled, peer_tag=tag)
         # A fresh session can't fix running out of usage; it would only spend more.  Check
         # again first: another worker may have found this agent out of usage meanwhile.
-        # Nor can it fix a changed output format.
+        # Nor can it fix a changed output format, or a turn the CLI stopped partway through
+        # (it would stop the same way, and the working conversation would be dropped).
         if (not res.ok and resume_id and not res.timed_out and not res.quota and not res.format_changed
-                and not self.cancelled()):
+                and not res.incomplete and not self.cancelled()):
             block = self.bus.quota_block(agent, quota.model_key(model))
             if block:
                 self.event("turn_end", f"failed: {res.error}" + format_usage(res.usage), agent)
@@ -237,6 +238,11 @@ class Worker:
             self.format_notice(agent, version, res.error or "")
             if resume_id:
                 self.set_peer_session(agent, resume_id)
+            return res
+        if res.incomplete:
+            # An ordinary failure the callers report on the thread, not drift.  Keep any
+            # pinned conversation, but don't pin a first turn's conversation that stopped
+            # early: the next turn's fresh prompt restates everything.
             return res
         if res.ok:
             # Newer evidence: it has usage again (account-wide, and for this model).
@@ -469,6 +475,9 @@ class Worker:
             res2 = self.turn(agent, repair, fresh_prompt=(fresh_prompt or prompt) + "\n\n" + repair)
             if res2.quota or res2.format_changed:
                 return  # out of usage or format drift mid-repair: post nothing from either attempt
+            if res2.incomplete:
+                self.system(f"{agent} could not repair its reply: {res2.error}")
+                return
             action = extract_json(res2.text) if res2.text else None
         if not self.valid_action(action, blind):
             self.safe_post(agent, res.text.strip()[:20000] or "(empty reply)", kind="message",
@@ -596,6 +605,8 @@ class Worker:
             if res2.quota or res2.format_changed:
                 self.finish_thread("needs_human")
                 return
+            if res2.incomplete:
+                res = res2
             verdict = normalize_verdict(extract_json(res2.text) if res2.text else None)
         if verdict is None:
             if self.finish_thread("needs_human"):
