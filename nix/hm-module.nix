@@ -10,8 +10,9 @@ self:
 #   store. When the importing config defines `local.claude` options,
 #   it is enabled through local.claude.extraKnownMarketplaces/enabledPlugins;
 #   otherwise wire `local.agentBus.claudeMarketplace` up yourself.
-# - Codex: `codex mcp add` at activation, skipped when the entry already
-#   matches, so the rest of ~/.codex/config.toml is left alone.
+# - Codex: `agent-bus setup-codex` at activation, which runs `codex mcp add`
+#   and sets env_vars on that one entry (so REX_* reach the server), skipped
+#   when the entry already matches; the rest of ~/.codex/config.toml is left alone.
 # - Antigravity: a plugin directory linked at ~/.gemini/config/plugins/agent-bus.
 
 let
@@ -107,7 +108,7 @@ in
     codex.enable = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Register agent-bus with Codex (`codex mcp add`) when codex is on PATH.";
+      description = "Register agent-bus with Codex (`agent-bus setup-codex`) when codex is on PATH.";
     };
     antigravity.enable = lib.mkOption {
       type = lib.types.bool;
@@ -141,15 +142,9 @@ in
       home.activation.agentBusCodex = lib.hm.dag.entryAfter [ "writeBoundary" "installPackages" ] ''
         PATH="${config.home.profileDirectory}/bin:/etc/profiles/per-user/${config.home.username}/bin:$PATH"
         if command -v codex >/dev/null 2>&1; then
-          current=$(codex mcp get agent-bus --json 2>/dev/null \
-            | ${lib.getExe pkgs.jq} -c '[.transport.command, .transport.args]' 2>/dev/null || true)
-          wanted=$(${lib.getExe pkgs.jq} -nc --arg c ${lib.escapeShellArg bin} '[$c, ["mcp","--agent","codex"]]')
-          if [ "$current" != "$wanted" ]; then
-            if [ -n "$current" ]; then
-              run codex mcp remove agent-bus >/dev/null
-            fi
-            run codex mcp add agent-bus -- ${lib.escapeShellArg bin} mcp --agent codex >/dev/null
-          fi
+          # Adds or fixes only the agent-bus entry, including env_vars so the server
+          # can see which Rex block it's in; a no-op when it already matches.
+          run ${lib.escapeShellArg bin} setup-codex --bin ${lib.escapeShellArg bin}
         else
           verboseEcho "agent-bus: codex not on PATH; skipping Codex MCP registration"
         fi

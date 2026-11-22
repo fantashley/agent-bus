@@ -16,7 +16,12 @@
 
       homeManagerModules.default = import ./nix/hm-module.nix self;
 
-      checks = forAll (pkgs: { package = self.packages.${pkgs.system}.default; });
+      checks = forAll (pkgs: {
+        package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        # The package build never evaluates the home-manager module, so at least
+        # make sure it parses (importing it does).
+        hm-module = builtins.seq (import ./nix/hm-module.nix) (pkgs.runCommand "hm-module-parses" { } "touch $out");
+      });
 
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {

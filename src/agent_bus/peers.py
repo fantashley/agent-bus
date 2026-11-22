@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -210,6 +211,9 @@ class ClaudeAdapter(Adapter):
                 st.final = obj["result"]
 
 
+_CODEX_KEY = re.compile(r"[A-Za-z0-9_-]+")
+
+
 class CodexAdapter(Adapter):
     agent = "codex"
     default_command = "codex"
@@ -242,7 +246,13 @@ class CodexAdapter(Adapter):
                   "-c", 'approval_policy="never"']
         # The read-only sandbox doesn't cover MCP side effects, so switch every server off.
         for name in self.mcp_servers(cwd):
-            common += ["-c", f"mcp_servers.{json.dumps(name)}.enabled=false"]
+            # `-c` takes a dotted path with bare keys: a quoted key names a *different*
+            # server ("invalid transport"), and a dot can't be expressed at all.  A
+            # server we can't switch off fails the turn rather than staying live.
+            if not _CODEX_KEY.fullmatch(name):
+                raise PeerSetupError(f"can't switch off codex MCP server {name!r} for a read-only turn "
+                                     "(its name can't be written in a `-c` override)")
+            common += ["-c", f"mcp_servers.{name}.enabled=false"]
         if resume_id:
             argv = [self.command, "exec", "resume", *common, *self.extra, resume_id, "-"]
         else:

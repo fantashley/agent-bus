@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 import textwrap
 import time
@@ -209,6 +211,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--agent", required=True, choices=cfg.AGENTS)
     s.add_argument("--role")
 
+    s = sub.add_parser("setup-codex", help="register agent-bus with Codex, forwarding Rex variables")
+    s.add_argument("--bin", help="agent-bus executable Codex should run (default: this one)")
+
     s = sub.add_parser("run-job", help="(internal) run a queued job")
     s.add_argument("job")
 
@@ -256,6 +261,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("thread")
     s.add_argument("--rounds", type=int, default=2, help="extra rounds to allow (default 2)")
 
+    s = sub.add_parser("rex-check", help="report what Rex shows about an agent session's block (read-only)")
+    s.add_argument("--session", help="session id (default: the latest session of each agent)")
+    s.add_argument("--block", help="Rex block to check instead of a session's")
+    s.add_argument("--agent", choices=cfg.AGENTS, help="agent expected in --block; alone, only that agent's latest session")
+    s.add_argument("--json", action="store_true")
+
     s = sub.add_parser("watch", help="open Rex viewer panes for a thread")
     s.add_argument("thread")
     s.add_argument("--no-peers", action="store_true", help="only the thread watcher")
@@ -265,6 +276,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "mcp":
         from . import mcp_server
         mcp_server.main(args.agent, args.role)
+        return 0
+    if args.cmd == "setup-codex":
+        from . import codex_setup
+        me = cfg.self_command()
+        if not args.bin and len(me) != 1:
+            print("agent-bus: setup-codex: can't tell where agent-bus is installed; pass --bin", file=sys.stderr)
+            return 1
+        exe = os.path.abspath(args.bin or me[0])
+        try:
+            print(f"codex: agent-bus entry {codex_setup.ensure(exe)}")
+        except (codex_setup.SetupError, OSError, UnicodeError, subprocess.TimeoutExpired) as e:
+            print(f"agent-bus: setup-codex: {e}", file=sys.stderr)
+            return 1
         return 0
     if args.cmd == "run-job":
         from . import worker
@@ -325,6 +349,17 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         print(f"resumed {t['id']}: status {t['status']}, max rounds {t['max_rounds']}"
               + (f", job {res['job']['id']}" if res.get("job") else ""))
         return 0
+    if args.cmd == "rex-check":
+        from . import rexcheck
+        if args.session or args.block:
+            reports = [rexcheck.check(bus, session_id=args.session, block=args.block, agent=args.agent)]
+        else:  # --agent alone narrows the latest sessions to that agent
+            reports = [rexcheck.check(bus, session_id=s) for s in rexcheck.latest_sessions(bus, args.agent)]
+        if args.json:
+            print(json.dumps(reports, indent=2))
+        else:
+            print("\n".join(rexcheck.format_report(r) for r in reports) or "no sessions registered")
+        return 0 if reports and all(r["ok"] for r in reports) else 1
     if args.cmd == "watch":
         t = bus.thread(args.thread)
         peers = [] if args.no_peers else [p for p in t["participants"] if p != t["initiator"]]

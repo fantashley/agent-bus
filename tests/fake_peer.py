@@ -17,6 +17,14 @@ agent = os.environ["FAKE_AGENT"]
 behaviour = os.environ.get("FAKE_BEHAVIOUR", "consensus")
 argv = sys.argv[1:]
 
+if agent == "codex":
+    # Like the real CLI: a quoted key in a -c override names a different server, which
+    # then has no transport.
+    for i, a in enumerate(argv[:-1]):
+        if a == "-c" and argv[i + 1].startswith("mcp_servers.") and '"' in argv[i + 1].split("=", 1)[0]:
+            print('Error loading config.toml: invalid transport in `mcp_servers."x"`', file=sys.stderr)
+            sys.exit(1)
+
 if agent == "codex" and argv[:2] == ["mcp", "list"]:
     print(json.dumps([{"name": "agent-bus", "enabled": True}, {"name": "github", "enabled": True},
                       {"name": "off", "enabled": False}]))

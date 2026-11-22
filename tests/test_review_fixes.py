@@ -334,9 +334,10 @@ def test_peer_turns_carry_peer_env_and_mcp_lockdown(env, no_spawn):
     claude_argv = [c for c in cs if c["agent"] == "claude"][0]["argv"]
     assert "--strict-mcp-config" in claude_argv and not any("Bash" in a for a in claude_argv)
     codex_argv = [c for c in cs if c["agent"] == "codex"][0]["argv"]
-    assert 'mcp_servers."agent-bus".enabled=false' in codex_argv
-    assert 'mcp_servers."github".enabled=false' in codex_argv
-    assert not any('"off"' in a for a in codex_argv)  # never touch servers that aren't live
+    # Bare keys: codex's -c reads a quoted key as a different, half-defined server.
+    assert "mcp_servers.agent-bus.enabled=false" in codex_argv
+    assert "mcp_servers.github.enabled=false" in codex_argv
+    assert not any("mcp_servers.off" in a for a in codex_argv)  # never touch servers that aren't live
 
 
 def test_mcp_tools_refuse_inside_peer(env, monkeypatch):
@@ -536,3 +537,14 @@ def test_repeating_a_followup_is_idempotent(env, no_spawn, state):
     assert again["job"]["id"] == first["job"]["id"] and again["job"]["deduplicated"]
     assert len([m for m in bus.history(tid)["messages"] if m["body"] == "n"]) == 1
     assert bus.thread(tid)["refs"]["heads"] == [h1, h2]
+
+
+def test_codex_server_name_that_cant_be_overridden_fails_closed(env, monkeypatch):
+    from agent_bus.peers import CodexAdapter, PeerSetupError
+    adapter = CodexAdapter(Config.load())
+    monkeypatch.setattr(adapter, "mcp_servers", lambda cwd: ["agent-bus", "has.dot"])
+    with pytest.raises(PeerSetupError):
+        adapter.invocation("hi", None, str(env["repo"]), [])
+    monkeypatch.setattr(adapter, "mcp_servers", lambda cwd: ["agent-bus", "my_srv-2"])
+    argv = adapter.invocation("hi", None, str(env["repo"]), []).argv
+    assert "mcp_servers.my_srv-2.enabled=false" in argv

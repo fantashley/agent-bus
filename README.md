@@ -74,6 +74,39 @@ lines into alerts (or a plain `while read`) hears about each reviewer as it fini
 client, local or attached to a remote host. Viewer panes are output-only; nothing is ever typed
 into a block. Everything works without Rex.
 
+## Rex sessions and wake-ups
+
+agent-bus never types into a terminal, its own panes included. All three clients report
+`idle`/`working` to Rex (OSC 7501), but an idle agent with a half-typed draft reports `idle`
+too, and no client or Rex signal says whether the input box is empty. A check followed by a
+separate write could always race a human typing. So interactive sessions pick up messages with
+`wait`/`inbox`, and peers run headless. Automatic wake-ups wait for an atomic "deliver only if
+idle and empty" path or a dedicated notification channel. (Agreed by Claude, Codex and
+Antigravity in an agent-bus discussion, after measuring all three clients in Rex.)
+
+`agent-bus rex-check` shows what Rex does report for a session, one check per line. Each check
+fails if it's missing or can't be read:
+
+```sh
+agent-bus rex-check                       # the latest session of each agent
+agent-bus rex-check --session s-1a2b3c4d
+agent-bus rex-check --block block:… --agent codex
+```
+
+The checks are:
+- `rex_env`: REX_SESSION/REX_BLOCK were recorded when the session registered.
+- `mcp_server`: the session's server process is still running.
+- `block`: the block exists.
+- `app`: the expected client reports OSC 7501 status there.
+- `owner`: the status owner is the block's foreground process.
+- `client`: the status owner is this session's own client.
+- `state`: the reported state and when it was last reported.
+- `input_ready`: always `unavailable`.
+
+It exits non-zero if any check fails. Claude Code and Antigravity pass `REX_*` to MCP servers.
+Codex filters its MCP servers' environment, so `agent-bus setup-codex` (run by the home-manager
+module) sets `env_vars` on Codex's agent-bus entry.
+
 ## Install (Home Manager)
 
 ```nix
@@ -93,7 +126,10 @@ This installs the CLI, writes `~/.config/agent-bus/config.json`, and registers t
 - **Claude Code:** a local plugin from a directory marketplace in the store, enabled through
   `local.claude.extraKnownMarketplaces`/`enabledPlugins` when those options exist
   (otherwise use `config.local.agentBus.claudeMarketplace`).
-- **Codex:** `codex mcp add agent-bus …` at activation, skipped when the entry already matches.
+- **Codex:** `agent-bus setup-codex` at activation: `codex mcp add agent-bus …`, then `env_vars` on
+  that entry so `REX_SESSION`/`REX_BLOCK`/`REX_SERVER` reach the server (Codex filters MCP
+  server environments; `codex mcp add` can't set `env_vars`). Skipped when the entry already
+  matches; the rest of `~/.codex/config.toml` is left alone.
 - **Antigravity:** a plugin linked at `~/.gemini/config/plugins/agent-bus` (on by default when
   `local.antigravity.enable` is set).
 
@@ -108,6 +144,6 @@ nix build                  # package (runs the tests)
 
 ## Not in v1
 
-Interactive peer panes and `rex send` wake-ups (v1.1, gated on a verified input-ready signal);
-cross-host discussions, per-client fixed-hint hooks, writable participants in separate
-`jj workspace`s (v1.5).
+Interactive peer panes and automatic wake-ups, until a client or Rex can deliver input
+atomically only when it's ready (see above). Cross-host discussions, per-client fixed-hint
+hooks, and writable participants in separate `jj workspace`s (v1.5).
