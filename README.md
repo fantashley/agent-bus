@@ -93,7 +93,10 @@ This installs the CLI, writes `~/.config/agent-bus/config.json`, and registers t
 - **Claude Code:** a local plugin from a directory marketplace in the store, enabled through
   `local.claude.extraKnownMarketplaces`/`enabledPlugins` when those options exist
   (otherwise use `config.local.agentBus.claudeMarketplace`).
-- **Codex:** `codex mcp add agent-bus …` at activation, skipped when the entry already matches.
+- **Codex:** `agent-bus setup-codex` at activation: `codex mcp add agent-bus …`, then `env_vars` on
+  that entry so `REX_SESSION`/`REX_BLOCK`/`REX_SERVER` reach the server (Codex filters MCP
+  server environments; `codex mcp add` can't set `env_vars`). Skipped when the entry already
+  matches; the rest of `~/.codex/config.toml` is left alone.
 - **Antigravity:** a plugin linked at `~/.gemini/config/plugins/agent-bus` (on by default when
   `local.antigravity.enable` is set).
 

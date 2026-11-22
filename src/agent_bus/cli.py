@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 import textwrap
 import time
@@ -209,6 +211,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--agent", required=True, choices=cfg.AGENTS)
     s.add_argument("--role")
 
+    s = sub.add_parser("setup-codex", help="register agent-bus with Codex, forwarding Rex variables")
+    s.add_argument("--bin", help="agent-bus executable Codex should run (default: this one)")
+
     s = sub.add_parser("run-job", help="(internal) run a queued job")
     s.add_argument("job")
 
@@ -265,6 +270,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "mcp":
         from . import mcp_server
         mcp_server.main(args.agent, args.role)
+        return 0
+    if args.cmd == "setup-codex":
+        from . import codex_setup
+        me = cfg.self_command()
+        if not args.bin and len(me) != 1:
+            print("agent-bus: setup-codex: can't tell where agent-bus is installed; pass --bin", file=sys.stderr)
+            return 1
+        exe = os.path.abspath(args.bin or me[0])
+        try:
+            print(f"codex: agent-bus entry {codex_setup.ensure(exe)}")
+        except (codex_setup.SetupError, OSError, subprocess.TimeoutExpired) as e:
+            print(f"agent-bus: setup-codex: {e}", file=sys.stderr)
+            return 1
         return 0
     if args.cmd == "run-job":
         from . import worker
