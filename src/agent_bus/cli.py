@@ -264,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("rex-check", help="report what Rex shows about an agent session's block (read-only)")
     s.add_argument("--session", help="session id (default: the latest session of each agent)")
     s.add_argument("--block", help="Rex block to check instead of a session's")
-    s.add_argument("--agent", choices=cfg.AGENTS, help="agent expected in --block")
+    s.add_argument("--agent", choices=cfg.AGENTS, help="agent expected in --block; alone, only that agent's latest session")
     s.add_argument("--json", action="store_true")
 
     s = sub.add_parser("watch", help="open Rex viewer panes for a thread")
@@ -353,8 +353,8 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         from . import rexcheck
         if args.session or args.block:
             reports = [rexcheck.check(bus, session_id=args.session, block=args.block, agent=args.agent)]
-        else:
-            reports = [rexcheck.check(bus, session_id=s) for s in rexcheck.latest_sessions(bus)]
+        else:  # --agent alone narrows the latest sessions to that agent
+            reports = [rexcheck.check(bus, session_id=s) for s in rexcheck.latest_sessions(bus, args.agent)]
         if args.json:
             print(json.dumps(reports, indent=2))
         else:
