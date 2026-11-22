@@ -133,7 +133,10 @@ class Service:
 
     def start_discussion(self, question: str, peers: list[str] | None = None, repo: str | None = None,
                          context_refs: list[str] | None = None, max_rounds: int | None = None,
-                         deadline_minutes: int | None = None, watch: bool = False) -> dict:
+                         deadline_minutes: int | None = None, watch: bool = False,
+                         peer_settings: dict | None = None) -> dict:
+        """``peer_settings``: optional per-peer model/effort for this discussion's headless
+        turns, e.g. {"codex": {"effort": "high"}}, on top of the config's."""
         if not question or not question.strip():
             raise ValueError("question is empty")
         defaulted = peers is None
@@ -150,6 +153,11 @@ class Service:
                 which = "no agent" if self.agent == HUMAN else "no other agent"
                 raise ValueError(f"a discussion needs at least one peer ({which} is available on this machine)")
             raise ValueError("a discussion needs at least one peer")
+        settings = {}
+        for agent, value in (peer_settings or {}).items():
+            if agent not in peers:
+                raise ValueError(f"peer_settings names {agent!r}, which isn't a peer in this discussion")
+            settings[agent] = cfg.check_peer_settings(agent, value)
         repo_path = self._allowed_repo(repo) if repo else None
         rounds = max(1, min(int(max_rounds or self.config.max_rounds), 10))
         minutes = max(1, min(int(deadline_minutes or self.config.deadline_minutes), 240))
@@ -159,7 +167,7 @@ class Service:
             initiator_session=self.session_id, max_rounds=rounds,
             max_messages=max(self.config.max_messages, rounds * len(participants) * 3),
             deadline=time.time() + minutes * 60, repo=repo_path,
-            refs={"context_refs": context_refs} if context_refs else None)
+            refs={k: v for k, v in (("context_refs", context_refs), ("peer_settings", settings)) if v} or None)
         if self.agent == HUMAN:
             self.bus.post(t["id"], HUMAN, question.strip())
         else:
@@ -200,9 +208,12 @@ class Service:
 
     def request_review(self, reviewer: str, repo: str, base_commit_id: str, head_commit_id: str,
                        change_id: str | None = None, prev_head_commit_id: str | None = None,
-                       focus: str | None = None) -> dict:
+                       focus: str | None = None, model: str | None = None, effort: str | None = None) -> dict:
+        """``model``/``effort`` override the config for this reviewer on this thread; a
+        follow-up pass keeps the thread's settings unless it gives new ones."""
         if reviewer not in cfg.AGENTS or reviewer == self.agent:
             raise ValueError("reviewer must be one of the other agents")
+        override = cfg.check_peer_settings(reviewer, {"model": model, "effort": effort})
         self.config.require_available(reviewer, "reviewer")
         for name, value in (("base_commit_id", base_commit_id), ("head_commit_id", head_commit_id),
                             ("prev_head_commit_id", prev_head_commit_id)):
@@ -215,6 +226,8 @@ class Service:
                 "base_commit_id": base_commit_id, "head_commit_id": head_commit_id,
                 "prev_head_commit_id": prev_head_commit_id, "focus": focus,
                 "heads": [head_commit_id]}  # every head this thread has been asked to review
+        if override:
+            refs["peer_settings"] = {reviewer: override}
         # The requester is part of the key: two agents asking for the same review each get
         # their own thread, so each verdict reaches the agent that asked.
         key = (f"review:{self.agent}:{repo_path}:{reviewer}:"
@@ -248,6 +261,9 @@ class Service:
                     if focus:
                         self.bus.post(t["id"], self.agent, focus, session_id=self.session_id, recipient=reviewer)
                     refs["heads"] = [*self._heads(t), head_commit_id]
+                    kept = ((t["refs"] or {}).get("peer_settings") or {}).get(reviewer, {})
+                    if kept or override:
+                        refs["peer_settings"] = {reviewer: {**kept, **override}}
                     self.bus.set_thread(t["id"], refs=json.dumps(refs), status="open", round=t["round"] + 1,
                                         max_rounds=t["round"] + 1,
                                         goal=f"Review {change_id or head_commit_id[:12]} in "

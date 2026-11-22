@@ -130,17 +130,19 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
     @mcp.tool()
     def start_discussion(question: str, peers: list[str] | None = None, repo: str | None = None,
                          context_refs: list[str] | None = None, max_rounds: int | None = None,
-                         deadline_minutes: int | None = None, watch: bool = False) -> dict[str, Any]:
+                         deadline_minutes: int | None = None, watch: bool = False,
+                         peer_settings: dict | None = None) -> dict[str, Any]:
         """Start a discussion with other agents that ends in agreement or documented dissent.
 
         peers: agent types to include (default: every other agent). repo: an allow-listed repo the
         peers may read. Peers run headless and read-only. You take part too: post your initial
         view with send(kind="proposal") right away, then loop wait(thread). watch=True opens Rex
-        viewer panes when you're running inside Rex.
+        viewer panes when you're running inside Rex. peer_settings optionally sets a peer's model
+        and/or reasoning effort for this discussion, e.g. {"codex": {"effort": "high"}}.
         """
         return call(svc.start_discussion, question=question, peers=peers, repo=repo,
                     context_refs=context_refs, max_rounds=max_rounds, deadline_minutes=deadline_minutes,
-                    watch=watch)
+                    watch=watch, peer_settings=peer_settings)
 
     @mcp.tool()
     def advance_discussion(thread: str) -> dict[str, Any]:
@@ -150,17 +152,20 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
     @mcp.tool()
     def request_review(reviewer: str, repo: str, base_commit_id: str, head_commit_id: str,
                        change_id: str | None = None, prev_head_commit_id: str | None = None,
-                       focus: str | None = None) -> dict[str, Any]:
+                       focus: str | None = None, model: str | None = None,
+                       effort: str | None = None) -> dict[str, Any]:
         """Ask another agent for a read-only review of a pinned change in an allow-listed repo.
 
         Pin full commit ids (`jj log --no-graph -r @ -T commit_id`). For a follow-up pass, pass the
         head that reviewer last reviewed as prev_head_commit_id: the request continues the same
         review thread and resumes the reviewer's own conversation, so it keeps its earlier
         findings and sees only the interdiff plus any replies you posted on the thread.
+        model/effort optionally set the reviewer's model and reasoning effort for this review
+        thread (kept for follow-up passes unless given again).
         """
         return call(svc.request_review, reviewer=reviewer, repo=repo, change_id=change_id,
                     base_commit_id=base_commit_id, head_commit_id=head_commit_id,
-                    prev_head_commit_id=prev_head_commit_id, focus=focus)
+                    prev_head_commit_id=prev_head_commit_id, focus=focus, model=model, effort=effort)
 
     return mcp
 

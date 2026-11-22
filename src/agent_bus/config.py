@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,10 +20,40 @@ from pathlib import Path
 # the app name it reports in Rex's OSC 7501 program status.  Which of them a
 # machine actually has is decided per machine (see Config.availability).
 AGENT_INFO = {
-    "claude": {"cli": "claude", "app": "claude-code", "name": "Claude Code"},
-    "codex": {"cli": "codex", "app": "codex", "name": "Codex"},
-    "antigravity": {"cli": "agy", "app": "antigravity", "name": "Antigravity"},
+    "claude": {"cli": "claude", "app": "claude-code", "name": "Claude Code",
+               "efforts": ("low", "medium", "high", "xhigh", "max")},
+    "codex": {"cli": "codex", "app": "codex", "name": "Codex",
+              "efforts": ("minimal", "low", "medium", "high", "xhigh")},
+    "antigravity": {"cli": "agy", "app": "antigravity", "name": "Antigravity",
+                    "efforts": ("low", "medium", "high", "xhigh", "max")},
 }
+
+_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,99}")
+
+
+def check_peer_settings(agent: str, settings: dict | None) -> dict:
+    """Validate a {model, effort} mapping for ``agent``; returns only the keys that are set.
+    Model names are restricted to a safe character set, and effort to the values that
+    agent's CLI accepts."""
+    if settings is None:
+        return {}
+    if not isinstance(settings, dict):
+        raise ValueError(f"settings for {agent} must be an object with model and/or effort")
+    extra = set(settings) - {"model", "effort"}
+    if extra:
+        raise ValueError(f"unknown setting(s) for {agent}: {', '.join(sorted(extra))} (expected model, effort)")
+    out = {}
+    model, effort = settings.get("model"), settings.get("effort")
+    if model is not None:
+        if not isinstance(model, str) or not _MODEL.fullmatch(model):
+            raise ValueError(f"invalid model name for {agent}: {model!r}")
+        out["model"] = model
+    if effort is not None:
+        allowed = AGENT_INFO[agent]["efforts"]
+        if effort not in allowed:
+            raise ValueError(f"invalid effort for {agent}: {effort!r}; expected one of {', '.join(allowed)}")
+        out["effort"] = effort
+    return out
 AGENTS = tuple(AGENT_INFO)
 
 DEFAULTS = {
@@ -80,7 +111,11 @@ class Config:
         if path.exists():
             data.update(json.loads(path.read_text()))
         known = {k: data[k] for k in DEFAULTS}
-        return cls(**known)
+        conf = cls(**known)
+        for agent, entry in (conf.peers or {}).items():  # reject a bad model/effort when loading
+            if agent in AGENT_INFO and isinstance(entry, dict):
+                check_peer_settings(agent, {k: entry.get(k) for k in ("model", "effort")})
+        return conf
 
     def peer_command(self, agent: str, default: str | None = None) -> str:
         return os.path.expanduser(self.peers.get(agent, {}).get("command", default or AGENT_INFO[agent]["cli"]))
@@ -123,6 +158,14 @@ class Config:
             from .db import BusError
             raise BusError("AGENT_UNAVAILABLE", f"{agent} isn't available on this machine ({info['reason']}); "
                            f"available: {', '.join(self.available_agents()) or 'none'}")
+
+    def peer_settings(self, agent: str, override: dict | None = None) -> dict:
+        """Model and effort for ``agent``'s headless turns: config ``peers.<agent>``,
+        then a per-thread override on top.  Empty means the CLI's own defaults."""
+        base = self.peers.get(agent, {})
+        merged = {k: base[k] for k in ("model", "effort") if base.get(k) is not None}
+        merged.update(check_peer_settings(agent, override))
+        return check_peer_settings(agent, merged)
 
     def peer_args(self, agent: str) -> list[str]:
         return list(self.peers.get(agent, {}).get("args", []))

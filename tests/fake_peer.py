@@ -25,10 +25,13 @@ if agent == "codex":
             print('Error loading config.toml: invalid transport in `mcp_servers."x"`', file=sys.stderr)
             sys.exit(1)
 
-if agent == "codex" and argv[:2] == ["mcp", "list"]:
-    print(json.dumps([{"name": "agent-bus", "enabled": True}, {"name": "github", "enabled": True},
-                      {"name": "off", "enabled": False}]))
-    sys.exit(0)
+    rest = list(argv)
+    while len(rest) >= 2 and rest[0] == "-c":
+        rest = rest[2:]
+    if rest[:2] == ["mcp", "list"]:
+        print(json.dumps([{"name": "agent-bus", "enabled": True}, {"name": "github", "enabled": True},
+                          {"name": "off", "enabled": False}]))
+        sys.exit(0)
 
 if behaviour == "hang":
     import time

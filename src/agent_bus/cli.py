@@ -180,8 +180,15 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
 def cmd_ask(bus: Bus, args: argparse.Namespace) -> int:
     svc = Service(bus, HUMAN)
     peers = ([p.strip() for p in args.with_.split(",")] if args.with_.strip() else []) if args.with_ is not None else None
+    settings: dict = {}
+    for item in args.settings:
+        key, sep, value = item.partition("=")
+        agent, dot, field_ = key.partition(".")
+        if not sep or not dot or field_ not in ("model", "effort"):
+            raise ValueError(f"--set expects AGENT.model=VALUE or AGENT.effort=VALUE, got {item!r}")
+        settings.setdefault(agent, {})[field_] = value
     res = svc.start_discussion(args.prompt, peers=peers, repo=args.repo, max_rounds=args.rounds,
-                               deadline_minutes=args.deadline, watch=args.watch)
+                               deadline_minutes=args.deadline, watch=args.watch, peer_settings=settings or None)
     tid = res["thread"]["id"]
     print(f"started {tid} with {', '.join(res['thread']['participants'])} (job {res['job']['id']})")
     if res.get("watch"):
@@ -228,6 +235,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--rounds", type=int, help="max rounds (default from config, 4)")
     s.add_argument("--deadline", type=int, help="deadline in minutes (default from config, 30)")
     s.add_argument("--watch", action="store_true", help="open Rex viewer panes")
+    s.add_argument("--set", dest="settings", action="append", default=[], metavar="AGENT.KEY=VALUE",
+                   help="per-peer model/effort for this discussion, e.g. codex.effort=high (repeatable)")
     s.add_argument("--wait", action="store_true", help="block until the worker finishes, then print the thread")
 
     s = sub.add_parser("agents", help="list the agents available on this machine, and why")

@@ -54,6 +54,29 @@ its earlier findings; it gets the interdiff plus anything you posted on the thre
 `send` explaining how each finding was addressed). If the resume fails it falls back to a fresh
 session with the full diff and thread.
 
+## Model and effort
+
+Headless peers use each CLI's default model and reasoning effort unless you set them:
+
+```nix
+local.agentBus.peerSettings = { codex.effort = "high"; claude.model = "opus"; };
+```
+
+You can also set `peers.<agent>.model` / `.effort` in `config.json`. Per thread, use
+`agent-bus ask … --set codex.effort=high`, or the `peer_settings` argument to
+`start_discussion` and `model`/`effort` to `request_review`. A review's settings stay with
+its thread for later passes unless new ones are given.
+
+| Agent | Flags passed | Effort values |
+|---|---|---|
+| Claude Code | `--model`, `--effort` | low, medium, high, xhigh, max |
+| Codex | `-m`, `-c model_reasoning_effort=…` | minimal, low, medium, high, xhigh |
+| Antigravity | `--model`, `--effort` | low, medium, high, xhigh, max |
+
+Other effort values, and model names outside a safe character set, are rejected when the
+config loads or when the request is made. The flags are passed on resumed turns too, and each
+`turn_start` progress line shows what the turn ran with.
+
 ## Watching and stepping in
 
 ```sh

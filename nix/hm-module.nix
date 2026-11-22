@@ -83,6 +83,9 @@ let
     && options.local.claude ? enabledPlugins
     && options.local.claude ? extraKnownMarketplaces;
   listed = agent: cfg.agents == null || lib.elem agent cfg.agents;
+  # Only the keys that are set, so the CLI's defaults apply otherwise.
+  peerSettings = lib.filterAttrs (_: v: v != { })
+    (lib.mapAttrs (_: v: lib.filterAttrs (_: x: x != null) v) cfg.peerSettings);
   defaultAntigravity = (options ? local && options.local ? antigravity)
     && config.local.antigravity.enable or false;
 in
@@ -118,6 +121,35 @@ in
         The agents available on this machine. Discussions and reviews default to
         these, naming any other agent fails up front, and registration is only done
         for these clients. Null detects them at runtime (a CLI found on PATH counts).
+      '';
+    };
+
+    peerSettings = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          model = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "opus";
+            description = "Model for this agent's headless turns (null: the CLI's default).";
+          };
+          effort = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "high";
+            description = ''
+              Reasoning effort for this agent's headless turns (null: the CLI's default).
+              Claude Code and Antigravity: low, medium, high, xhigh, max. Codex: minimal,
+              low, medium, high, xhigh. agent-bus rejects other values.
+            '';
+          };
+        };
+      });
+      default = { };
+      example = lib.literalExpression ''{ codex.effort = "high"; claude.model = "opus"; }'';
+      description = ''
+        Per-agent model and reasoning effort for the headless peers agent-bus runs in
+        discussions and reviews. A discussion or review can override them per thread.
       '';
     };
 
@@ -177,8 +209,11 @@ in
     {
       home.packages = [ cfg.package ];
       xdg.configFile."agent-bus/config.json".source =
-        json.generate "agent-bus-config.json" ({ inherit (cfg) repos; }
-          // lib.optionalAttrs (cfg.agents != null) { inherit (cfg) agents; } // cfg.settings);
+        json.generate "agent-bus-config.json" (lib.recursiveUpdate
+          ({ inherit (cfg) repos; }
+            // lib.optionalAttrs (cfg.agents != null) { inherit (cfg) agents; }
+            // lib.optionalAttrs (peerSettings != { }) { peers = peerSettings; })
+          cfg.settings);
     }
 
     (lib.mkIf cfg.antigravity.enable {

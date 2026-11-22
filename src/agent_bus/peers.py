@@ -62,10 +62,29 @@ class Adapter:
     agent: str
     default_command: str
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, settings: dict | None = None):
         self.config = config
         self.command = config.peer_command(self.agent, self.default_command)
         self.extra = config.peer_args(self.agent)
+        self.settings = settings or {}  # validated {model, effort}; see Config.peer_settings
+
+    def setting_args(self) -> list[str]:
+        """This CLI's flags for the configured model and effort (none: its defaults)."""
+        args = []
+        if self.settings.get("model"):
+            args += ["--model", self.settings["model"]]
+        if self.settings.get("effort"):
+            args += ["--effort", self.settings["effort"]]
+        return args
+
+    def extra_args(self) -> list[str]:
+        """``self.extra`` with flags overridden by explicit ``self.settings`` stripped."""
+        drop = set()
+        if self.settings.get("model"):
+            drop.add("--model")
+        if self.settings.get("effort"):
+            drop.add("--effort")
+        return _strip_flags(self.extra, drop) if drop else list(self.extra)
 
     def invocation(self, prompt: str, resume_id: str | None, cwd: str, add_dirs: list[str]) -> Invocation:
         raise NotImplementedError
@@ -170,6 +189,51 @@ def _short(text: str, n: int = 240) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+def _config_key(override: str) -> str:
+    return override.split("=", 1)[0].strip() if "=" in override else ""
+
+
+def _strip_flags(args: list[str], flags: set[str], config_keys: set[str] = frozenset()) -> list[str]:
+    """Remove options in ``flags`` (``--flag val``, ``--flag=val``, short ``-xval``)
+    and ``-c``/``--config`` overrides for ``config_keys`` from an argv slice."""
+    short = {f for f in flags if len(f) == 2 and f.startswith("-") and f[1] != "-"}
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            out.extend(args[i:])
+            break
+        if a in flags:
+            i += 2
+            continue
+        if any(a.startswith(f + "=") for f in flags):
+            i += 1
+            continue
+        if any(a.startswith(f) and len(a) > 2 for f in short):
+            i += 1
+            continue
+        if config_keys:
+            if a in ("-c", "--config"):
+                if i + 1 < len(args) and _config_key(args[i + 1]) in config_keys:
+                    i += 2
+                    continue
+                out.extend(args[i : i + 2])
+                i += 2
+                continue
+            if a.startswith("--config=") and _config_key(a.split("=", 1)[1]) in config_keys:
+                i += 1
+                continue
+            if a.startswith("-c") and len(a) > 2 and not a.startswith("--"):
+                rest = a[3:] if a.startswith("-c=") else a[2:]
+                if _config_key(rest) in config_keys:
+                    i += 1
+                    continue
+        out.append(a)
+        i += 1
+    return out
+
+
 class ClaudeAdapter(Adapter):
     agent = "claude"
     default_command = cfg.AGENT_INFO["claude"]["cli"]
@@ -184,13 +248,14 @@ class ClaudeAdapter(Adapter):
                 "--allowedTools", ",".join(self.allowed_tools)]
         for d in add_dirs:
             argv += ["--add-dir", d]
+        argv += self.setting_args()
         sid = resume_id
         if resume_id:
             argv += ["--resume", resume_id]
         else:
             sid = new_uuid()
             argv += ["--session-id", sid]
-        argv += self.extra
+        argv += self.extra_args()
         return Invocation(argv=argv, stdin=prompt, external_id=sid)
 
     def parse_line(self, obj, st, emit):
@@ -243,6 +308,23 @@ class CodexAdapter(Adapter):
         return sorted({d["name"] for d in data
                        if isinstance(d, dict) and isinstance(d.get("name"), str) and d.get("enabled", True)})
 
+    def setting_args(self) -> list[str]:
+        args = []
+        if self.settings.get("model"):
+            args += ["-m", self.settings["model"]]
+        if self.settings.get("effort"):
+            args += ["-c", f'model_reasoning_effort="{self.settings["effort"]}"']
+        return args
+
+    def extra_args(self) -> list[str]:
+        flags, keys = set(), set()
+        if self.settings.get("model"):
+            flags |= {"-m", "--model"}
+            keys.add("model")
+        if self.settings.get("effort"):
+            keys.add("model_reasoning_effort")
+        return _strip_flags(self.extra, flags, keys) if (flags or keys) else list(self.extra)
+
     def invocation(self, prompt, resume_id, cwd, add_dirs):
         common = ["--json", "--skip-git-repo-check", "-c", 'sandbox_mode="read-only"',
                   "-c", 'approval_policy="never"']
@@ -255,10 +337,12 @@ class CodexAdapter(Adapter):
                 raise PeerSetupError(f"can't switch off codex MCP server {name!r} for a read-only turn "
                                      "(its name can't be written in a `-c` override)")
             common += ["-c", f"mcp_servers.{name}.enabled=false"]
+        common += self.setting_args()
+        extra = self.extra_args()
         if resume_id:
-            argv = [self.command, "exec", "resume", *common, *self.extra, resume_id, "-"]
+            argv = [self.command, "exec", "resume", *common, *extra, resume_id, "-"]
         else:
-            argv = [self.command, "exec", *common, "-C", cwd, *self.extra, "-"]
+            argv = [self.command, "exec", *common, "-C", cwd, *extra, "-"]
         return Invocation(argv=argv, stdin=prompt, external_id=resume_id)
 
     def parse_line(self, obj, st, emit):
@@ -317,7 +401,8 @@ class AntigravityAdapter(Adapter):
             argv += ["--add-dir", d]
         if resume_id:
             argv += ["--conversation", resume_id]
-        argv += self.extra
+        argv += self.setting_args()
+        argv += self.extra_args()
         # agy takes the prompt as the value of --print; there is no stdin mode
         # for plain text, so very long prompts go through a file.
         if len(prompt.encode()) > MAX_ARG:
@@ -392,9 +477,9 @@ def _agy_hint(params) -> str:
 ADAPTERS = {a.agent: a for a in (ClaudeAdapter, CodexAdapter, AntigravityAdapter)}
 
 
-def adapter(agent: str, config: Config) -> Adapter:
+def adapter(agent: str, config: Config, settings: dict | None = None) -> Adapter:
     try:
-        return ADAPTERS[agent](config)
+        return ADAPTERS[agent](config, settings)
     except KeyError:
         raise ValueError(f"unknown agent {agent!r}; expected one of {', '.join(ADAPTERS)}") from None
 
