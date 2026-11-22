@@ -135,8 +135,29 @@ agreed on agent-bus thread t-35d692 (issue #32). Stage 1 is in place:
 - **Codex MCP listing:** a malformed entry in `codex mcp list --json` now fails the turn
   instead of being skipped. A server agent-bus can't name is one it can't switch off.
 
-Stage 2, still to come: `agent-bus doctor` / `doctor --live`, and a launch gate that refuses a
-peer whose isolation can't be shown for the installed version.
+Stage 2 (agent-bus thread t-71c7ce) is under way:
+- **`agent-bus doctor`** checks each agent without spending a turn, and exits 1 if a check fails:
+  - its CLI path, version and adapter recipe;
+  - the isolation flags actually in its launch command. For Codex that's the *effective*
+    sandbox and approval policy, so a `peers.codex.args` override that weakens them is caught;
+  - its MCP preflight;
+  - the isolation evidence on record for the current binary, recipe and config fingerprint.
+- **Antigravity's MCP check** now covers every source agy loads:
+  - the global config root, including its `plugins.json`;
+  - every workspace `.agents/` directory from the working directory (and each `--add-dir`) up
+    to `/`, including their `mcp_config.json`, `plugins/*/` and `plugins.json` entries and
+    inherits.
+
+  It fails closed on anything it can't read. A server named `agent-bus` is exempt only if it's
+  exactly agent-bus's own registration: `mcp --agent antigravity` run by the installed agent-bus
+  binary.
+- **`agent-bus sentinel-mcp`** is a fake MCP server that logs start, handshake and call
+  separately. The live canaries will use it.
+
+Still to come, together: `doctor --live` canaries that drive each CLI from a scripted local
+model endpoint, and a launch gate that refuses a peer without verified write and MCP evidence.
+Antigravity has no known local endpoint, so once the gate ships it needs an explicit unsafe
+override to keep running.
 
 ## Watching and stepping in
 

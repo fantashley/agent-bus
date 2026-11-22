@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -491,6 +492,32 @@ AGY_USAGE = {"input": "input_tokens", "output": "output_tokens", "cache_read": "
 _AGY_QUOTA = (r"quota reached", r"quota (?:exceeded|exhausted|has been exhausted)", r"exhausted (?:your|the) quota",
               r"(?:out of|insufficient|no remaining) (?:ai )?credits", r"usage limit (?:reached|exceeded)")
 
+def codex_config_args(args: list[str]) -> list[str]:
+    """Every option in ``args`` that changes codex's configuration, in order, in a
+    canonical split form: -c/--config overrides (split or joined) and -p/--profile.
+    The MCP listing gets exactly these, so it sees the servers the turn will (#32)."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            break
+        for flags, canon in ((("-c", "--config"), "-c"), (("-p", "--profile"), "--profile")):
+            if a in flags and i + 1 < len(args):
+                out += [canon, args[i + 1]]
+                i += 1
+                break
+            joined = next((a[len(f) + 1:] for f in flags if f.startswith("--") and a.startswith(f + "=")), None)
+            for short in ("-c", "-p"):
+                if joined is None and flags[0] == short and a.startswith(short) and len(a) > 2:
+                    joined = a[2:].removeprefix("=")  # -cX and -c=X
+            if joined is not None:
+                out += [canon, joined]
+                break
+        i += 1
+    return out
+
+
 _CODEX_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
 
@@ -500,14 +527,16 @@ class CodexAdapter(Adapter):
                               "turn.completed", "turn.failed", "error"})
     default_command = cfg.AGENT_INFO["codex"]["cli"]
 
-    def mcp_servers(self, cwd: str) -> list[str]:
-        """Live MCP servers as codex would load them in ``cwd`` (project config included).
+    def mcp_list(self, cwd: str) -> list[dict]:
+        """`codex mcp list --json` as this launch would see it, validated, read once
+        per adapter and cwd so the launch and doctor use one snapshot (#32).
 
-        Raises if they can't be listed: without the list we can't switch them off,
-        and running a peer with unknown integrations live is not read-only.
-        """
-        overrides = [a for i, a in enumerate(self.extra) if i > 0 and self.extra[i - 1] == "-c"]
-        argv = [self.command, *sum((["-c", o] for o in overrides), []), "mcp", "list", "--json"]
+        Raises if it can't be listed: without the list we can't switch servers off, and
+        running a peer with unknown integrations live is not read-only."""
+        cache = self.__dict__.setdefault("_mcp_cache", {})
+        if cwd in cache:
+            return cache[cwd]
+        argv = [self.command, *codex_config_args(self.extra), "mcp", "list", "--json"]
         try:
             out = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30)
             if out.returncode != 0:
@@ -526,11 +555,67 @@ class CodexAdapter(Adapter):
                    else "`enabled` is not true/false" if not isinstance(d.get("enabled", True), bool) else None)
             if bad:
                 raise PeerSetupError(f"unexpected entry #{i} in `codex mcp list --json`: {bad}")
-        # Only servers that exist: overriding a missing one creates a half-defined entry
-        # that codex rejects ("invalid transport").  agent-bus itself is also covered by
-        # the AGENT_BUS_PEER guard even if it isn't listed here.
-        return sorted({d["name"] for d in data
-                       if isinstance(d, dict) and isinstance(d.get("name"), str) and d.get("enabled", True)})
+        self.check_project_servers(cwd, {d["name"] for d in data})
+        cache[cwd] = data
+        return data
+
+    def mcp_servers(self, cwd: str) -> list[str]:
+        """Enabled MCP servers to switch off.  Only servers that exist: overriding a
+        missing one creates a half-defined entry codex rejects ("invalid transport").
+        agent-bus itself is also covered by the AGENT_BUS_PEER guard."""
+        return sorted({d["name"] for d in self.mcp_list(cwd) if d.get("enabled", True)})
+
+    @staticmethod
+    def check_project_servers(cwd: str, listed: set[str]) -> None:
+        """Project `.codex/config.toml` files above ``cwd`` can add MCP servers that a
+        trusted exec loads even if `mcp list` didn't report them.  Any enabled one the
+        listing missed fails closed: it would stay live without a disable override."""
+        import tomllib
+        d = Path(cwd).resolve()
+        for parent in [d, *d.parents]:
+            f = parent / ".codex" / "config.toml"
+            try:
+                text = f.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as e:
+                raise PeerSetupError(f"can't read {f} to check Codex's project MCP servers: {e}") from e
+            try:
+                servers = tomllib.loads(text).get("mcp_servers", {})
+            except tomllib.TOMLDecodeError as e:
+                raise PeerSetupError(f"can't parse {f} to check Codex's project MCP servers: {e}") from e
+            if not isinstance(servers, dict):
+                raise PeerSetupError(f"unexpected `mcp_servers` in {f}")
+            missed = sorted(n for n, spec in servers.items()
+                            if n not in listed and not (isinstance(spec, dict) and spec.get("enabled") is False))
+            if missed:
+                raise PeerSetupError(f"{f} defines MCP servers ({', '.join(missed)}) that `codex mcp list` didn't "
+                                     "report, so a peer can't switch them off; remove them or mark them enabled = false")
+
+    # Configured args that could change the turn's isolation in a way the MCP listing
+    # and the generated overrides can't account for: refused outright (#32).
+    UNSAFE_FLAGS = ("-s", "--sandbox", "-a", "--ask-for-approval", "--dangerously-bypass-approvals-and-sandbox",
+                    "--yolo", "--full-auto", "-p", "--profile", "-C", "--cd", "--add-dir", "--enable", "--disable")
+    UNSAFE_KEYS = ("mcp_servers", "sandbox_mode", "sandbox_workspace_write", "approval_policy", "profile",
+                   "profiles", "projects", "features", "default_permissions", "permissions")
+
+    def check_extra_args(self) -> None:
+        cfg_args = codex_config_args(self.extra)
+        for i in range(0, len(cfg_args), 2):
+            flag, value = cfg_args[i], cfg_args[i + 1]
+            key = value.split("=", 1)[0].strip().strip('"').strip("'")
+            root = key.split(".", 1)[0]
+            if flag == "--profile" or root in self.UNSAFE_KEYS:
+                raise PeerSetupError(f"peers.codex.args may not set `{key if flag == '-c' else 'profile'}`: it "
+                                     "changes the peer's sandbox, approvals or MCP servers")
+        for a in self.extra:
+            if a == "--":
+                break
+            if any(a == f or (f.startswith("--") and a.startswith(f + "="))
+                   or (len(f) == 2 and a.startswith(f) and len(a) > 2 and f not in ("-c",))
+                   for f in self.UNSAFE_FLAGS):
+                raise PeerSetupError(f"peers.codex.args may not use `{a.split('=', 1)[0]}`: it changes the "
+                                     "peer's sandbox, approvals, profile or working directories")
 
     def setting_args(self) -> list[str]:
         args = []
@@ -550,6 +635,7 @@ class CodexAdapter(Adapter):
         return _strip_flags(self.extra, flags, keys) if (flags or keys) else list(self.extra)
 
     def invocation(self, prompt, resume_id, cwd, add_dirs):
+        self.check_extra_args()
         common = ["--json", "--skip-git-repo-check", "-c", 'sandbox_mode="read-only"',
                   "-c", 'approval_policy="never"']
         # The read-only sandbox doesn't cover MCP side effects, so switch every server off.
@@ -607,32 +693,26 @@ class AntigravityAdapter(Adapter):
 
     quota_patterns = _AGY_QUOTA
 
-    def check_isolation(self) -> None:
+    def check_isolation(self, cwd: str | None = None, add_dirs: list[str] | None = None) -> None:
         """agy has no per-session switch for MCP servers, so refuse to run a peer while
         any server other than agent-bus (which refuses peers itself) is configured,
-        unless config sets peers.antigravity.allow_mcp."""
+        unless config sets peers.antigravity.allow_mcp.
+
+        agy loads MCP servers from the global config root and from every workspace
+        `.agents/` directory between the working directory and the project root
+        (`mcp_config.json`, `plugins/*/`, and plugin dirs listed in `plugins.json`,
+        which may inherit other such files).  Every one of those is checked, walking up
+        to the filesystem root to be safe; anything unreadable fails closed (#32)."""
         if self.config.peers.get(self.agent, {}).get("allow_mcp"):
             return
-        base = Path(os.environ.get("AGY_CONFIG_DIR") or Path.home() / ".gemini" / "config")
-        files = [base / "mcp_config.json", *sorted(base.glob("plugins/*/mcp_config.json"))]
-        live = []
-        for f in files:
-            if not f.exists():
-                continue
-            try:
-                text = f.read_text().strip()
-                servers = (json.loads(text).get("mcpServers") or {}) if text else {}  # agy leaves it empty
-            except (OSError, json.JSONDecodeError, AttributeError) as e:
-                raise PeerSetupError(f"can't read {f} to check Antigravity's MCP servers: {e}") from e
-            live += [n for n, spec in servers.items()
-                     if n != "agent-bus" and not (isinstance(spec, dict) and spec.get("disabled"))]
+        live = [f"{name} ({where})" for name, where, spec in agy_mcp_servers(cwd, add_dirs or [])
+                if not trusted_agent_bus_entry(name, spec)]
         if live:
             raise PeerSetupError(
                 f"Antigravity has MCP servers configured ({', '.join(sorted(live))}) that a headless peer "
                 "can't be isolated from. Remove them, or set peers.antigravity.allow_mcp = true to accept that.")
 
     def invocation(self, prompt, resume_id, cwd, add_dirs):
-        self.check_isolation()
         argv = [self.command, "--mode", "plan", "--sandbox", "--output-format", "stream-json"]
         for d in add_dirs:
             argv += ["--add-dir", d]
@@ -640,6 +720,10 @@ class AntigravityAdapter(Adapter):
             argv += ["--conversation", resume_id]
         argv += self.setting_args()
         argv += self.extra_args()
+        # Check the workspaces the final command line gives agy, configured extra args
+        # included, resolved where agy will run.
+        spaces = agy_workspaces(argv, cwd)
+        self.check_isolation(spaces[0], spaces[1:])
         # agy takes the prompt as the value of --print; there is no stdin mode
         # for plain text, so very long prompts go through a file.
         if len(prompt.encode()) > MAX_ARG:
@@ -693,6 +777,209 @@ class AntigravityAdapter(Adapter):
                 st.error = _short(f"status {res.get('status')}: {res.get('error') or ''}", 800)
             if isinstance(res.get("response"), str):
                 st.final = res["response"]
+
+
+def trusted_agent_bus_entry(name: str, spec: object) -> bool:
+    """Only agent-bus's own registration is exempt, recognised by what it runs, not by
+    its name: exactly {command, args}, args `mcp --agent antigravity`, and an absolute
+    command that resolves to the agent-bus binary installed here (on PATH or running
+    now).  That server refuses every call from a peer (AGENT_BUS_PEER)."""
+    if name != "agent-bus" or not isinstance(spec, dict) or set(spec) - {"command", "args", "disabled"}:
+        return False
+    command = spec.get("command")
+    if spec.get("args") != ["mcp", "--agent", "antigravity"] or not isinstance(command, str):
+        return False
+    if not os.path.isabs(command):  # a relative command resolves wherever agy runs it
+        return False
+    trusted = installed_agent_bus()
+    return trusted is not None and os.path.realpath(command) == trusted
+
+
+def installed_agent_bus() -> str | None:
+    """The real path of the agent-bus installation in use: the running executable when
+    it is agent-bus itself (workers and the CLI run that way), else the one on PATH."""
+    running = sys.argv[0] if os.path.basename(sys.argv[0]) == "agent-bus" else None
+    for candidate in (running, shutil.which("agent-bus")):
+        if candidate and os.path.isabs(candidate):
+            return os.path.realpath(candidate)
+    return None
+
+
+def agy_workspaces(argv: list[str], cwd: str) -> list[str]:
+    """The workspace roots a launch gets: its cwd plus every --add-dir in the final
+    argv (worker-supplied and configured extra args alike), resolved in that cwd."""
+    out = [cwd]
+    for i, a in enumerate(argv):
+        if a == "--add-dir" and i + 1 < len(argv):
+            out.append(argv[i + 1])
+        elif a.startswith("--add-dir="):
+            out.append(a.split("=", 1)[1])
+    return [d if os.path.isabs(d) else os.path.join(cwd, d) for d in out]
+
+
+def _stat_kind(p: Path) -> str | None:
+    """"dir", "file", "other" or None (missing), distinguishing an unreadable path
+    (PeerSetupError) from a missing one: Path.exists() hides permission errors."""
+    import stat as st
+    try:
+        mode = os.stat(p).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        raise PeerSetupError(f"can't check {p} for Antigravity customizations: {e}") from e
+    return "dir" if st.S_ISDIR(mode) else "file" if st.S_ISREG(mode) else "other"
+
+
+def _resolve(p: Path) -> Path:
+    try:
+        return p.resolve()
+    except (OSError, RuntimeError) as e:
+        raise PeerSetupError(f"can't resolve {p} for Antigravity customizations: {e}") from e
+
+
+def agy_roots(cwd: str | None, add_dirs: list[str]) -> list[Path]:
+    """agy customization roots a run in ``cwd`` (plus ``add_dirs`` workspaces) loads:
+    the global config dir; each `.agents` dir from every workspace up to /; and any
+    personal customization dir a repository's `.gemini/config.json` selects
+    (`personal_customization_dir`), with its `.agents` (#32)."""
+    roots = [Path(os.environ.get("AGY_CONFIG_DIR") or Path.home() / ".gemini" / "config")]
+
+    def add(p: Path) -> None:
+        if p not in roots:
+            roots.append(p)
+
+    for start in [cwd, *add_dirs]:
+        if not start:
+            continue
+        d = _resolve(Path(start if os.path.isabs(start) else os.path.join(cwd or ".", start)))
+        for parent in [d, *d.parents]:
+            if _stat_kind(parent / ".agents") == "dir":
+                add(parent / ".agents")
+            conf = parent / ".gemini" / "config.json"
+            if _stat_kind(conf) is not None:
+                try:
+                    data = json.loads(conf.read_text(encoding="utf-8") or "{}")
+                except (OSError, ValueError) as e:
+                    raise PeerSetupError(f"can't read {conf} to check Antigravity customizations: {e}") from e
+                personal = data.get("personal_customization_dir") if isinstance(data, dict) else None
+                if personal is not None:
+                    if not isinstance(personal, str) or not personal:
+                        raise PeerSetupError(f"unexpected personal_customization_dir in {conf}")
+                    pd = Path(os.path.expanduser(personal))
+                    pd = pd if pd.is_absolute() else parent / pd
+                    add(pd)
+                    add(pd / ".agents")
+    return roots
+
+
+def agy_mcp_servers(cwd: str | None, add_dirs: list[str]) -> list[tuple[str, str, object]]:
+    """(server name, file, spec) for every enabled MCP server agy could load.
+
+    A superset of agy's own discovery (issue #32).  For each root: its own
+    mcp_config.json; each plugin under plugins/; and plugin dirs plugins.json selects,
+    where an entry may be a plugin itself, a directory of plugins (one level), or name
+    nested plugins through include_only.  A relative path is tried against every base
+    agy might use.  Anything unreadable or malformed fails closed (PeerSetupError)."""
+    found: list[tuple[str, str, object]] = []
+    seen: set[Path] = set()
+
+    def fail(f: Path, why: str) -> PeerSetupError:
+        return PeerSetupError(f"can't check {f} for Antigravity MCP servers: {why}")
+
+    def read_json(f: Path):
+        try:
+            text = f.read_text(encoding="utf-8").strip()
+            return json.loads(text) if text else {}  # agy leaves some files empty
+        except (OSError, ValueError) as e:  # ValueError covers JSON and UTF-8 decoding
+            raise fail(f, str(e)) from e
+
+    def servers_in(f: Path) -> None:
+        if _stat_kind(f) is None:
+            return
+        f = _resolve(f)
+        if f in seen:
+            return
+        seen.add(f)
+        data = read_json(f)
+        if not isinstance(data, dict):
+            raise fail(f, "not a JSON object")
+        servers = data.get("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise fail(f, "`mcpServers` is not an object")
+        found.extend((n, str(f), spec) for n, spec in servers.items()
+                     if not (isinstance(spec, dict) and spec.get("disabled") is True))
+
+    def plugin(d: Path) -> None:
+        servers_in(d / "mcp_config.json")
+
+    def plugin_dir(d: Path) -> None:
+        """A directory that is a plugin, or holds plugins one level down."""
+        kind = _stat_kind(d)
+        if kind is None:
+            return
+        if kind == "file":
+            if d.name == "mcp_config.json":
+                servers_in(d)
+            return
+        plugin(d)
+        try:
+            children = sorted(c for c in d.iterdir() if c.name not in (".git", ".jj"))
+        except OSError as e:
+            raise fail(d, str(e)) from e
+        for c in children:
+            if _stat_kind(c) == "dir":
+                plugin(c)
+
+    def project_root(f: Path) -> Path:
+        for p in [f.parent, *f.parents]:
+            if _stat_kind(p / ".git") is not None or _stat_kind(p / ".jj") is not None:
+                return p
+        return f.parent
+
+    def plugins_json(f: Path, depth: int = 0) -> None:
+        if _stat_kind(f) is None:
+            return
+        f = _resolve(f)
+        if f in seen:
+            return
+        if depth > 8:
+            raise fail(f, "inherits too deeply")
+        seen.add(f)
+        data = read_json(f)
+        if not isinstance(data, dict):
+            raise fail(f, "not a JSON object")
+        # agy resolves relative paths against the dir holding the dot-dir, falling back
+        # to the project root; try every candidate.
+        bases = {f.parent.parent if f.parent.name == ".agents" else f.parent, f.parent, project_root(f)}
+        for key in ("entries", "inherits"):
+            if key not in data:
+                continue
+            items = data[key]
+            if not isinstance(items, list):
+                raise fail(f, f"`{key}` is not a list")
+            for item in items:
+                path = item.get("path") if isinstance(item, dict) else None
+                if not isinstance(path, str) or not path:
+                    raise fail(f, f"an `{key}` item has no path")
+                include = item.get("include_only", [])
+                if not isinstance(include, list) or not all(isinstance(x, str) for x in include):
+                    raise fail(f, "`include_only` is not a list of names")
+                target = Path(os.path.expanduser(path))
+                for t in ([target] if target.is_absolute() else [b / target for b in bases]):
+                    if key == "inherits":
+                        plugins_json(t, depth + 1)
+                        continue
+                    plugin_dir(t)
+                    for name in include:  # nested selections, e.g. "group/plugin"
+                        if "/" in name and ".." not in Path(name).parts:
+                            plugin(t / name)
+
+    for root in agy_roots(cwd, add_dirs):
+        servers_in(root / "mcp_config.json")
+        if _stat_kind(root / "plugins") == "dir":
+            plugin_dir(root / "plugins")
+        plugins_json(root / "plugins.json")
+    return found
 
 
 _AGY_HINT_KEYS = ("commandline", "command", "path", "absolutepath", "file", "directorypath", "searchdirectory",

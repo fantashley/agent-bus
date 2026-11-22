@@ -123,7 +123,7 @@ def test_settings_strip_conflicting_peer_args(env):
             "-c", 'model="old6"', "--config", "model=old7", "--config=model=old8", "-c=model=old9",
             "-c", 'model_reasoning_effort="low"', "--config", "model_reasoning_effort=low",
             "--config=model_reasoning_effort=low", "-c=model_reasoning_effort=low",
-            "-c", "other=1", "--profile", "p", "--", "--model", "positional",
+            "-c", "other=1", "--", "--model", "positional",
         ]},
     )
     conf = cfg.Config.load()
@@ -148,7 +148,7 @@ def test_settings_strip_conflicting_peer_args(env):
 
     # Codex: both model and effort set strip every conflicting form, keep unrelated args and anything after `--`.
     cx_both = adapter("codex", conf, {"model": "gpt-new", "effort": "high"})
-    assert cx_both.extra_args() == ["-c", "other=1", "--profile", "p", "--", "--model", "positional"]
+    assert cx_both.extra_args() == ["-c", "other=1", "--", "--model", "positional"]
     inv_cx = cx_both.invocation("hi", None, str(env["repo"]), [])
     assert inv_cx.argv.count("-m") == 1 and inv_cx.argv[inv_cx.argv.index("-m") + 1] == "gpt-new"
     assert 'model_reasoning_effort="high"' in inv_cx.argv

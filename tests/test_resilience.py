@@ -190,3 +190,91 @@ def test_aliases_of_one_binary_are_probed_separately(env, no_spawn):
     cli_version(bus, "codex", str(b))
     assert len(bus._all("SELECT * FROM cli_versions")) == 2
 
+
+
+# ------------------------------------------- Antigravity workspace MCP sources (#32)
+
+
+def agy_check(env, cwd, add_dirs=()):
+    ad = adapter("antigravity", cfg.Config.load())
+    ad.check_isolation(str(cwd), list(add_dirs))
+
+
+def write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data) if not isinstance(data, str) else data)
+
+
+SERVER = {"mcpServers": {"sentinel": {"command": "true"}}}
+
+
+@pytest.mark.parametrize("layout", ["agents-mcp", "agents-plugins-dir", "plugins-json-entry", "inherits",
+                                    "parent-dir", "add-dir", "global-plugins-json"])
+def test_agy_preflight_sees_workspace_and_global_plugin_sources(env, layout):
+    ws = env["tmp"] / "ws"
+    sub = ws / "pkg" / "deep"
+    sub.mkdir(parents=True)
+    cwd, add = ws, []
+    if layout == "agents-mcp":
+        write(ws / ".agents" / "mcp_config.json", SERVER)
+    elif layout == "agents-plugins-dir":
+        write(ws / ".agents" / "plugins" / "s" / "mcp_config.json", SERVER)
+    elif layout == "plugins-json-entry":
+        write(ws / ".agents" / "plugins.json", {"entries": [{"path": "vendor"}]})
+        write(ws / "vendor" / "s" / "mcp_config.json", SERVER)
+    elif layout == "inherits":
+        write(ws / ".agents" / "plugins.json", {"inherits": [{"path": str(ws / "shared.json")}]})
+        write(ws / "shared.json", {"entries": [{"path": str(ws / "vendor")}]})
+        write(ws / "vendor" / "s" / "mcp_config.json", SERVER)
+    elif layout == "parent-dir":  # started in a subdirectory: the repo's .agents still applies
+        write(ws / ".agents" / "mcp_config.json", SERVER)
+        cwd = sub
+    elif layout == "add-dir":
+        other = env["tmp"] / "other"
+        write(other / ".agents" / "mcp_config.json", SERVER)
+        add = [other]
+    else:
+        write(env["tmp"] / "agy" / "plugins.json", {"entries": [{"path": str(ws / "vendor")}]})
+        write(ws / "vendor" / "s" / "mcp_config.json", SERVER)
+    with pytest.raises(PeerSetupError) as e:
+        agy_check(env, cwd, add)
+    assert "sentinel" in str(e.value)
+
+
+def test_agy_preflight_allows_clean_and_disabled_and_fails_closed_on_garbage(env):
+    ws = env["tmp"] / "ws"
+    ws.mkdir()
+    agy_check(env, ws)  # nothing configured
+    write(ws / ".agents" / "mcp_config.json", {"mcpServers": {"s": {"command": "x", "disabled": True}}})
+    agy_check(env, ws)  # disabled servers don't count
+    write(ws / ".agents" / "plugins.json", "{not json")
+    with pytest.raises(PeerSetupError):
+        agy_check(env, ws)
+    write(ws / ".agents" / "plugins.json", {"entries": ["just-a-string"]})
+    with pytest.raises(PeerSetupError):
+        agy_check(env, ws)
+
+
+def test_agy_exempts_only_the_real_agent_bus_registration(env, monkeypatch):
+    from agent_bus import peers
+    real = env["tmp"] / "bin" / "agent-bus"
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+    monkeypatch.setattr(peers.shutil, "which", lambda cmd, path=None: str(real) if cmd == "agent-bus" else None)
+    ok = {"command": str(real), "args": ["mcp", "--agent", "antigravity"]}
+    assert peers.trusted_agent_bus_entry("agent-bus", ok)
+    impostor = env["tmp"] / "evil" / "agent-bus"
+    impostor.parent.mkdir()
+    impostor.write_text("#!/bin/sh\n")
+    for spec in ({**ok, "command": str(impostor)},                    # same name, different binary
+                 {**ok, "args": ["mcp", "--agent", "claude"]},        # wrong identity
+                 {**ok, "env": {"X": "1"}},                           # extra transport keys
+                 {"url": "https://example.invalid/mcp"},
+                 "not-an-object"):
+        assert not peers.trusted_agent_bus_entry("agent-bus", spec), spec
+    assert not peers.trusted_agent_bus_entry("other", ok)
+    ws = env["tmp"] / "ws"
+    write(ws / ".agents" / "mcp_config.json", {"mcpServers": {"agent-bus": {**ok, "command": str(impostor)}}})
+    with pytest.raises(PeerSetupError) as e:
+        agy_check(env, ws)
+    assert "agent-bus" in str(e.value)

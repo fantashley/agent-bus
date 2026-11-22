@@ -120,6 +120,17 @@ CREATE TABLE IF NOT EXISTS cli_versions (  -- `<cli> --version`, once per binary
     version TEXT NOT NULL,              -- the CLI's own version line, or "unknown"
     probed_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS isolation_evidence (  -- live canary outcomes (#32 stage 2)
+    agent TEXT NOT NULL,
+    identity TEXT NOT NULL,             -- launch path, real path, size, mtime
+    recipe TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,          -- args and MCP sources the isolation depends on
+    capability TEXT NOT NULL,           -- write | mcp
+    outcome TEXT NOT NULL,              -- verified | failed | inconclusive
+    reason TEXT,
+    checked_at REAL NOT NULL,
+    PRIMARY KEY (agent, identity, recipe, fingerprint, capability)
+);
 CREATE TABLE IF NOT EXISTS quota_blocks (  -- an agent out of usage (issue #26)
     agent TEXT NOT NULL,
     scope TEXT NOT NULL DEFAULT '',     -- '' for the whole account, else the model it applies to
@@ -787,6 +798,24 @@ class Bus:
         for r in self._all("SELECT * FROM cli_versions ORDER BY probed_at"):
             out[r["agent"]] = dict(r)
         return out
+
+    # ------------------------------------------------------- isolation evidence
+
+    def set_isolation_evidence(self, agent: str, identity: str, recipe: str, fingerprint: str,
+                               capability: str, outcome: str, reason: str | None = None) -> None:
+        """A newer outcome (including failed or inconclusive) replaces an older one."""
+        if outcome not in ("verified", "failed", "inconclusive") or capability not in ("write", "mcp"):
+            raise ValueError(f"bad evidence {capability!r}={outcome!r}")
+        self.conn.execute(
+            "INSERT OR REPLACE INTO isolation_evidence (agent, identity, recipe, fingerprint, capability, outcome,"
+            " reason, checked_at) VALUES (?,?,?,?,?,?,?,?)",
+            (agent, identity, recipe, fingerprint, capability, outcome, reason, _now()))
+
+    def isolation_evidence(self, agent: str, identity: str, recipe: str, fingerprint: str) -> dict[str, dict]:
+        """{capability: row} for exactly this key; anything else counts as no evidence."""
+        return {r["capability"]: dict(r) for r in self._all(
+            "SELECT * FROM isolation_evidence WHERE agent=? AND identity=? AND recipe=? AND fingerprint=?",
+            agent, identity, recipe, fingerprint)}
 
     # ---------------------------------------------------------------- quota
 

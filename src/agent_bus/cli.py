@@ -253,6 +253,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="only update Codex's hooks.json; leave config.toml untouched")
     s.add_argument("--hooks-bin", help="stable agent-bus path for hooks.json (default: --bin)")
 
+    s = sub.add_parser("sentinel-mcp", help="(internal) fake MCP server for isolation canaries")
+    s.add_argument("--log", required=True, help="where to record start, handshake and call")
+    s.add_argument("--nonce", required=True)
+
+    s = sub.add_parser("doctor", help="check each agent's CLI, version, isolation preflight and evidence (no turns)")
+    s.add_argument("--json", action="store_true")
+
     s = sub.add_parser("run-job", help="(internal) run a queued job")
     s.add_argument("job")
 
@@ -326,6 +333,9 @@ def main(argv: list[str] | None = None) -> int:
         from . import mcp_server
         mcp_server.main(args.agent, args.role)
         return 0
+    if args.cmd == "sentinel-mcp":
+        from . import sentinel
+        return sentinel.serve(args.log, args.nonce)
     if args.cmd == "hook":
         from . import hooks
         try:
@@ -392,6 +402,11 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         return cmd_tail(bus, args)
     if args.cmd == "stream":
         return cmd_stream(bus, args)
+    if args.cmd == "doctor":
+        from . import isolation
+        rep = isolation.report(bus, cfg.Config.load(), os.getcwd())
+        print(json.dumps(rep, indent=2) if args.json else isolation.render(rep))
+        return 1 if isolation.failing(rep) else 0
     if args.cmd == "agents":
         from . import quota
         conf = cfg.Config.load()
