@@ -335,11 +335,22 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         if args.json:
             print(json.dumps([thread_summary(t) for t in ts], indent=2))
             return 0
+        if not ts:
+            print("no threads" if args.all else "no open threads (use --all to include closed ones)")
+            return 0
+        rows = []
         for t in ts:
             job = bus.active_job(t["id"])
-            run = f" · worker {job['status']}" if job else ""
-            print(f"{t['id']}  {t['status']:<11} {t['kind']:<10} r{t['round']}/{t['max_rounds']}  "
-                  f"{','.join(t['participants'])}{run}\n    {t['goal'][:100]}")
+            rows.append((t["id"], t["status"], t["kind"], f"{t['round']}/{t['max_rounds']}",
+                         job["status"] if job else "-", ",".join(t["participants"]), t["goal"]))
+        head = ("THREAD", "STATUS", "KIND", "ROUND", "WORKER", "PARTICIPANTS")
+        widths = [max(len(head[i]), *(len(r[i]) for r in rows)) for i in range(5)]
+        line = lambda cols: "  ".join(c.ljust(w) for c, w in zip(cols, widths)) + "  " + cols[5]
+        print(line(head))
+        indent = " " * (widths[0] + 2)
+        for r in rows:
+            print(line(r))
+            print(indent + " ".join(r[6].split())[:100])
         return 0
     if args.cmd == "history":
         if args.json:
