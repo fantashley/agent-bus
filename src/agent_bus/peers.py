@@ -740,10 +740,9 @@ class AntigravityAdapter(Adapter):
             # Actions agy auto-denied because a headless turn can't ask for approval.
             denied = res.get("denied_actions")
             for d in denied if isinstance(denied, list) else []:
+                # The action type only: display_name is free-form text from the CLI.
                 if isinstance(d, dict) and isinstance(d.get("action"), str) and d["action"]:
-                    label = d.get("display_name")
-                    st.denied.append(_safe_name(d["action"])
-                                     + (f" ({label})" if _is_name(label) else ""))
+                    st.denied.append(_safe_name(d["action"]))
 
     def incomplete(self, st):
         # agy 1.5.13 in plan mode with --sandbox (live probe, 2026-11-23): a terminal command
@@ -768,14 +767,10 @@ class AntigravityAdapter(Adapter):
 _NAME = re.compile(r"[A-Za-z0-9_.:-]{1,40}")
 
 
-def _is_name(value: object) -> bool:
-    return isinstance(value, str) and _NAME.fullmatch(value) is not None
-
-
 def _safe_name(value: object) -> str:
     """A CLI-supplied identifier fit for a thread notice: a plain name as given, else "?".
     Never filtered down from free-form text, which could keep fragments of arguments."""
-    return value if _is_name(value) else "?"
+    return value if isinstance(value, str) and _NAME.fullmatch(value) else "?"
 
 
 _AGY_HINT_KEYS = ("commandline", "command", "path", "absolutepath", "file", "directorypath", "searchdirectory",

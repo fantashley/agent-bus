@@ -193,7 +193,7 @@ def test_agy_denied_command_is_an_incomplete_turn_not_drift(env, monkeypatch):
     res = agy_run(env, monkeypatch, "denied", seen)
     assert not res.ok and not res.format_changed and res.incomplete
     assert res.error.startswith("PEER_TURN_INCOMPLETE: antigravity")
-    assert "auto-denied 1 action(s)" in res.error and "command (Bash)" in res.error
+    assert "auto-denied 1 action(s)" in res.error and "give: command;" in res.error and "Bash" not in res.error
     assert "failed tool(s): run_command" in res.error
     assert "jj log" not in res.error  # names only, never arguments
     assert res.external_id and res.usage == {"input": 12732, "output": 652, "cache_read": 0, "thinking": 366}
@@ -231,12 +231,12 @@ def test_agy_denial_notice_carries_plain_names_only(env):
         "step_type": "tool", "step_index": 1, "state": "ERROR", "tool_name": "run_command --rm"}}, st, lambda k, t: None)
     ad.parse_line({"event": "result", "result": {"status": "SUCCESS", "response": "", "denied_actions": [
         {"action": {"cmd": "rm -rf secret"}, "display_name": "Bash"},  # not a name: dropped
-        {"action": "command", "display_name": "Run rm -rf secret"},    # free-form label: omitted
-        {"action": "command", "display_name": "Bash"},
+        {"action": "command", "display_name": "db-prod.key"},          # free-form label: never shown
+        {"action": "rm -rf secret"},                                   # not a plain name: "?"
     ]}}, st, lambda k, t: None)
     why = ad.incomplete(st)
-    assert "rm" not in why and "secret" not in why
-    assert "auto-denied 2 action(s)" in why and "command, command (Bash)" in why
+    assert "rm" not in why and "secret" not in why and "db-prod" not in why
+    assert "auto-denied 2 action(s)" in why and "give: command, ?;" in why
     assert "failed tool(s): ?" in why
 
 
