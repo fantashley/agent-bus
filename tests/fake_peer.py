@@ -14,7 +14,8 @@ Behaviour is driven by env vars so tests can script outcomes:
   FAKE_BEHAVIOUR=newevents  also emit event types no adapter knows
   FAKE_BEHAVIOUR=denied  (antigravity) agy's headless auto-denial of run_command: exit 0, no
                   reply, denied_actions in the result.  denied_reply: the same, then a reply;
-                  unfinished: the tool never reaches an end state; toolerror: ERROR, no denial
+                  denied_blank: a whitespace-only response; unfinished: the tool never reaches an end
+                  state; toolerror: ERROR, no denial
   FAKE_MCP_LIST   what `codex mcp list --json` prints
 Round-1 prompts get a proposal; later prompts agree with the lowest proposal id
 mentioned (or object, for `stubborn`).
@@ -131,11 +132,12 @@ if behaviour == "silent" or (repair and listed("FAKE_SILENT_REPAIR")):
     sys.exit(0)
 if agent == "antigravity" and repair and os.environ.get("FAKE_AGY_DENIED_REPAIR"):
     behaviour = "denied"
-if agent == "antigravity" and behaviour in ("denied", "denied_reply", "unfinished", "toolerror"):
+if agent == "antigravity" and behaviour in ("denied", "denied_reply", "denied_blank", "unfinished", "toolerror"):
     # The headless denial agy 1.5.13 sends in plan mode with --sandbox (live probe,
     # 2026-11-23): run_command goes ACTIVE then ERROR, the result is SUCCESS with an empty
     # response and lists denied_actions, exit 0.  Variants: denied_reply also answers from
-    # context; unfinished leaves the tool with no end state; toolerror has no denial.
+    # context; denied_blank's response is whitespace only; unfinished leaves the tool with
+    # no end state; toolerror has no denial.
     su = lambda **kw: out({"event": "step_update", "step_update": {"conversation_id": sid, **kw}})  # noqa: E731
     tool = {"step_type": "tool", "tool_name": "run_command",
             "tool_info": {"name": "run_command", "parameters": {"CommandLine": "jj log"}}}
@@ -146,7 +148,7 @@ if agent == "antigravity" and behaviour in ("denied", "denied_reply", "unfinishe
     su(step_index=2, state="ACTIVE", **tool)
     if behaviour != "unfinished":
         su(step_index=2, state="ERROR", **tool)
-    response = ""
+    response = "  \n" if behaviour == "denied_blank" else ""
     if behaviour == "denied_reply":
         response = reply
         su(step_index=3, state="ACTIVE", step_type="agent_response", text_delta=reply)

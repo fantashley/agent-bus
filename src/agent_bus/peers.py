@@ -87,6 +87,9 @@ class Adapter:
     # Stream event types this adapter understands.  Anything else is counted and
     # reported, never fatal on its own: CLIs add event types often.
     known_events: frozenset = frozenset()
+    # Whether a headless turn can search the web, so the prompt doesn't offer a tool the
+    # CLI would deny (issue #46).
+    web_search: bool = True
 
     def event_type(self, obj: dict) -> str | None:
         t = obj.get("type")
@@ -245,7 +248,8 @@ class Adapter:
         # missing session id, or a stopped turn nothing explains, stays drift.
         why = self.incomplete(st) if missing == ["a reply"] else None
         if why:
-            return TurnResult(ok=False, text=text, external_id=st.external_id, usage=st.usage, incomplete=True,
+            # No reply text at all: a whitespace-only response must not reach JSON repair.
+            return TurnResult(ok=False, text="", external_id=st.external_id, usage=st.usage, incomplete=True,
                               error=f"PEER_TURN_INCOMPLETE: {self.agent} {why}")
         if missing:
             return TurnResult(ok=False, text=text, external_id=st.external_id, usage=st.usage, format_changed=True,
@@ -621,6 +625,7 @@ class AntigravityAdapter(Adapter):
     agent = "antigravity"
     # 2: headless tool guidance in every prompt; denied actions reported as an incomplete turn.
     recipe = "2"
+    web_search = False  # denied headless (agy 1.5.13); see prompts.AGY_HEADLESS
     known_events = frozenset({"init", "step_update", "result"})
 
     def event_type(self, obj):
@@ -687,14 +692,16 @@ class AntigravityAdapter(Adapter):
             if kind == "tool" and isinstance(idx, int):
                 # A tool step ends DONE (fixtures) or ERROR (a denied run_command, agy 1.5.13
                 # probe 2026-11-23).  Only one with no end state is still pending at exit.
+                # A frame with no state changes nothing; an end frame that omits the tool's
+                # name keeps the one its ACTIVE frame gave.
                 info = su.get("tool_info") if isinstance(su.get("tool_info"), dict) else {}
-                name = su.get("tool_name") or info.get("name") or "tool"
+                name = su.get("tool_name") or info.get("name")
                 if state == "ACTIVE":
-                    st.pending[idx] = name
-                else:
-                    st.pending.pop(idx, None)
+                    st.pending[idx] = name or st.pending.get(idx) or "tool"
+                elif state:
+                    prev = st.pending.pop(idx, None)
                     if state == "ERROR":
-                        st.failed_tools.add(_safe_name(name))
+                        st.failed_tools.add(_safe_name(name or prev or "tool"))
             if kind == "agent_response":
                 if su.get("text_delta"):
                     st.text_parts.append(su["text_delta"])
@@ -733,15 +740,20 @@ class AntigravityAdapter(Adapter):
             # Actions agy auto-denied because a headless turn can't ask for approval.
             denied = res.get("denied_actions")
             for d in denied if isinstance(denied, list) else []:
-                if isinstance(d, dict) and d.get("action"):
-                    st.denied.append(_safe_name(d.get("action"))
-                                     + (f" ({_safe_name(d['display_name'])})" if d.get("display_name") else ""))
+                if isinstance(d, dict) and isinstance(d.get("action"), str) and d["action"]:
+                    label = d.get("display_name")
+                    st.denied.append(_safe_name(d["action"])
+                                     + (f" ({label})" if _is_name(label) else ""))
 
     def incomplete(self, st):
         # agy 1.5.13 in plan mode with --sandbox (live probe, 2026-11-23): a terminal command
         # needs approval, so headless it is auto-denied.  The run_command step ends ERROR,
         # the result is SUCCESS with an empty response and lists denied_actions, and agy
         # exits 0.  Names only in the diagnostic, never arguments.
+        # Only a recognised result with an explicitly blank response counts: anything else
+        # (no result, a response of another type) may be a changed schema, so it stays drift.
+        if not isinstance(st.final, str) or st.final.strip():
+            return None
         tools = f"; failed tool(s): {', '.join(sorted(st.failed_tools))}" if st.failed_tools else ""
         if st.denied:
             return (f"ended its turn without a reply after it auto-denied {len(st.denied)} action(s) that need "
@@ -753,9 +765,17 @@ class AntigravityAdapter(Adapter):
         return None  # nothing in the stream explains it: format drift
 
 
+_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,40}")
+
+
+def _is_name(value: object) -> bool:
+    return isinstance(value, str) and _NAME.fullmatch(value) is not None
+
+
 def _safe_name(value: object) -> str:
-    """A CLI-supplied identifier fit for a thread notice."""
-    return re.sub(r"[^A-Za-z0-9_.:-]", "", str(value))[:40] or "?"
+    """A CLI-supplied identifier fit for a thread notice: a plain name as given, else "?".
+    Never filtered down from free-form text, which could keep fragments of arguments."""
+    return value if _is_name(value) else "?"
 
 
 _AGY_HINT_KEYS = ("commandline", "command", "path", "absolutepath", "file", "directorypath", "searchdirectory",

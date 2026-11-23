@@ -212,8 +212,67 @@ def test_agy_unexplained_missing_reply_is_still_drift(env, monkeypatch):
         res = agy_run(env, monkeypatch, behaviour)
         assert res.format_changed and not res.incomplete and res.error.startswith("PEER_FORMAT_CHANGED"), behaviour
     # A tool that looks unfinished among events we don't understand may just be unparsed.
-    st = StreamState(pending={2: "run_command"}, unknown={"brand_new_event": 1})
-    assert adapter("antigravity", cfg.Config.load()).incomplete(st) is None
+    ad = adapter("antigravity", cfg.Config.load())
+    st = StreamState(pending={2: "run_command"}, unknown={"brand_new_event": 1}, final="")
+    assert ad.incomplete(st) is None
+    # Without a recognised result carrying an explicitly blank response, nothing explains it:
+    # a missing result, or a response field whose type changed, may hide a new schema.
+    for final in (None, "answer"):
+        assert ad.incomplete(StreamState(pending={2: "run_command"}, final=final)) is None
+        assert ad.incomplete(StreamState(denied=["command"], final=final)) is None
+    assert ad.incomplete(StreamState(pending={2: "run_command"}, final=" \n"))
+
+
+def test_agy_denial_notice_carries_plain_names_only(env):
+    from agent_bus.peers import StreamState
+    ad = adapter("antigravity", cfg.Config.load())
+    st = StreamState()
+    ad.parse_line({"event": "step_update", "step_update": {
+        "step_type": "tool", "step_index": 1, "state": "ERROR", "tool_name": "run_command --rm"}}, st, lambda k, t: None)
+    ad.parse_line({"event": "result", "result": {"status": "SUCCESS", "response": "", "denied_actions": [
+        {"action": {"cmd": "rm -rf secret"}, "display_name": "Bash"},  # not a name: dropped
+        {"action": "command", "display_name": "Run rm -rf secret"},    # free-form label: omitted
+        {"action": "command", "display_name": "Bash"},
+    ]}}, st, lambda k, t: None)
+    why = ad.incomplete(st)
+    assert "rm" not in why and "secret" not in why
+    assert "auto-denied 2 action(s)" in why and "command, command (Bash)" in why
+    assert "failed tool(s): ?" in why
+
+
+def test_agy_tool_state_tracking_tolerates_partial_frames(env):
+    from agent_bus.peers import StreamState
+    ad = adapter("antigravity", cfg.Config.load())
+    st = StreamState()
+    step = lambda **kw: ad.parse_line({"event": "step_update", "step_update": {  # noqa: E731
+        "step_type": "tool", "step_index": 2, **kw}}, st, lambda k, t: None)
+    step(state="ACTIVE", tool_name="run_command")
+    step()  # a frame with no state leaves the tool pending
+    assert st.pending == {2: "run_command"}
+    step(state="ERROR")  # the end frame omits the name: the ACTIVE frame's name is kept
+    assert st.pending == {} and st.failed_tools == {"run_command"}
+
+
+def test_agy_whitespace_only_denial_reaches_no_repair(env, no_spawn, monkeypatch):
+    bus = env["bus"]
+    res = agy_run(env, monkeypatch, "denied_blank")
+    assert res.incomplete and res.text == ""
+    tid = Service(bus, HUMAN).start_discussion("q", peers=["codex", "antigravity"], max_rounds=2)["thread"]["id"]
+    run_job(bus, tid)
+    msgs = bus.history(tid)["messages"]
+    assert not [m for m in msgs if m["sender"] == "antigravity"]  # no repaired proposal or vote
+    assert [m for m in msgs if m["sender"] == SYSTEM
+            and m["body"].startswith("antigravity could not take its turn: PEER_TURN_INCOMPLETE")]
+    agy = calls(env, "antigravity")
+    assert agy and not any("did not end with the JSON object" in c["prompt"] for c in agy)
+
+
+def test_preamble_offers_web_search_only_where_it_works(env, no_spawn):
+    t = {"id": "t-x", "participants": ["codex", "antigravity"], "initiator": HUMAN, "repo": "/r"}
+    w = Worker.__new__(Worker)
+    assert "search the web" in w.preamble("codex", t) and "search the web" in w.preamble("claude", t)
+    agy = w.preamble("antigravity", t)
+    assert "search the web" not in agy and "You may read files in /r if that helps you answer." in agy
 
 
 def test_agy_reply_after_a_denial_is_a_normal_turn(env, monkeypatch):
