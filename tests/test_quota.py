@@ -338,18 +338,18 @@ def stance(bus, tid, agent, kind, on=None, stance="agree"):
     ([], True),                                               # never posted
 ])
 def test_stalemate_rule_is_deterministic(env, no_spawn, setup, expected):
-    from agent_bus import quota
+    from agent_bus import unvotable
     bus = env["bus"]
     tid = Service(bus, HUMAN).start_discussion("q", peers=["claude", "codex", "antigravity"])["thread"]["id"]
     bus.set_thread(tid, round=2, blind=0)
     for s in setup:
         stance(bus, tid, *s)
     bus.set_quota_block("codex", time.time() + 600, "heuristic", "q")
-    assert quota.stalemate(bus, cfg.Config.load(), bus.thread(tid)) is expected
+    assert bool(unvotable.stalemate(bus, cfg.Config.load(), bus.thread(tid))) is expected
 
 
 def test_two_blocked_peers_backing_different_proposals_is_a_stalemate(env, no_spawn):
-    from agent_bus import quota
+    from agent_bus import unvotable
     bus = env["bus"]
     tid = Service(bus, HUMAN).start_discussion("q", peers=["claude", "codex", "antigravity"])["thread"]["id"]
     bus.set_thread(tid, round=2, blind=0)
@@ -357,7 +357,7 @@ def test_two_blocked_peers_backing_different_proposals_is_a_stalemate(env, no_sp
     stance(bus, tid, "antigravity", "proposal")
     for a in ("codex", "antigravity"):
         bus.set_quota_block(a, time.time() + 600, "heuristic", "q")
-    assert quota.stalemate(bus, cfg.Config.load(), bus.thread(tid))
+    assert unvotable.stalemate(bus, cfg.Config.load(), bus.thread(tid))
 
 
 def test_all_peers_blocked_on_one_proposal_hands_over_without_spinning(env, no_spawn, monkeypatch):
@@ -365,12 +365,87 @@ def test_all_peers_blocked_on_one_proposal_hands_over_without_spinning(env, no_s
     sid = bus.register_session("claude", env={})
     me = Service(bus, "claude", sid)
     tid = me.start_discussion("q", peers=["codex"], max_rounds=4)["thread"]["id"]
-    bus.conn.execute("UPDATE sessions SET last_seen=0 WHERE id=?", (sid,))  # initiator absent: no grace waits
+    me.send("my own plan", thread=tid, kind="proposal")  # P1: a competing initiator position
+    bus.conn.execute("UPDATE sessions SET last_seen=0 WHERE id=?", (sid,))  # then absent: no grace waits
     monkeypatch.setenv("FAKE_EXHAUSTED_LATER", "codex")
-    run_job(bus, tid)  # round 1: codex proposes P1; the initiator is absent
+    run_job(bus, tid)  # round 1: codex proposes P2; round 2: codex runs out of usage
     t = bus.thread(tid)
-    assert t["round"] <= 2  # no rounds burnt on a peer that can't move
-    assert len(calls(env, "codex")) <= 2
+    st = bus.standings(tid)["codex"]
+    assert (st["proposal_id"], st["stance"]) == ("P2", "agree")
+    assert bus.quota_block("codex")  # the quota path really ran, in round 2
+    assert t["status"] == "open" and t["round"] == 2  # no round 3 for a peer that can't move
+    assert len(calls(env, "codex")) == 2
+    last = bus.history(tid)["messages"][-1]
+    assert last["recipient"] == "claude" and "All peers agree on P2" in last["body"]
+
+
+def advance_setup(bus, peers=("codex",)):
+    """An agent-initiated discussion after round 1: each peer backs its own proposal and
+    the initiator backs a competing one."""
+    me = Service(bus, "claude", bus.register_session("claude", env={}))
+    tid = me.start_discussion("q", peers=list(peers), max_rounds=4)["thread"]["id"]
+    for j in bus.jobs(tid):
+        bus.conn.execute("UPDATE jobs SET status='done' WHERE id=?", (j["id"],))
+    bus.set_thread(tid, round=1, blind=0)
+    return me, tid
+
+
+def test_advance_is_refused_when_every_peer_is_blocked(env, no_spawn):
+    bus = env["bus"]
+    me, tid = advance_setup(bus)
+    bus.post(tid, "codex", "codex plan", kind="proposal")  # P1
+    me.send("claude plan", thread=tid, kind="proposal")  # P2
+    bus.set_quota_block("codex", time.time() + 600, "heuristic", "q")
+    jobs = len(bus.jobs(tid))
+    with pytest.raises(BusError) as e:
+        me.advance_discussion(tid)
+    assert e.value.code == "USAGE_EXHAUSTED"
+    assert "no peer can take another round" in e.value.message and "Every peer backs P1" in e.value.message
+    assert len(bus.jobs(tid)) == jobs and bus.thread(tid)["round"] == 1  # nothing queued, no round spent
+    with pytest.raises(BusError) as e:  # the human is told who can settle it
+        Service(bus, HUMAN).advance_discussion(tid)
+    assert "claude (initiator) can settle it" in e.value.message
+    me.send("ok", thread=tid, kind="vote", on="P1", stance="agree")  # the initiator can still settle it
+    assert bus.thread(tid)["status"] == "resolved"
+
+
+def test_block_after_advance_is_queued_spends_no_round(env, no_spawn):
+    bus = env["bus"]
+    me, tid = advance_setup(bus)
+    bus.post(tid, "codex", "codex plan", kind="proposal")  # P1
+    me.send("claude plan", thread=tid, kind="proposal")  # P2
+    me.advance_discussion(tid)
+    bus.set_quota_block("codex", time.time() + 600, "heuristic", "q")  # arrives after admission
+    run_job(bus, tid)
+    t = bus.thread(tid)
+    assert t["status"] == "open" and t["round"] == 1
+    assert calls(env, "codex") == []
+    bodies = [m["body"] for m in bus.history(tid)["messages"] if m["sender"] == SYSTEM]
+    assert any("codex is out of usage" in b for b in bodies)
+    assert "All peers agree on P1. Waiting for claude" in bodies[-1]
+    # Once codex has usage again, the same advance runs: the first one spent no round.
+    bus.clear_quota("codex")
+    assert not me.advance_discussion(tid)["job"].get("deduplicated")
+    run_job(bus, tid)
+    assert bus.thread(tid)["round"] == 2 and len(calls(env, "codex")) == 1
+
+
+def test_block_between_the_check_and_the_round_spends_no_round(env, no_spawn, monkeypatch):
+    from agent_bus import unvotable
+    bus = env["bus"]
+    me, tid = advance_setup(bus)
+    bus.post(tid, "codex", "codex plan", kind="proposal")  # P1
+    me.send("claude plan", thread=tid, kind="proposal")  # P2
+    me.advance_discussion(tid)
+    real = unvotable.assess
+
+    def assess(*a):  # another worker records a block right after the first check
+        s = real(*a)
+        bus.set_quota_block("codex", time.time() + 600, "heuristic", "q")
+        return s
+    monkeypatch.setattr(unvotable, "assess", assess)
+    run_job(bus, tid)
+    assert bus.thread(tid)["round"] == 1 and calls(env, "codex") == []
 
 
 def test_whoami_and_clear_quota_cli(env, no_spawn, capsys):
@@ -442,12 +517,14 @@ def test_stalemate_from_another_jobs_block_names_the_peer(env, no_spawn):
 
 
 def test_stalemate_cleared_before_closing_leaves_the_discussion_open(env, no_spawn, monkeypatch):
-    from agent_bus import quota
+    from agent_bus import unvotable
     bus = env["bus"]
     tid = Service(bus, HUMAN).start_discussion("q", peers=["claude", "codex"])["thread"]["id"]
     w = Worker(bus, bus.jobs(tid)[-1]["id"])
     monkeypatch.setattr(w, "fenced", contextlib.nullcontext)  # no lease needed for this check
     # The quick check sees a stalemate; by the time the transaction re-reads, the block is gone.
-    monkeypatch.setattr(quota, "stalemate", lambda *a: True)
+    real = unvotable.stalemate
+    quick = iter([{"codex": {}}])
+    monkeypatch.setattr(unvotable, "stalemate", lambda *a: next(quick, None) or real(*a))
     assert w.close_on_stalemate() is False
     assert bus.thread(tid)["status"] == "open"

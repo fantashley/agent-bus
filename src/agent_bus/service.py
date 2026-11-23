@@ -14,7 +14,7 @@ from typing import Any
 
 from . import config as cfg
 from . import quota
-from . import rex, worker
+from . import rex, unvotable, worker
 from .db import HUMAN, SYSTEM, Bus, BusError, wrap_peer
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -232,11 +232,21 @@ class Service:
         for p in t["participants"]:
             if p != t["initiator"]:
                 self.config.require_available(p, "peer")
-        # Out-of-usage peers keep their recorded votes; refuse only when no round can help.
-        blocked = quota.stalemate_blocks(self.bus, self.config, t)
-        if blocked:
-            raise BusError("USAGE_EXHAUSTED", "no consensus is possible until these peers have usage again: "
-                           + " ".join(quota.message(p, "peer", b) for p, b in blocked.items()))
+        # Peers that can't vote again (out of usage, format drift) keep their recorded
+        # votes; refuse only when another round can't help.
+        s = unvotable.assess(self.bus, self.config, t)
+        if s.stalemate:
+            raise BusError(unvotable.code(s.stuck), "no consensus is possible until these peers can vote again: "
+                           + unvotable.explain(s.stuck, thread))
+        if s.everyone:
+            # No headless peer can move, so a round would only be spent (issue #39); the
+            # initiator can still settle it by voting on the proposal they all back.
+            how = (f"{t['initiator']} (initiator) can settle it by voting on it" if self.agent == HUMAN else
+                   f"vote on it with send(thread=\"{thread}\", kind=\"vote\", on=\"{s.backs}\", "
+                   "stance=\"agree\"|\"object\")")
+            raise BusError(unvotable.code(s.stuck), "no peer can take another round: "
+                           + unvotable.explain(s.stuck, thread)
+                           + f" Every peer backs {s.backs}: {how}, or retry once they can vote again.")
         job = self._dispatch(thread, "discussion", {"mode": "advance"}, f"{thread}:advance:{t['round'] + 1}")
         return {"thread": thread_summary(t), "job": job}
 
@@ -361,6 +371,9 @@ class Service:
         # a stale or wrong one doesn't stop the retry.  A real limit is found again.
         cleared = [p for p in peers if self.bus.clear_quota(p, quota.model_key(quota.effective_model(
             self.config, p, self.config.peer_settings(p, overrides.get(p)))))]
+        # And the format drift that kept peers out of this discussion's rounds: the human
+        # resumes once the adapter handles the new format, and a real drift is found again.
+        drifted = self.bus.clear_peer_drift(thread)
         fields: dict[str, Any] = {"status": "open"}
         count = self.bus._one("SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender NOT IN (?,?)",
                               thread, HUMAN, SYSTEM)["n"]
@@ -371,7 +384,8 @@ class Service:
         self.bus.set_thread(thread, **fields)
         self.bus.post(thread, SYSTEM, (f"Resumed by the human user with {extra_rounds} more round(s)."
                       if t["kind"] == "discussion" else "Resumed by the human user.")
-                      + (f" Cleared out-of-usage state for {', '.join(cleared)}." if cleared else ""),
+                      + (f" Cleared out-of-usage state for {', '.join(cleared)}." if cleared else "")
+                      + (f" Cleared format-drift state for {', '.join(drifted)}." if drifted else ""),
                       kind="status")
         res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(thread))}
         if t["kind"] == "discussion":
