@@ -395,3 +395,99 @@ def test_whitespace_stdout_falls_back_to_stderr_for_the_version(env):
     script.write_text(f"#!{sys.executable}\nimport sys\nprint()\nprint('tool 4.5.6', file=sys.stderr)\n")
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     assert cli_version(env["bus"], "codex", str(script), cwd=str(env["tmp"])) == "tool 4.5.6"
+
+
+# ------------------------------------------------- version probe timeout cooldown (#41)
+
+
+def _slow_cli(env, name="slow-cli"):
+    """A CLI whose ``--version`` logs each run and hangs while ``<name>.slow`` exists."""
+    import stat
+    import sys
+    script = env["tmp"] / name
+    runs, slow = env["tmp"] / f"{name}.runs", env["tmp"] / f"{name}.slow"
+    script.write_text(f"#!{sys.executable}\nimport os, time\n"
+                      f"open({str(runs)!r}, 'a').write('x')\n"
+                      f"while os.path.exists({str(slow)!r}):\n    time.sleep(0.05)\n"
+                      "print('slow 2.0.0')\n")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    slow.touch()
+    return str(script), (lambda: len(runs.read_text()) if runs.exists() else 0), slow
+
+
+def _concurrently(n, fn):
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(n) as pool:
+        return list(pool.map(lambda _: fn(), range(n)))
+
+
+def test_timed_out_version_probe_cools_down_then_recovers(env, monkeypatch):
+    from agent_bus import peers
+    bus = env["bus"]
+    monkeypatch.setattr(peers, "VERSION_PROBE_TIMEOUT_S", 0.5)
+    script, runs, slow = _slow_cli(env)
+    key = cli_identity(script)[1]
+
+    assert cli_version(bus, "codex", script) == "unknown"
+    assert runs() == 1
+    # Not cached as the binary's answer: only a cooldown is recorded.
+    assert bus.cli_version(key) is None
+    assert bus.cli_version_retry_after(key) > time.time() + peers.VERSION_TIMEOUT_COOLDOWN_S - 5
+
+    # During the cooldown: "unknown" at once, without another probe.
+    slow.unlink()
+    started = time.monotonic()
+    assert cli_version(bus, "codex", script) == "unknown"
+    assert time.monotonic() - started < 0.3 and runs() == 1
+
+    # Once it expires, the next caller probes again and the answer is cached as usual.
+    bus.set_cli_version_timeout(key, "codex", script, time.time() - 1)
+    assert cli_version(bus, "codex", script) == "slow 2.0.0"
+    assert runs() == 2
+    assert bus.cli_version(key) == "slow 2.0.0" and bus.cli_version_retry_after(key) is None
+    assert cli_version(bus, "codex", script) == "slow 2.0.0" and runs() == 2
+
+
+def test_concurrent_callers_share_one_version_probe(env, monkeypatch):
+    from agent_bus import peers
+    bus = env["bus"]
+    monkeypatch.setattr(peers, "VERSION_PROBE_TIMEOUT_S", 0.5)
+    script, runs, slow = _slow_cli(env)
+    key = cli_identity(script)[1]
+
+    # Callers that arrive during a probe that times out wait for it, then share its
+    # "unknown" rather than each queueing a probe of their own.
+    assert _concurrently(4, lambda: cli_version(bus, "codex", script)) == ["unknown"] * 4
+    assert runs() == 1
+
+    # After the cooldown, concurrent callers share a single fresh probe.
+    slow.unlink()
+    bus.set_cli_version_timeout(key, "codex", script, time.time() - 1)
+    assert _concurrently(4, lambda: cli_version(bus, "codex", script)) == ["slow 2.0.0"] * 4
+    assert runs() == 2
+
+
+def test_upgrade_drops_unknown_versions_cached_by_older_releases(env):
+    """Codex review of PR #49: before #41 a timed-out probe was cached as "unknown" for
+    good.  Opening such a database once makes those binaries eligible for a new probe."""
+    from agent_bus.db import Bus
+    bus = env["bus"]
+    command = cfg.Config.load().peer_command("codex")
+    key = cli_identity(command)[1]
+    bus.set_cli_version(key, "codex", command, "unknown")
+    bus.set_cli_version("other-binary", "claude", "/x/claude", "claude 1.0.0")
+    bus.conn.execute("DROP TABLE cli_version_timeouts")  # as an older release left it
+    upgraded = Bus(bus.path)
+    try:
+        assert upgraded.cli_version(key) is None
+        assert upgraded.cli_version("other-binary") == "claude 1.0.0"
+        assert cli_version(upgraded, "codex", command) == "fake-codex 0.0.0"
+        # Only once: a definite "unknown" cached after the upgrade stays cached.
+        upgraded.set_cli_version("gone", "codex", "/x/codex", "unknown")
+    finally:
+        upgraded.close()
+    again = Bus(bus.path)
+    try:
+        assert again.cli_version("gone") == "unknown"
+    finally:
+        again.close()
