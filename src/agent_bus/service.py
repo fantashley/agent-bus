@@ -300,35 +300,46 @@ class Service:
         self.config.require_available(reviewer, "reviewer")
         self._check_review_ids(base_commit_id, head_commit_id, prev_head_commit_id, change_id)
         repo_path = self._allowed_repo(repo)
+        request = [base_commit_id, prev_head_commit_id, head_commit_id]
         refs = {"reviewer": reviewer, "repo": repo_path, "change_id": change_id,
                 "base_commit_id": base_commit_id, "head_commit_id": head_commit_id,
                 "prev_head_commit_id": prev_head_commit_id, "focus": focus,
                 "heads": [head_commit_id]}  # every head this thread has been asked to review
         if override:
             refs["peer_settings"] = {reviewer: override}
-        # The requester is part of the key: two agents asking for the same review each get
-        # their own thread, so each verdict reaches the agent that asked.
-        key = (f"review:{self.agent}:{repo_path}:{reviewer}:"
-               f"{prev_head_commit_id or base_commit_id}:{head_commit_id}")
         self.bus.reap()
         # Follow-up pass: same thread, so the worker resumes the reviewer's conversation.
         # The lineage lookup and every busy/stale decision and write happen in one IMMEDIATE
         # transaction, so concurrent follow-ups serialize and a loser changes nothing.
         with self.bus.tx():
-            previous = (self._previous_review(reviewer, repo_path, prev_head_commit_id)
+            previous = (self._previous_review(reviewer, repo_path, prev_head_commit_id, request)
                         if prev_head_commit_id else None)
             if previous:
                 t = previous
-                current = (t["refs"] or {}).get("head_commit_id")
+                old = t["refs"] or {}
+                current = old.get("head_commit_id")
                 active = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND status IN ('queued','running')",
                                        t["id"])
-                same = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND dedupe_key=?"
-                                     " AND status IN ('queued','running','done') ORDER BY created_at DESC LIMIT 1",
-                                     t["id"], key)
-                if same:
-                    # This exact request (same prev head -> head) is queued, running or done:
-                    # idempotent, whatever happened to the thread since.
-                    job_row, created = self.bus._job(same), False
+                # Idempotent only as a repeat of the request that pinned the thread's current
+                # revision (#59); an older request is new work, or stale.
+                repeat = self._pinned_request(t) == request
+                same = self._revision_pass(t) if repeat else None
+                if repeat and same is None:
+                    # Pinned to this request with no pass for it (a thread #59 left without
+                    # one): queue that pass now, or report the one already running.
+                    self._quota_check(reviewer, "reviewer", (old.get("peer_settings") or {}).get(reviewer))
+                    autoresume.forget(self.bus, t["id"])
+                    # Its reviewer's session may never have seen the previous head: full diff.
+                    self.bus.set_thread(t["id"], status="open", refs=json.dumps({**old, "full_diff": True}))
+                    job_row, created = self.bus.create_job(t["id"], "review",
+                                                           {"mode": "followup", "round": t["round"]},
+                                                           f"review:{t['id']}:{t['round']}")
+                elif same and same["status"] in ("queued", "running", "done"):
+                    job_row, created = same, False
+                elif same:
+                    raise BusError("REVIEW_FAILED", f"the pass for this request on {t['id']} {same['status']} "
+                                   f"({same.get('error') or 'see the thread'}); ask the human user to run "
+                                   f"`agent-bus resume {t['id']}` to retry it")
                 elif active:
                     raise BusError("REVIEW_BUSY", f"{reviewer} is still on a previous pass ({t['id']}); "
                                    "wait for that verdict, then request this head again")
@@ -336,7 +347,7 @@ class Service:
                     raise BusError("REVIEW_STALE", f"{t['id']} has moved on to head {str(current)[:12]}; "
                                    "use that as prev_head_commit_id")
                 else:
-                    kept = ((t["refs"] or {}).get("peer_settings") or {}).get(reviewer, {})
+                    kept = (old.get("peer_settings") or {}).get(reviewer, {})
                     # The follow-up runs with the thread's settings plus any new ones.
                     self._quota_check(reviewer, "reviewer", {**kept, **override})
                     if focus:
@@ -344,33 +355,92 @@ class Service:
                     refs["heads"] = [*self._heads(t), head_commit_id]
                     if kept or override:
                         refs["peer_settings"] = {reviewer: {**kept, **override}}
-                    if (t["refs"] or {}).get("auto_resumes"):
-                        refs["auto_resumes"] = t["refs"]["auto_resumes"]  # still counts for this thread
+                    if old.get("auto_resumes"):
+                        refs["auto_resumes"] = old["auto_resumes"]  # still counts for this thread
                     autoresume.forget(self.bus, t["id"])  # this pass replaces the parked one
-                    self.bus.set_thread(t["id"], refs=json.dumps(refs), status="open", round=t["round"] + 1,
+                    self.bus.set_thread(t["id"], status="open", round=t["round"] + 1,
                                         max_rounds=t["round"] + 1,
                                         goal=f"Review {change_id or head_commit_id[:12]} in "
                                              f"{os.path.basename(repo_path)}")
-                    job_row, created = self.bus.create_job(t["id"], "review", {"mode": "followup"}, key)
-        if previous:
-            if created:
-                worker.spawn(job_row["id"])
-            job = self._job_info(job_row, created)
-        else:
-            self._quota_check(reviewer, "reviewer", override)
-            goal = f"Review {change_id or head_commit_id[:12]} in {os.path.basename(repo_path)}"
-            t = self.bus.create_thread("review", goal, [self.agent, reviewer], initiator=self.agent,
-                                       initiator_session=self.session_id, max_rounds=1,
-                                       max_messages=self.config.max_messages, repo=repo_path, refs=refs)
-            t["round"] = 1
-            self.bus.set_thread(t["id"], round=1)
-            job = self._dispatch(t["id"], "review", {"mode": "first"}, key)
-            if job.get("deduplicated"):
-                self.bus.set_thread(t["id"], status="cancelled")
-                t = self.bus.thread(job["thread"])
+                    # Scoped to the thread and round: create_job's global dedupe lookup must
+                    # never hand back another thread's job (#59) or an earlier round's.
+                    job_row, created = self.bus.create_job(t["id"], "review",
+                                                           {"mode": "followup", "round": t["round"] + 1},
+                                                           f"review:{t['id']}:{t['round'] + 1}")
+                    self.bus.set_thread(t["id"], refs=json.dumps(refs))
+            else:
+                t, job_row, created = self._fresh_review(reviewer, repo_path, refs, override, request)
+        if created:
+            worker.spawn(job_row["id"])
+        job = self._job_info(job_row, created)
         t = self.bus.thread(t["id"])
         return {"thread": thread_summary(t), "job": job, "review": self.bus.review_standings(t["id"]),
                 "next": f"Call wait(\"{t['id']}\") for the verdict, or check inbox later."}
+
+    def _fresh_review(self, reviewer: str, repo_path: str, refs: dict, override: dict,
+                      request: list) -> tuple[dict, dict, bool]:
+        """Start a single-reviewer thread, or return the one this exact request started while it
+        is still pinned to this request and its pass hasn't failed (a failed one is retried on a
+        new thread).  Runs inside the caller's transaction."""
+        base, prev, head = request
+        # The requester is part of the key: two agents asking for the same review each get
+        # their own thread, so each verdict reaches the agent that asked.  Follow-up passes
+        # use thread-scoped keys, so this only ever finds fresh reviews (#59).
+        key = f"review:{self.agent}:{repo_path}:{reviewer}:{prev or base}:{head}"
+        for row in self.bus._all("SELECT thread_id FROM jobs WHERE dedupe_key=? GROUP BY thread_id"
+                                 " ORDER BY MAX(created_at) DESC", key):
+            t = self.bus.thread(row["thread_id"])
+            if t["status"] == "cancelled" or self._pinned_request(t) != request:
+                continue  # moved on to another diff: new work
+            latest = self._revision_pass(t)
+            if latest and latest["status"] in ("queued", "running", "done"):
+                return t, latest, False  # idempotent, including a pass `agent-bus resume` restarted
+        self._quota_check(reviewer, "reviewer", override)
+        goal = f"Review {refs['change_id'] or head[:12]} in {os.path.basename(repo_path)}"
+        t = self.bus.create_thread("review", goal, [self.agent, reviewer], initiator=self.agent,
+                                   initiator_session=self.session_id, max_rounds=1,
+                                   max_messages=self.config.max_messages, repo=repo_path, refs=refs)
+        self.bus.set_thread(t["id"], round=1)
+        # No dedupe inside create_job: its lookup can't tell whether a thread has moved on.
+        job_row, created = self.bus.create_job(t["id"], "review", {"mode": "first", "round": 1}, None)
+        self.bus.conn.execute("UPDATE jobs SET dedupe_key=? WHERE id=?", (key, job_row["id"]))
+        return t, job_row, created
+
+    @staticmethod
+    def _pinned_request(t: dict) -> list:
+        """The request that pinned a single-reviewer thread's current revision: its refs
+        hold that request's base, previous head and head (threads from before #59 too)."""
+        refs = t["refs"] or {}
+        return [refs.get("base_commit_id"), refs.get("prev_head_commit_id"), refs.get("head_commit_id")]
+
+    def _revision_pass(self, t: dict) -> dict | None:
+        """The newest job of a single-reviewer thread's current revision (its first or
+        follow-up pass, or a resume's retry of it), or None if that revision has none.
+
+        Jobs carry the round they ran for.  Older ones don't, and #59 could advance a thread
+        without creating its follow-up job, leaving it open past its first round with no
+        active job (a pass that ran would have resolved or parked it).  Only there does an
+        older job have to show it ran for the current round: by a message it posted in that
+        round, or by its old-style key, which named the request (unless the thread has made
+        that same move before, so the key can't tell the rounds apart)."""
+        row = self.bus._one("SELECT * FROM jobs WHERE thread_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                            t["id"])
+        if row is None:
+            return None
+        newest = self.bus._job(row)
+        if "round" in newest["params"]:
+            return newest if newest["params"]["round"] == t["round"] else None
+        if newest["status"] in ("queued", "running") or t["status"] != "open" or t["round"] == 1:
+            return newest
+        refs = t["refs"] or {}
+        heads, move = self._heads(t), (refs.get("prev_head_commit_id"), refs.get("head_commit_id"))
+        old_key = f"review:{t['initiator']}:{t['repo']}:{refs.get('reviewer')}:{move[0]}:{move[1]}"
+        if newest["params"].get("mode") == "followup" and newest["dedupe_key"] == old_key \
+                and list(zip(heads, heads[1:])).count(move) == 1:
+            return newest
+        posted = self.bus._one("SELECT 1 FROM messages WHERE thread_id=? AND session_id=? AND round=?",
+                               t["id"], f"job:{newest['id']}", t["round"])
+        return newest if posted else None
 
     @staticmethod
     def _check_review_ids(base: str, head: str, prev: str | None, change_id: str | None) -> None:
@@ -620,17 +690,25 @@ class Service:
         refs = t["refs"] or {}
         return list(refs.get("heads") or [refs.get("head_commit_id")])
 
-    def _previous_review(self, reviewer: str, repo: str, prev_head: str) -> dict | None:
-        """The requester's review thread with this reviewer that has reviewed ``prev_head``
-        at any point (not only as its current head), so a request based on a head the
-        thread has since moved past is reported as stale instead of starting a new thread."""
+    def _previous_review(self, reviewer: str, repo: str, prev_head: str, request: list) -> dict | None:
+        """The requester's review thread with this reviewer to continue: the one this exact
+        request pinned (a repeat, even if a newer thread has since seen ``prev_head``), else
+        the newest that has reviewed ``prev_head`` at any point (not only as its current
+        head), so a request based on a head the thread has since moved past is reported as
+        stale instead of starting a new thread."""
+        mine = []
         for r in self.bus._all("SELECT id FROM threads WHERE kind='review' AND initiator=? AND repo=?"
                                " ORDER BY created_at DESC", self.agent, repo):
             t = self.bus.thread(r["id"])
             if (t["refs"] or {}).get("reviewer") == reviewer and not (t["refs"] or {}).get("reviewers") \
-                    and t["status"] != "cancelled" and prev_head in self._heads(t):
-                return t
-        return None
+                    and t["status"] != "cancelled":
+                mine.append(t)
+        exact = [t for t in mine if self._pinned_request(t) == request]
+        if exact:
+            # A fresh review that named this previous head without any lineage is pinned to
+            # this request but never saw prev_head: its repeat is the fresh path's.
+            return exact[0] if prev_head in self._heads(exact[0]) else None
+        return next((t for t in mine if prev_head in self._heads(t)), None)
 
     def resume(self, thread: str, extra_rounds: int = 2) -> dict:
         """Human only: lift the turn cap and give a stalled discussion more rounds."""
@@ -714,13 +792,19 @@ class Service:
             fields["max_rounds"] = max(t["max_rounds"], t["round"]) + extra_rounds
             fields["deadline"] = time.time() + self.config.deadline_minutes * 60
         if t["refs"] is not None or auto_resumes:
-            fields["refs"] = json.dumps({**(t["refs"] or {}), "auto_resumes": auto_resumes})
+            refs = {**(t["refs"] or {}), "auto_resumes": auto_resumes}
+            if t["kind"] == "review" and not refs.get("reviewers") and self._revision_pass(t) is None:
+                # A round #59 left without a pass: its reviewer's session may never have seen
+                # the previous head, so the retry gets the full diff.
+                refs["full_diff"] = True
+            fields["refs"] = json.dumps(refs)
         self.bus.set_thread(thread, **fields)
         res: dict[str, Any] = {}
         if t["kind"] == "discussion":
             res["job"] = self._dispatch(thread, "discussion", {"mode": "start_later"}, f"{thread}:resume:{key}")
         elif t["kind"] == "review" and not self.bus.active_job(thread) and not self._review_settled(t):
-            res["job"] = self._dispatch(thread, "review", {"mode": "retry"}, f"{thread}:retry:{key}")
+            res["job"] = self._dispatch(thread, "review", {"mode": "retry", "round": t["round"]},
+                                        f"{thread}:retry:{key}")
         # After the job lookups, whose reaping may post an older job's notice: this one is last.
         self.bus.post(thread, SYSTEM, note, kind="status")
         res["thread"] = thread_summary(self.bus.thread(thread))
@@ -735,9 +819,11 @@ class Service:
         return self._has_verdict_for_head(t)
 
     def _has_verdict_for_head(self, t: dict) -> bool:
+        """A verdict on the current head in the current round (a thread can return to a head
+        an earlier round reviewed; that verdict isn't this round's)."""
         head = (t["refs"] or {}).get("head_commit_id")
         return any(m["kind"] == "review_verdict" and m["data"].get("head_commit_id") == head
-                   for m in self.bus.history(t["id"])["messages"])
+                   and m["round"] == t["round"] for m in self.bus.history(t["id"])["messages"])
 
     def cancel(self, thread: str) -> dict:
         if self.agent != HUMAN:

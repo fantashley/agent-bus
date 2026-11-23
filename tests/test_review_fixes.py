@@ -622,3 +622,386 @@ def test_antigravity_text_is_kept_per_step():
     step(step_index=3, state="DONE", step_type="agent_response")
     assert [t for k, t in events if k == "text"] == ["Let me check the file.", "It says hi."]
     assert "".join(st.text_parts) == "Let me check the file.It says hi."
+
+
+# ---- single-reviewer dedupe keys (#59) ----------------------------------------
+
+def test_followup_does_not_collide_with_another_threads_fresh_review(env, no_spawn):
+    """Thread A at head P, thread B a fresh review of P..H: the follow-up P -> H on A gets
+    its own job on A, not B's (whose old key it shared), and repeating it is idempotent."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(env["repo"]), x, p)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    bus.transition(a, "resolved")
+    b = claude.request_review("codex", str(env["repo"]), p, h)["thread"]["id"]
+    assert b != a
+    res = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert res["thread"]["id"] == a and res["job"]["thread"] == a and not res["job"].get("deduplicated")
+    assert bus.active_job(a)["id"] == res["job"]["id"] and bus.thread(a)["status"] == "open"
+    again = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert again["thread"]["id"] == a and again["job"]["id"] == res["job"]["id"] and again["job"]["deduplicated"]
+    assert [j["thread_id"] for j in bus.jobs(b)] == [b] and bus.thread(b)["status"] == "open"
+
+
+def test_fresh_review_does_not_collide_with_another_threads_followup(env, no_spawn):
+    """The other order: after the follow-up P -> H on A, a fresh review of P..H starts its own thread."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(env["repo"]), x, p)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    bus.transition(a, "resolved")
+    claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    res = claude.request_review("codex", str(env["repo"]), p, h)
+    assert res["thread"]["id"] != a and res["job"]["thread"] == res["thread"]["id"]
+    assert not res["job"].get("deduplicated") and bus.thread(res["thread"]["id"])["status"] == "open"
+
+
+def test_single_fresh_request_is_not_deduplicated_onto_a_thread_that_moved(env, no_spawn):
+    bus = env["bus"]
+    base, h1, h2 = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), base, h1)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    bus.transition(tid, "resolved")
+    same = claude.request_review("codex", str(env["repo"]), base, h1)
+    assert same["thread"]["id"] == tid and same["job"]["deduplicated"]
+    claude.request_review("codex", str(env["repo"]), base, h2, prev_head_commit_id=h1)
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    res = claude.request_review("codex", str(env["repo"]), base, h1)
+    assert res["thread"]["id"] != tid and not res["job"].get("deduplicated")
+
+
+def test_single_followup_back_to_an_earlier_head_runs_again(env, no_spawn):
+    """h1 -> h2, h2 -> h1, then h1 -> h2 again is a new pass, not the first one's old job."""
+    bus = env["bus"]
+    base, h1, h2 = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), base, h1)["thread"]["id"]
+    seen = []
+    for prev, head in ((h1, h2), (h2, h1), (h1, h2)):
+        bus.conn.execute("UPDATE jobs SET status='done'")
+        bus.transition(tid, "resolved")
+        res = claude.request_review("codex", str(env["repo"]), base, head, prev_head_commit_id=prev)
+        assert res["thread"]["id"] == tid and not res["job"].get("deduplicated")
+        seen.append(res["job"]["id"])
+    assert len(set(seen)) == 3
+
+
+def test_repeating_a_failed_single_followup_reports_that_failure(env, no_spawn):
+    bus = env["bus"]
+    base, h1, h2 = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), base, h1)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    claude.request_review("codex", str(env["repo"]), base, h2, prev_head_commit_id=h1)
+    bus.conn.execute("UPDATE jobs SET status='failed'")
+    with pytest.raises(BusError) as e:
+        claude.request_review("codex", str(env["repo"]), base, h2, prev_head_commit_id=h1)
+    assert e.value.code == "REVIEW_FAILED" and f"agent-bus resume {tid}" in e.value.message
+
+
+def test_repeating_a_followup_is_not_intercepted_by_a_newer_thread_at_its_prev_head(env, no_spawn):
+    """A: X..P then P -> H.  B: a fresh X..P review (its own thread, also at P).  Repeating A's
+    P -> H request returns A's pass, not B (busy) or a new pass on B."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(env["repo"]), x, p)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    bus.transition(a, "resolved")
+    first = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    b = claude.request_review("codex", str(env["repo"]), x, p)["thread"]["id"]
+    assert b != a and bus.active_job(b)
+    again = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert again["thread"]["id"] == a and again["job"]["id"] == first["job"]["id"] and again["job"]["deduplicated"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    again = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert again["thread"]["id"] == a and again["job"]["id"] == first["job"]["id"] and len(bus.jobs(b)) == 1
+
+
+def test_repeats_on_threads_from_before_59_stay_idempotent(env, no_spawn):
+    """A thread whose follow-up job still has the old global key: repeating the follow-up
+    and the fresh request are both idempotent, and a fresh P..H still gets its own thread."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(env["repo"]), x, p)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    first = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    bus.conn.execute("UPDATE jobs SET status='done', dedupe_key=? WHERE id=?",
+                     (f"review:claude:{bus.thread(a)['repo']}:codex:{p}:{h}", first["job"]["id"]))
+    bus.transition(a, "resolved")
+    again = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert again["thread"]["id"] == a and again["job"]["id"] == first["job"]["id"] and again["job"]["deduplicated"]
+    fresh = claude.request_review("codex", str(env["repo"]), p, h)
+    assert fresh["thread"]["id"] != a and not fresh["job"].get("deduplicated")
+    repeat = claude.request_review("codex", str(env["repo"]), p, h)
+    assert repeat["thread"]["id"] == fresh["thread"]["id"] and repeat["job"]["deduplicated"]
+
+
+def test_repeat_recovers_a_followup_pass_that_59_never_created(env, no_spawn):
+    """A thread #59 broke: advanced to H with no follow-up job.  Repeating the follow-up
+    queues the missing pass instead of reporting the earlier round's finished job."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(env["repo"]), x, p)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done', params=?", (json.dumps({"mode": "first"}),))  # an old job
+    refs = {**bus.thread(a)["refs"], "base_commit_id": x, "prev_head_commit_id": p, "head_commit_id": h,
+            "heads": [p, h]}
+    bus.set_thread(a, refs=json.dumps(refs), round=2, max_rounds=2)
+    res = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert res["thread"]["id"] == a and not res["job"].get("deduplicated")
+    assert bus.active_job(a)["id"] == res["job"]["id"] and len(bus.jobs(a)) == 2
+    again = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert again["job"]["id"] == res["job"]["id"] and again["job"]["deduplicated"]
+
+
+def _old_verdict(bus, tid, job_id, base, head):
+    bus.conn.execute("UPDATE jobs SET status='done', params=? WHERE id=?", (json.dumps({"mode": "retry"}), job_id))
+    bus.post(tid, "codex", "Verdict: approve", kind="review_verdict", session_id=f"job:{job_id}",
+             data={"verdict": "approve", "findings": [], "head_commit_id": head, "base_commit_id": base})
+
+
+def test_old_pass_that_reviewed_the_current_head_is_not_rerun(env, no_spawn):
+    """A thread #59 skipped a round of, whose later pass (or a resume's retry) then reviewed
+    the current head before the upgrade: repeating that request is idempotent, no new pass."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(env["repo"]), x, p)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done', params=?", (json.dumps({"mode": "first"}),))
+    refs = {**bus.thread(a)["refs"], "base_commit_id": x, "prev_head_commit_id": p, "head_commit_id": h,
+            "heads": [p, h]}
+    bus.set_thread(a, refs=json.dumps(refs), round=2, max_rounds=2)
+    retry, _ = bus.create_job(a, "review", {"mode": "retry"}, None)
+    _old_verdict(bus, a, retry["id"], x, h)
+    res = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert res["job"]["id"] == retry["id"] and res["job"]["deduplicated"] and len(bus.jobs(a)) == 2
+
+
+def _old_followup_thread(bus, claude, repo, x, p, h):
+    """A thread advanced from X..P to P -> H before the upgrade, with unstamped jobs."""
+    a = claude.request_review("codex", str(repo), x, p)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    job = claude.request_review("codex", str(repo), x, h, prev_head_commit_id=p)["job"]
+    bus.conn.execute("UPDATE jobs SET status='done', params=?, dedupe_key=? WHERE id=?",
+                     (json.dumps({"mode": "followup"}), f"review:claude:{bus.thread(a)['repo']}:codex:{p}:{h}",
+                      job["id"]))
+    return a, job
+
+
+def test_old_parked_followup_is_not_reopened(env, no_spawn):
+    """A pre-upgrade pass that parked the thread (no verdict) still counts as this request's."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a, job = _old_followup_thread(bus, claude, env["repo"], x, p, h)
+    bus.transition(a, "needs_human")
+    res = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert res["job"]["id"] == job["id"] and res["job"]["deduplicated"]
+    assert bus.thread(a)["status"] == "needs_human" and len(bus.jobs(a)) == 2
+
+
+def test_old_verdict_without_a_base_counts(env, no_spawn):
+    """A pre-#47 verdict (no base) from this round's pass shows the pass ran."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a, job = _old_followup_thread(bus, claude, env["repo"], x, p, h)
+    bus.post(a, "codex", "Verdict: approve", kind="review_verdict", session_id=f"job:{job['id']}",
+             data={"verdict": "approve", "findings": [], "head_commit_id": h})  # pre-#47: no base
+    res = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert res["job"]["id"] == job["id"] and res["job"]["deduplicated"] and len(bus.jobs(a)) == 2
+
+
+def test_recovering_a_missing_pass_checks_the_reviewers_quota(env, no_spawn):
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(env["repo"]), x, p)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done', params=?", (json.dumps({"mode": "first"}),))
+    refs = {**bus.thread(a)["refs"], "base_commit_id": x, "prev_head_commit_id": p, "head_commit_id": h,
+            "heads": [p, h]}
+    bus.set_thread(a, refs=json.dumps(refs), round=2, max_rounds=2)
+    bus.set_quota_block("codex", time.time() + 3600, "usage limit")
+    with pytest.raises(BusError) as e:
+        claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert e.value.code == "USAGE_EXHAUSTED" and len(bus.jobs(a)) == 1
+
+
+def test_repeating_a_fresh_request_that_named_a_prev_head_is_not_intercepted(env, no_spawn):
+    """F: a fresh request X..H naming previous head P with no lineage.  G: a later review at
+    P.  Repeating F's request returns F, not a follow-up on G."""
+    bus = env["bus"]
+    x, p, h, y = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    first = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    f = first["thread"]["id"]
+    g = claude.request_review("codex", str(env["repo"]), y, p)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='done'")
+    again = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert again["thread"]["id"] == f and again["job"]["id"] == first["job"]["id"] and again["job"]["deduplicated"]
+    assert len(bus.jobs(g)) == 1 and bus.thread(g)["refs"]["head_commit_id"] == p
+
+
+def test_old_verdict_from_an_earlier_round_at_the_same_head_is_not_this_pass(env, no_spawn):
+    """#59 skipped P -> H and H -> P on the same base: the round-1 verdict at P isn't the final round's."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(env["repo"]), x, p)["thread"]["id"]
+    job = bus.jobs(a)[0]
+    bus.post(a, "codex", "Verdict: approve", kind="review_verdict", session_id=f"job:{job['id']}",
+             data={"verdict": "approve", "findings": [], "head_commit_id": p, "base_commit_id": x})
+    bus.conn.execute("UPDATE jobs SET status='done', params=?", (json.dumps({"mode": "first"}),))
+    refs = {**bus.thread(a)["refs"], "base_commit_id": x, "prev_head_commit_id": h, "head_commit_id": p,
+            "heads": [p, h, p]}
+    bus.set_thread(a, refs=json.dumps(refs), round=3, max_rounds=3)
+    res = claude.request_review("codex", str(env["repo"]), x, p, prev_head_commit_id=h)
+    assert res["job"]["id"] != job["id"] and not res["job"].get("deduplicated") and bus.active_job(a)
+
+
+def test_old_failed_job_from_an_earlier_round_is_not_this_pass(env, no_spawn):
+    """#59 advanced a thread whose last pass had failed: the repeat queues the missing pass
+    instead of reporting the earlier round's failure."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(env["repo"]), x, p)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='failed', params=?", (json.dumps({"mode": "first"}),))
+    refs = {**bus.thread(a)["refs"], "base_commit_id": x, "prev_head_commit_id": p, "head_commit_id": h,
+            "heads": [p, h]}
+    bus.set_thread(a, refs=json.dumps(refs), round=2, max_rounds=2)
+    res = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert not res["job"].get("deduplicated") and bus.active_job(a)["id"] == res["job"]["id"]
+
+
+def test_old_followup_that_failed_before_posting_reports_its_failure(env, no_spawn):
+    """A legacy follow-up for this request (named by its old key) reaped before it started:
+    repeating the request reports that failure rather than silently queueing another pass."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a, job = _old_followup_thread(bus, claude, env["repo"], x, p, h)
+    bus.conn.execute("UPDATE jobs SET status='failed', error='never started' WHERE id=?", (job["id"],))
+    with pytest.raises(BusError) as e:
+        claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert e.value.code == "REVIEW_FAILED" and "never started" in e.value.message and len(bus.jobs(a)) == 2
+
+
+def test_old_key_for_a_move_the_thread_made_twice_is_not_this_pass(env, no_spawn):
+    """An old P -> H attempt failed, then #59 skipped H -> P and P -> H again: the old job's key
+    names the same move, but it isn't the final round's pass."""
+    bus = env["bus"]
+    x, p, h = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a, job = _old_followup_thread(bus, claude, env["repo"], x, p, h)
+    bus.conn.execute("UPDATE jobs SET status='failed', error='old attempt' WHERE id=?", (job["id"],))
+    refs = {**bus.thread(a)["refs"], "prev_head_commit_id": p, "head_commit_id": h, "heads": [p, h, p, h]}
+    bus.set_thread(a, refs=json.dumps(refs), round=4, max_rounds=4)
+    res = claude.request_review("codex", str(env["repo"]), x, h, prev_head_commit_id=p)
+    assert not res["job"].get("deduplicated") and bus.active_job(a)["id"] == res["job"]["id"]
+
+
+def test_old_fresh_key_is_not_taken_for_a_followup(env, no_spawn):
+    """A failed fresh P..H, then #59 skipped H -> P and P -> H: the fresh job's key matches the
+    move, but it isn't a follow-up, so the missing pass is queued."""
+    bus = env["bus"]
+    p, h = "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(env["repo"]), p, h)["thread"]["id"]
+    bus.conn.execute("UPDATE jobs SET status='failed', params=?", (json.dumps({"mode": "first"}),))
+    refs = {**bus.thread(a)["refs"], "prev_head_commit_id": p, "head_commit_id": h, "heads": [h, p, h]}
+    bus.set_thread(a, refs=json.dumps(refs), round=3, max_rounds=3)
+    res = claude.request_review("codex", str(env["repo"]), p, h, prev_head_commit_id=p)
+    assert not res["job"].get("deduplicated") and bus.active_job(a)["id"] == res["job"]["id"]
+
+
+def test_recovered_pass_sends_the_full_diff(env, no_spawn):
+    """A pass recovered after #59 doesn't resume the reviewer's session with only P..H (it may
+    never have seen P), and an `agent-bus resume` retry of it doesn't either."""
+    repo = env["repo"]
+    sh, rev = _jj_repo(repo)
+    x, p = rev("@-"), rev("@")
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(repo), x, p)["thread"]["id"]
+    run_job(bus, a)  # codex has a session at P
+    bus.conn.execute("UPDATE jobs SET params=?", (json.dumps({"mode": "first"}),))  # an old job
+    (repo / "a.txt").write_text("CHANGE-IN-H\n")
+    h = rev("@")
+    refs = {**bus.thread(a)["refs"], "prev_head_commit_id": p, "head_commit_id": h, "heads": [p, h]}
+    bus.set_thread(a, status="open", refs=json.dumps(refs), round=2, max_rounds=2)  # #59 left it so
+    res = claude.request_review("codex", str(repo), x, h, prev_head_commit_id=p)
+    assert not res["job"].get("deduplicated")
+    bus.conn.execute("UPDATE jobs SET status='failed' WHERE id=?", (res["job"]["id"],))
+    bus.transition(a, "needs_human")
+    Service(bus, HUMAN).resume(a)
+    run_job(bus, a)
+    last = [c for c in calls(env) if c["agent"] == "codex"][-1]
+    assert last["argv"][:3] != ["exec", "resume", "--json"]
+    assert "Interdiff" not in last["prompt"] and "CHANGE-IN-H" in last["prompt"]
+    # The next ordinary follow-up resumes the session again.
+    (repo / "b.txt").write_text("more\n")
+    h2 = rev("@")
+    claude.request_review("codex", str(repo), x, h2, prev_head_commit_id=h)
+    run_job(bus, a)
+    assert [c for c in calls(env) if c["agent"] == "codex"][-1]["argv"][:3] == ["exec", "resume", "--json"]
+
+
+def test_direct_resume_of_a_thread_59_left_without_a_pass_sends_the_full_diff(env, no_spawn):
+    repo = env["repo"]
+    sh, rev = _jj_repo(repo)
+    x, p = rev("@-"), rev("@")
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(repo), x, p)["thread"]["id"]
+    run_job(bus, a)
+    bus.conn.execute("UPDATE jobs SET params=?", (json.dumps({"mode": "first"}),))
+    (repo / "a.txt").write_text("CHANGE-IN-H\n")
+    h = rev("@")
+    refs = {**bus.thread(a)["refs"], "prev_head_commit_id": p, "head_commit_id": h, "heads": [p, h]}
+    bus.set_thread(a, status="open", refs=json.dumps(refs), round=2, max_rounds=2)
+    assert Service(bus, HUMAN).resume(a)["job"]
+    run_job(bus, a)
+    last = [c for c in calls(env) if c["agent"] == "codex"][-1]
+    assert last["argv"][:3] != ["exec", "resume", "--json"] and "CHANGE-IN-H" in last["prompt"]
+
+
+def test_resume_retries_a_round_that_returned_to_an_earlier_reviewed_head(env, no_spawn):
+    """A -> B -> A: the round-1 verdict at A doesn't settle round 3, so resume retries it."""
+    bus = env["bus"]
+    x, ha, hb = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), x, ha)["thread"]["id"]
+    for prev, head in ((None, ha), (ha, hb), (hb, ha)):
+        if prev:
+            claude.request_review("codex", str(env["repo"]), x, head, prev_head_commit_id=prev)
+        if (prev, head) != (hb, ha):
+            bus.post(tid, "codex", "Verdict: approve", kind="review_verdict",
+                     data={"verdict": "approve", "findings": [], "head_commit_id": head, "base_commit_id": x})
+            bus.conn.execute("UPDATE jobs SET status='done'")
+            bus.transition(tid, "resolved")
+    bus.conn.execute("UPDATE jobs SET status='failed' WHERE status='queued'")
+    bus.transition(tid, "needs_human")
+    res = Service(bus, HUMAN).resume(tid)
+    assert res["job"] and not res["job"].get("deduplicated")
+
+
+def test_single_standings_ignore_an_earlier_rounds_verdict_at_the_same_head(env, no_spawn):
+    """A approved in round 1, then A -> B and B -> A: round 3 is pending, not approved."""
+    bus = env["bus"]
+    x, ha, hb = "a" * 40, "b" * 40, "c" * 40
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), x, ha)["thread"]["id"]
+    bus.post(tid, "codex", "Verdict: approve", kind="review_verdict",
+             data={"verdict": "approve", "findings": [], "head_commit_id": ha, "base_commit_id": x})
+    for prev, head in ((ha, hb), (hb, ha)):
+        bus.conn.execute("UPDATE jobs SET status='done'")
+        bus.transition(tid, "resolved")
+        res = claude.request_review("codex", str(env["repo"]), x, head, prev_head_commit_id=prev)
+    assert not res["review"]["complete"] and res["review"]["reviewers"]["codex"]["state"] != "approved"

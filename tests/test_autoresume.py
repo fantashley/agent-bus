@@ -60,7 +60,7 @@ def test_a_review_parked_by_quota_resumes_once_the_limit_resets(env, no_spawn, m
     assert t["status"] == "open" and t["refs"]["auto_resumes"] == 1 and not autoresume.pending(bus)
     assert "Resumed automatically: the usage limit that stopped codex has reset (automatic resume 1 of 3)" \
         in bus.history(tid)["messages"][-1]["body"]
-    assert bus.jobs(tid)[-1]["params"] == {"mode": "retry"} and len(no_spawn) == 2
+    assert bus.jobs(tid)[-1]["params"]["mode"] == "retry" and len(no_spawn) == 2
     run_job(bus, tid)
     assert bus.thread(tid)["status"] == "resolved"  # the verdict came in
     assert autoresume.sweep(bus) == []  # nothing left to do
@@ -95,7 +95,7 @@ def test_concurrent_sweeps_resume_once(env, no_spawn, monkeypatch):
     for b in buses:
         b.close()
     assert results == [tid]
-    assert len([j for j in bus.jobs(tid) if j["params"] == {"mode": "retry"}]) == 1
+    assert len([j for j in bus.jobs(tid) if j["params"].get("mode") == "retry"]) == 1
     assert sum("Resumed automatically" in m["body"] for m in bus.history(tid)["messages"]) == 1
 
 

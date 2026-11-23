@@ -1178,10 +1178,11 @@ class Bus:
             m = last.get(r)
             verdict = m["data"].get("verdict") if m else None
             at = m["data"].get("head_commit_id") if m else None
-            # Single-reviewer verdicts carry no revision or base; they count for the thread's.
+            # Single-reviewer verdicts carry no revision or base; they count for the thread's,
+            # in the round they were given (a thread can return to an earlier round's head).
             on_base = m["data"].get("base_commit_id", base) if m else None
             current = (m["data"].get("revision") == refs.get("revision", 0) if "reviewers" in refs
-                       else at == head) if m else False
+                       else at == head and m["round"] == t["round"]) if m else False
             if m is None:
                 state = "pending"
             elif not current:

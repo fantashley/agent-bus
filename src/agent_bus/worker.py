@@ -774,7 +774,10 @@ class Worker:
         refs = t["refs"] or {}
         reviewer = refs["reviewer"]
         followup = bool(refs.get("prev_head_commit_id"))
-        resume = followup and self.bus.peer_session(self.thread_id, reviewer) is not None
+        # A pass recovered after #59 never reached the session, which may not have seen
+        # the previous head: it gets the full diff.
+        resume = (followup and not refs.get("full_diff")
+                  and self.bus.peer_session(self.thread_id, reviewer) is not None)
         everything = self.bus.history(self.thread_id)["messages"]  # one snapshot for prompt + watermark
         upto = everything[-1]["id"] if everything else 0
         since = self.bus.delivered(self.thread_id, reviewer)
