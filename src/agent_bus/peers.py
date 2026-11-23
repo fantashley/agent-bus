@@ -286,18 +286,34 @@ def cli_identity(command: str, cwd: str | None = None) -> tuple[str, str] | None
     return found, f"{found}->{real}:{st.st_size}:{st.st_mtime_ns}"
 
 
+# A `--version` probe that runs longer than this is abandoned as "unknown" ...
+VERSION_PROBE_TIMEOUT_S = 10
+# ... and the same binary identity reports "unknown" without probing for this long
+# before one caller tries again (#41: a slow cold start must not stick forever).
+VERSION_TIMEOUT_COOLDOWN_S = 60
+
+
 def cli_version(bus, agent: str, command: str, cwd: str | None = None) -> str:
     """The CLI's own ``--version`` line, probed once per binary identity and cached in
     the bus (issue #32).  "unknown" when it can't be found or doesn't say.  A miss is
-    probed under a per-binary file lock, so concurrent jobs don't race to different
-    answers."""
+    probed under a per-binary file lock, so concurrent jobs share one probe and its
+    answer.  A probe that times out isn't cached: the identity answers "unknown" at
+    once for a cooldown, then the next caller probes again (issue #41)."""
     ident = cli_identity(command, cwd)
     if ident is None:
         return "unknown"
     launch, key = ident
-    cached = bus.cli_version(key)
-    if cached is not None:
-        return cached
+
+    def settled() -> str | None:
+        cached = bus.cli_version(key)
+        if cached is not None:
+            return cached
+        retry_after = bus.cli_version_retry_after(key)
+        return "unknown" if retry_after is not None and time.time() < retry_after else None
+
+    found = settled()
+    if found is not None:
+        return found
     import fcntl
     import hashlib
     lock_dir = Path(bus.path).parent / "locks"  # next to the cache itself
@@ -305,21 +321,25 @@ def cli_version(bus, agent: str, command: str, cwd: str | None = None) -> str:
     lock = lock_dir / f"version-{hashlib.sha256(key.encode()).hexdigest()[:16]}.lock"
     with open(lock, "w") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
-        cached = bus.cli_version(key)  # another process may have probed while we waited
-        if cached is not None:
-            return cached
+        # Another caller may have probed, or timed out, while we waited for the lock.
+        found = settled()
+        if found is not None:
+            return found
         version = "unknown"
         try:
             # errors="replace": a stray undecodable byte (say, a wrapper's diagnostic on
             # stderr) must not stop the turn this probe runs ahead of.
             out = subprocess.run([launch, "--version"], cwd=cwd, capture_output=True, text=True, errors="replace",
-                                 timeout=10, stdin=subprocess.DEVNULL,
+                                 timeout=VERSION_PROBE_TIMEOUT_S, stdin=subprocess.DEVNULL,
                                  env={**os.environ, "AGENT_BUS_PEER": "version-probe"})
             text = out.stdout if (out.stdout or "").strip() else out.stderr
             line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
             if out.returncode == 0 and line:
                 version = "".join(ch for ch in line if ch.isprintable())[:80]
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
+            bus.set_cli_version_timeout(key, agent, launch, time.time() + VERSION_TIMEOUT_COOLDOWN_S)
+            return "unknown"
+        except OSError:
             pass
         bus.set_cli_version(key, agent, launch, version)
         return version

@@ -149,6 +149,17 @@ CREATE INDEX IF NOT EXISTS events_thread ON events(thread_id, id);
 CREATE INDEX IF NOT EXISTS jobs_dedupe ON jobs(dedupe_key);
 """
 
+# Created by Bus._migrate, not SCHEMA: its absence marks a database from before #41,
+# whose cached "unknown" versions may be timeouts that must be dropped with it.
+CLI_VERSION_TIMEOUTS = """
+CREATE TABLE cli_version_timeouts (  -- a `--version` probe that timed out (#41)
+    identity TEXT PRIMARY KEY,          -- as in cli_versions
+    agent TEXT NOT NULL,
+    path TEXT NOT NULL,
+    retry_after REAL NOT NULL           -- "unknown" without probing until then
+)
+"""
+
 
 class BusError(Exception):
     """An error reported to callers by code (e.g. THREAD_LIMIT_REACHED)."""
@@ -230,7 +241,10 @@ class Bus:
         tcols = {r["name"] for r in self._all("PRAGMA table_info(threads)")}
         jobs_sql = self._one("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'")["sql"]
         return (any(c not in scols for c, _ in self.SESSION_COLUMNS) or "blind" not in tcols
-                or "dedupe_key TEXT UNIQUE" in jobs_sql)
+                or "dedupe_key TEXT UNIQUE" in jobs_sql or not self._has_table("cli_version_timeouts"))
+
+    def _has_table(self, name: str) -> bool:
+        return self._one("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", name) is not None
 
     def _migrate(self) -> None:
         """Bring databases created by older versions up to the current schema.
@@ -254,6 +268,13 @@ class Bus:
                 self.conn.executescript_in_tx(SCHEMA)
                 self.conn.execute("INSERT INTO jobs SELECT * FROM jobs_v0")
                 self.conn.execute("DROP TABLE jobs_v0")
+            if not self._has_table("cli_version_timeouts"):
+                # Older versions cached a timed-out `--version` probe as "unknown" for good,
+                # indistinguishable from other unknowns: drop them all, in the same
+                # transaction that creates the marker table, so each binary is probed
+                # again exactly once (#41).  Known versions stay cached.
+                self.conn.execute(CLI_VERSION_TIMEOUTS)
+                self.conn.execute("DELETE FROM cli_versions WHERE version='unknown'")
 
     def close(self) -> None:
         self.conn.close()
@@ -778,8 +799,19 @@ class Bus:
         return row["version"] if row else None
 
     def set_cli_version(self, identity: str, agent: str, path: str, version: str) -> None:
-        self.conn.execute("INSERT OR REPLACE INTO cli_versions (identity, agent, path, version, probed_at)"
-                          " VALUES (?,?,?,?,?)", (identity, agent, path, version, _now()))
+        with self.tx():
+            self.conn.execute("INSERT OR REPLACE INTO cli_versions (identity, agent, path, version, probed_at)"
+                              " VALUES (?,?,?,?,?)", (identity, agent, path, version, _now()))
+            self.conn.execute("DELETE FROM cli_version_timeouts WHERE identity=?", (identity,))
+
+    def cli_version_retry_after(self, identity: str) -> float | None:
+        """When a timed-out probe of ``identity`` may be retried, or None if none timed out."""
+        row = self._one("SELECT retry_after FROM cli_version_timeouts WHERE identity=?", identity)
+        return row["retry_after"] if row else None
+
+    def set_cli_version_timeout(self, identity: str, agent: str, path: str, retry_after: float) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO cli_version_timeouts (identity, agent, path, retry_after)"
+                          " VALUES (?,?,?,?)", (identity, agent, path, retry_after))
 
     def latest_cli_versions(self) -> dict[str, dict]:
         """The most recently probed version per agent."""
