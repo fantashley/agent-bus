@@ -97,6 +97,35 @@ def test_ensure_replaces_stale_entry_then_is_a_no_op(codex_home):
     assert fake.calls == [["mcp", "get", "agent-bus", "--json"]]
 
 
+def test_ensure_keeps_a_participant_pin(codex_home):
+    """#43: a user's `--participant NAME` on the entry survives setup (Home Manager runs it on
+    every activation), including when the command changes."""
+    fake = FakeCodex(codex_home)
+    codex_home.write_text(CONFIG.replace('args = ["mcp", "--agent", "codex"]',
+                                         'args = ["mcp", "--agent", "codex", "--participant", "codex-work"]'))
+    assert cs.ensure("/new/agent-bus", codex="codex", run=fake) == "updated"
+    entry = tomllib.loads(codex_home.read_text())["mcp_servers"]["agent-bus"]
+    assert entry["args"] == ["mcp", "--agent", "codex", "--participant", "codex-work"]
+    assert entry["command"] == "/new/agent-bus"
+    fake.calls.clear()
+    assert cs.ensure("/new/agent-bus", codex="codex", run=fake) == "unchanged"
+    # Anything else in the args is still ours to replace.
+    assert cs.pin({"args": ["mcp", "--agent", "codex", "--participant", "Bad Name"]}) == []
+    assert cs.pin({"args": ["mcp", "--agent", "claude", "--participant", "codex-work"]}) == []
+    for args in (["mcp", "--agent", "codex", "--participant=codex-work"],
+                 ["mcp", "--participant", "codex-work", "--agent", "codex"],
+                 ["mcp", "--agent=codex", "--participant", "codex-work"],
+                 ["mcp", "--agent", "codex", "--role", "dev", "--participant", "codex-work"],
+                 ["mcp", "--agent", "codex", "--part", "codex-work"]):  # argparse's abbreviation
+        assert cs.pin({"args": args}) == args  # every form `agent-bus mcp` accepts, kept as written
+    for name in ("human", "claude", "antigravity"):
+        assert cs.pin({"args": ["mcp", "--agent", "codex", "--participant", name]}) == []
+    for args in (["mcp", "--agent", "codex", "--role", "dev"], ["mcp", "--agent", "codex", "--participant"],
+                 ["mcp", "--agent", "codex", "--participant", "codex-work", "--extra", "x"],
+                 ["mcp", "--agent", "codex", "--participant", "codex-work", "--role", "--extra"]):
+        assert cs.pin({"args": args}) == []
+
+
 def test_ensure_only_adds_env_vars_when_command_matches(codex_home):
     fake = FakeCodex(codex_home)
     assert cs.ensure("/old/agent-bus", codex="codex", run=fake) == "updated"

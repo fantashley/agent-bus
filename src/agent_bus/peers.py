@@ -94,6 +94,8 @@ Emit = Callable[[str, str], None]  # (kind, text)
 
 
 class Adapter:
+    # The harness this adapter drives (#43).  Each turn runs one participant on it:
+    # ``self.participant``, whose launch settings it uses.
     agent: str
     default_command: str
     # Bump when the invocation or what the parser relies on changes, so a version's
@@ -115,12 +117,33 @@ class Adapter:
         t = obj.get("type")
         return t if isinstance(t, str) else None
 
-    def __init__(self, config: Config, settings: dict | None = None):
+    def __init__(self, config: Config, settings: dict | None = None, participant: str | None = None):
         self.config = config
-        self.command = config.peer_command(self.agent, self.default_command)
-        self.extra = config.peer_args(self.agent)
+        self.participant = participant or self.agent
+        if config.harness_of(self.participant) != self.agent:
+            raise ValueError(f"participant {self.participant!r} runs on {config.harness_of(self.participant)}, "
+                             f"not {self.agent}")
+        self.command = config.peer_command(self.participant, self.default_command)
+        self.extra = config.peer_args(self.participant)
         self.settings = settings or {}  # validated {model, effort}; see Config.peer_settings
-        self.web_search = config.web_search(self.agent)
+        self.web_search = config.web_search(self.participant)
+
+    def launch_fingerprint(self, cwd: str | None = None) -> str | None:
+        """What isolation evidence for a turn of this participant must match (#32, #43):
+        the harness and its recipe, the executable identity, and the launch settings
+        that change how the CLI is isolated (its args, MCP and web settings).  Two
+        participants on one harness share evidence only when these all match; model and
+        effort don't change isolation, so they aren't part of it.  None when the
+        executable can't be found: such a launch can't be matched to any evidence."""
+        import hashlib
+        ident = cli_identity(self.command, cwd)
+        if ident is None:
+            return None
+        launch = self.config.launch(self.participant)
+        material = {"harness": self.agent, "recipe": self.recipe, "executable": ident[1],
+                    "args": self.extra, "web_search": self.web_search,
+                    "allow_mcp": bool(launch.get("allow_mcp"))}
+        return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
     def setting_args(self) -> list[str]:
         """This CLI's flags for the configured model and effort (none: its defaults)."""
@@ -262,9 +285,9 @@ class Adapter:
             st.final = None
         st.text_parts = [p for p in st.text_parts if isinstance(p, str)]
         if st.stray:
-            emit("format", f"{st.stray} non-JSON stdout line(s) from {self.agent} (not shown)")
+            emit("format", f"{st.stray} non-JSON stdout line(s) from {self.participant} (not shown)")
         if st.unknown:
-            emit("format", f"unrecognised {self.agent} stream events: "
+            emit("format", f"unrecognised {self.participant} stream events: "
                  + ", ".join(f"{k}×{n}" for k, n in sorted(st.unknown.items())[:10]))
         text = st.final if st.final is not None else "".join(st.text_parts)
         # Steps that finished before a turn failed, timed out or ended without its result
@@ -274,7 +297,7 @@ class Adapter:
         try:
             limits = self.usage_limits(st)
         except Exception as e:  # noqa: BLE001 - the windows are a hint; never fail a turn on them
-            emit("format", f"could not read {self.agent}'s usage limits: {e!r}"[:300])
+            emit("format", f"could not read {self.participant}'s usage limits: {e!r}"[:300])
             limits = None
         if timed_out:
             return TurnResult(ok=False, text=text, external_id=st.external_id, error="turn timed out",
@@ -296,10 +319,10 @@ class Adapter:
         if why:
             # No reply text at all: a whitespace-only response must not reach JSON repair.
             return TurnResult(ok=False, text="", external_id=st.external_id, usage=st.usage,
-                              partial_usage=partial, limits=limits, incomplete=True, error=f"PEER_TURN_INCOMPLETE: {self.agent} {why}")
+                              partial_usage=partial, limits=limits, incomplete=True, error=f"PEER_TURN_INCOMPLETE: {self.participant} {why}")
         if missing:
             return TurnResult(ok=False, text=text, external_id=st.external_id, usage=st.usage,
-                              partial_usage=partial, limits=limits, format_changed=True, error=f"PEER_FORMAT_CHANGED: {self.agent} exited normally without "
+                              partial_usage=partial, limits=limits, format_changed=True, error=f"PEER_FORMAT_CHANGED: {self.participant} exited normally without "
                                     + " or ".join(missing))
         return TurnResult(ok=True, text=text, external_id=st.external_id, usage=st.usage, partial_usage=partial, limits=limits)
 
@@ -796,8 +819,8 @@ class CodexAdapter(Adapter):
         return sorted({d["name"] for d in data
                        if isinstance(d, dict) and isinstance(d.get("name"), str) and d.get("enabled", True)})
 
-    def __init__(self, config: Config, settings: dict | None = None):
-        super().__init__(config, settings)
+    def __init__(self, config: Config, settings: dict | None = None, participant: str | None = None):
+        super().__init__(config, settings, participant)
         # A web_search="disabled" in peers.codex.args turns search off for the preamble and
         # the report too, so they say what the turn will really have.
         modes = [_codex_value(o) for o in _codex_overrides(self.extra) if _config_key(o) == "web_search"]
@@ -959,8 +982,17 @@ class AntigravityAdapter(Adapter):
         """agy has no per-session switch for MCP servers, so refuse to run a peer while
         any server other than agent-bus (which refuses peers itself) is configured,
         unless config sets peers.antigravity.allow_mcp."""
-        if self.config.peers.get(self.agent, {}).get("allow_mcp"):
+        if self.config.launch(self.participant).get("allow_mcp"):
             return
+        base = self.config.peers.get(self.agent) if isinstance(self.config.peers.get(self.agent), dict) else {}
+        if (self.command != os.path.expanduser(base.get("command", self.default_command))
+                or self.extra != list(base.get("args", []))):
+            # A participant with its own command or args (say, a wrapper or flag for another
+            # account) may run agy with another config directory, which this check can't see (#43).
+            raise PeerSetupError(
+                f"{self.participant} runs Antigravity with its own command or args, so agent-bus can't check "
+                f"which MCP servers it loads; set participants.{self.participant}.allow_mcp = true to run it "
+                "anyway")
         base = Path(os.environ.get("AGY_CONFIG_DIR") or Path.home() / ".gemini" / "config")
         files = [base / "mcp_config.json", *sorted(base.glob("plugins/*/mcp_config.json"))]
         live = []
@@ -1129,15 +1161,14 @@ ADAPTERS = {a.agent: a for a in (ClaudeAdapter, CodexAdapter, AntigravityAdapter
 
 
 def adapter(agent: str, config: Config, settings: dict | None = None) -> Adapter:
-    try:
-        return ADAPTERS[agent](config, settings)
-    except KeyError:
-        raise ValueError(f"unknown agent {agent!r}; expected one of {', '.join(ADAPTERS)}") from None
+    """The adapter for a turn of participant ``agent``: its harness's, with its launch settings."""
+    harness = config.participant(agent).harness
+    return ADAPTERS[harness](config, settings, participant=agent)
 
 
 def web_search_report(agent: str, config: Config) -> dict:
     """What a headless turn of ``agent`` gets for web search, for `agent-bus agents` (#46)."""
-    cls = ADAPTERS[agent]
+    cls = ADAPTERS[config.harness_of(agent)]
     on = adapter(agent, config).web_search  # the same resolution the turn and preamble use
     note = cls.web_tools if on else ("off" if cls.web_off_enforced
                                      else "off by instruction only: the CLI has no switch for it")

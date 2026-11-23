@@ -34,7 +34,7 @@ def blocks_for(bus: Bus, config: cfg.Config, t: dict, agents: list[str]) -> dict
     """The active blocks that stop ``agents`` on thread ``t`` (with its model settings)."""
     out = {}
     for a in agents:
-        b = bus.quota_block(a, quota.model_key(quota.peer_model(config, t, a)))
+        b = quota.thread_block(bus, config, t, a)
         if b:
             out[a] = b
     return out

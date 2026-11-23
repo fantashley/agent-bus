@@ -232,8 +232,9 @@ class Worker:
         cwd, add_dirs = self.workdir(t)
         settings = self.config.peer_settings(agent, ((t["refs"] or {}).get("peer_settings") or {}).get(agent))
         model = quota.effective_model(self.config, agent, settings)
-        # Out of usage: don't spend a turn finding that out again.
-        block = self.bus.quota_block(agent, quota.model_key(model))
+        # Out of usage: don't spend a turn finding that out again.  Blocks belong to the
+        # harness and account this participant runs on, shared with others on it (#43).
+        block = quota.block_for(self.bus, self.config, agent, settings)
         if block:
             return self.blocked(agent, block)
         # Nor on a discussion peer whose output this discussion already found unusable.
@@ -245,12 +246,12 @@ class Worker:
         timeout = max(30.0, min(self.config.turn_timeout_s, self.deadline_left()))
         shown = "".join(f" · {k} {v}" for k, v in settings.items())
         # Which CLI build and adapter recipe ran this turn, so drift can be tied to an upgrade (#32).
-        version = cli_version(self.bus, agent, ad.command, cwd=cwd)
+        version = cli_version(self.bus, ad.agent, ad.command, cwd=cwd)
         # Close to its usage limit, by the last reading its CLI gave: worth knowing before
         # the turn spends more (issue #26).
         near = quota.near_limit(self.bus, self.config, agent)
         self.event("turn_start", f"round {t['round']}" + (" (resumed)" if resume_id else "") + shown
-                   + f" · {version} · recipe {agent}/{ad.recipe}"
+                   + f" · {version} · recipe {ad.agent}/{ad.recipe}"
                    + (" · near its usage limit: " + "; ".join(map(quota.describe_window, near)) if near else ""),
                    agent)
         emit = lambda kind, text: self.event(kind, text, agent)  # noqa: E731
@@ -265,7 +266,7 @@ class Worker:
         # (it would stop the same way, and the working conversation would be dropped).
         if (not res.ok and resume_id and not res.timed_out and not res.quota and not res.format_changed
                 and not res.incomplete and not self.cancelled()):
-            block = self.bus.quota_block(agent, quota.model_key(model))
+            block = quota.block_for(self.bus, self.config, agent, settings)
             if block:
                 self.event("turn_end", f"failed: {res.error}" + tokens(res), agent)
                 return self.blocked(agent, block)
@@ -303,7 +304,7 @@ class Worker:
         if res.ok:
             # Newer evidence: it has usage again (account-wide, and for this model).
             with self.fenced():
-                self.bus.clear_quota(agent, quota.model_key(model))
+                quota.clear_for(self.bus, self.config, agent, model)
         if res.external_id:
             self.set_peer_session(agent, res.external_id)
         return res
@@ -313,10 +314,10 @@ class Worker:
         if not ad.session_usage:
             return None
         try:
-            return self.bus.begin_usage(self.thread_id, ad.agent, job_id=self.job["id"], model=model,
+            return self.bus.begin_usage(self.thread_id, ad.participant, job_id=self.job["id"], model=model,
                                         session=resume_id)
         except Exception as e:  # noqa: BLE001 - history must never fail a turn
-            self.event("error", f"could not record token usage: {e!r}", ad.agent)
+            self.event("error", f"could not record token usage: {e!r}", ad.participant)
             return None
 
     def account(self, ad: Adapter, model: str | None, res: TurnResult, resumed: bool, row: int | None) -> None:
@@ -325,9 +326,9 @@ class Worker:
         its lease: the tokens were spent either way, and the history is not thread state."""
         if res.limits:
             try:
-                self.bus.set_usage_limits(ad.agent, res.limits)
+                self.bus.set_usage_limits(quota.subject(self.config, ad.participant), res.limits)
             except Exception as e:  # noqa: BLE001 - history must never fail a turn
-                self.event("error", f"could not record usage limits: {e!r}", ad.agent)
+                self.event("error", f"could not record usage limits: {e!r}", ad.participant)
         total = res.usage if ad.session_usage else None
         if total is not None:
             res.session_usage, res.usage = total, None
@@ -338,11 +339,11 @@ class Worker:
                     self.bus.close_usage(row)
                 return
             res.usage = self.bus.record_usage(
-                self.thread_id, ad.agent, res.usage, ok=res.ok, job_id=self.job["id"], model=model,
+                self.thread_id, ad.participant, res.usage, ok=res.ok, job_id=self.job["id"], model=model,
                 session=res.external_id, session_total=total, resumed=resumed, row=row,
                 partial=res.partial_usage)
         except Exception as e:  # noqa: BLE001 - history must never fail a turn
-            self.event("error", f"could not record token usage: {e!r}", ad.agent)
+            self.event("error", f"could not record token usage: {e!r}", ad.participant)
             if row is not None:
                 try:  # the CLI has exited: at least mark the turn as ended, as a gap
                     self.bus.close_usage(row)
@@ -363,8 +364,9 @@ class Worker:
         until = now + self.config.quota_cooldown_s if estimated else min(max(reset, now + 60), now + 7 * 86400)
         source = found.get("source") if found.get("source") in quota.REASONS else "heuristic"
         with self.fenced():  # the cache is shared: only a worker that still holds its lease writes it
-            block = self.bus.set_quota_block(agent, until, source, quota.reason(agent, source),
-                                             scope=quota.scope_for(agent, model), estimated=estimated)
+            subj = quota.subject(self.config, agent)  # shared by every participant on it
+            block = self.bus.set_quota_block(subj, until, source, quota.reason(subj, source),
+                                             scope=quota.scope_for(self.config, agent, model), estimated=estimated)
         found.update(resets_at=until)
         self.quota_notice(agent, block)
 

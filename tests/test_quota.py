@@ -459,9 +459,9 @@ def test_whoami_and_clear_quota_cli(env, no_spawn, capsys):
     assert [b["agent"] for b in payload["out_of_usage"]] == ["codex"]
     assert cli.main(["agents"]) == 0
     assert "out of usage until" in capsys.readouterr().out
-    with pytest.raises(SystemExit):
-        cli.main(["agents", "--clear-quota", "nobody"])  # argparse rejects it, no NameError
-    capsys.readouterr()
+    # Participant names come from the config (#43): an unknown one is refused, no NameError.
+    assert cli.main(["agents", "--clear-quota", "nobody"]) == 2
+    assert "unknown participant 'nobody'" in capsys.readouterr().err
     assert cli.main(["agents", "--clear-quota", "codex"]) == 0
     assert "cleared 1" in capsys.readouterr().out
     assert bus.quota_block("codex") is None

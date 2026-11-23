@@ -241,13 +241,39 @@ def _print_history(bus: Bus, thread: str, color: bool) -> None:
         print(format_message(m, color))
 
 
+def add_mcp_args(s: argparse.ArgumentParser) -> None:
+    """The `agent-bus mcp` options (shared with setup-codex, which reads them back)."""
+    s.add_argument("--agent", required=True, choices=cfg.HARNESSES, help="the client's harness")
+    s.add_argument("--participant", help="speak as this configured participant on that harness "
+                                         "(default: the harness's own participant)")
+    s.add_argument("--role")
+
+
+class _ArgError(Exception):
+    pass
+
+
+class _QuietParser(argparse.ArgumentParser):
+    def error(self, message: str):  # raise instead of printing and exiting
+        raise _ArgError(message)
+
+
+def parse_mcp_args(args: list[str]) -> argparse.Namespace | None:
+    """``args`` (after ``mcp``) parsed exactly as `agent-bus mcp` would, or None if it
+    would refuse them."""
+    p = _QuietParser(prog="agent-bus mcp", add_help=False)
+    add_mcp_args(p)
+    try:
+        return p.parse_args(args)
+    except _ArgError:
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="agent-bus", description="Local message bus for coding agents.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("mcp", help="run the stdio MCP server for one agent")
-    s.add_argument("--agent", required=True, choices=cfg.AGENTS)
-    s.add_argument("--role")
+    add_mcp_args(sub.add_parser("mcp", help="run the stdio MCP server for one agent"))
 
     s = sub.add_parser("hook", help="(called by client hooks) print a fixed unread-mail hint at turn boundaries")
     s.add_argument("--client", required=True)
@@ -280,13 +306,14 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("agents", help="list the agents available on this machine, and why")
     s.add_argument("--json", action="store_true")
-    s.add_argument("--clear-quota", metavar="AGENT", choices=cfg.AGENTS,
-                   help="forget that AGENT is out of usage (e.g. after upgrading a plan)")
+    s.add_argument("--clear-quota", metavar="AGENT",
+                   help="forget that AGENT is out of usage (e.g. after upgrading a plan); this lifts it for "
+                        "every participant sharing its harness and account")
 
     s = sub.add_parser("usage", help="tokens headless turns used recently, per agent and per thread")
     s.add_argument("--hours", type=float, default=24, help="how far back to look (default 24)")
     s.add_argument("--thread", help="only this thread")
-    s.add_argument("--agent", choices=cfg.AGENTS, help="only this agent")
+    s.add_argument("--agent", help="only this agent")
     s.add_argument("--limit", type=int, default=20, help="most threads to list (default 20)")
     s.add_argument("--json", action="store_true")
 
@@ -304,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("tail", help="follow a thread (Rex-friendly: emits OSC 7501 status)")
     s.add_argument("thread")
-    s.add_argument("--peer", choices=cfg.AGENTS, help="show one peer's progress events")
+    s.add_argument("--peer", help="show one peer's progress events")
     s.add_argument("--events", action="store_true", help="show every peer's progress events")
     s.add_argument("--once", action="store_true", help="print and exit")
     s.add_argument("--no-status", action="store_true", help="don't emit OSC 7501 status")
@@ -323,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("reply", help="post to a thread as the human user")
     s.add_argument("thread")
     s.add_argument("body")
-    s.add_argument("--to", choices=cfg.AGENTS)
+    s.add_argument("--to", help="the participant to address")
 
     s = sub.add_parser("cancel", help="cancel a thread and kill its worker")
     s.add_argument("thread")
@@ -335,7 +362,8 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("rex-check", help="report what Rex shows about an agent session's block (read-only)")
     s.add_argument("--session", help="session id (default: the latest session of each agent)")
     s.add_argument("--block", help="Rex block to check instead of a session's")
-    s.add_argument("--agent", choices=cfg.AGENTS, help="agent expected in --block; alone, only that agent's latest session")
+    s.add_argument("--agent", help="harness expected in --block; alone, only that participant's (or "
+                                   "harness's) latest session")
     s.add_argument("--json", action="store_true")
 
     s = sub.add_parser("watch", help="open Rex viewer panes for a thread")
@@ -346,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "mcp":
         from . import mcp_server
-        mcp_server.main(args.agent, args.role)
+        mcp_server.main(args.agent, args.role, participant=args.participant)
         return 0
     if args.cmd == "hook":
         from . import hooks
@@ -436,25 +464,28 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         from . import quota
         conf = cfg.Config.load()
         if args.clear_quota:
+            subj = quota.subject(conf, conf.participant(args.clear_quota).name)
             with bus.tx():
-                n = bus.conn.execute("DELETE FROM quota_blocks WHERE agent=?", (args.clear_quota,)).rowcount
-                bus.due_now(args.clear_quota)
-            print(f"cleared {n} out-of-usage block(s) for {args.clear_quota}")
+                n = bus.conn.execute("DELETE FROM quota_blocks WHERE agent=?", (subj,)).rowcount
+                bus.due_now(quota.sharing(conf, subj))
+            print(f"cleared {n} out-of-usage block(s) for {args.clear_quota}"
+                  + (f" ({subj}, shared by {', '.join(quota.sharing(conf, subj))})"
+                     if quota.sharing(conf, subj) != [args.clear_quota] else ""))
             for tid in autoresume.sweep(bus):  # threads that waited only on it go now
                 print(f"resumed {tid}")
             return 0
         avail = conf.availability()
         from .peers import cli_version, web_search_report
         for a, v in avail.items():
+            harness = conf.harness_of(a)
+            if harness != a:
+                v["harness"] = harness
             if v["available"]:
-                v["version"] = cli_version(bus, a, conf.peer_command(a))
+                v["version"] = cli_version(bus, harness, conf.peer_command(a))
                 v["web_search"] = web_search_report(a, conf)
-        blocks: dict[str, list] = {}
-        for b in bus.quota_blocks():
-            blocks.setdefault(b["agent"], []).append(b)
-        limits: dict[str, list] = {}
-        for w in bus.usage_limits():
-            limits.setdefault(w["agent"], []).append(w)
+        # Keyed by harness and account: listed under every participant they apply to.
+        blocks = quota.by_participant(conf, bus.quota_blocks())
+        limits = quota.by_participant(conf, bus.usage_limits())
         if args.json:
             for a, v in avail.items():
                 if a in blocks:
@@ -468,7 +499,8 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         print(f"agents ({source}):")
         for a, v in avail.items():
             print(f"  {'yes' if v['available'] else 'no ':<4} {a:<12} {v['reason']}"
-                  + (f" ({v['version']})" if v.get("version") else ""))
+                  + (f" ({v['version']})" if v.get("version") else "")
+                  + (f" [harness {v['harness']}]" if v.get("harness") else ""))
             if v.get("web_search"):
                 print(f"       web search as a peer: {'on, ' if v['web_search']['enabled'] else ''}"
                       f"{v['web_search']['note']}")
