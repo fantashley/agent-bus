@@ -407,8 +407,10 @@ def test_preamble_offers_web_search_unless_it_is_off(env, no_spawn):
     t = {"id": "t-x", "participants": ["codex", "antigravity"], "initiator": HUMAN, "repo": "/r"}
     w = Worker.__new__(Worker)
     w.config = cfg.Config.load()
-    for agent in cfg.AGENTS:  # every adapter can search headless now (issue #46)
+    for agent in ("claude", "codex", "antigravity"):  # these can search headless now (issue #46)
         assert "You may read files in /r and search the web if that helps you answer." in w.preamble(agent, t)
+    # Copilot has no search tool, only web_fetch (issue #2).
+    assert "You may read files in /r and fetch web pages if that helps you answer." in w.preamble("copilot", t)
     w.config.peers["antigravity"]["web_search"] = False
     agy = w.preamble("antigravity", t)
     assert "search the web" not in agy and "You may read files in /r if that helps you answer." in agy

@@ -141,7 +141,7 @@ def check(bus: Bus, session_id: str | None = None, block: str | None = None, age
             add("rex_env", FAIL, "the session registered without REX_SESSION/REX_BLOCK: not started inside Rex, "
                 "or its client didn't pass them to the MCP server" + hint)
     if harness not in APPS:
-        raise ValueError("pass --agent (claude, codex or antigravity) with --block")
+        raise ValueError("pass --agent (claude, codex, antigravity or copilot) with --block")
     report = {"session": session_id, "agent": agent, "block": block, "checks": checks}
 
     if session:

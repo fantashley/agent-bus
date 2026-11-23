@@ -39,8 +39,8 @@ def test_configured_subset_drives_defaults_and_refusals(env, no_spawn):
 
 
 def test_unknown_agent_in_config_is_an_error(env):
-    set_config(env, agents=["claude", "copilot"])
-    with pytest.raises(ValueError, match="copilot"):
+    set_config(env, agents=["claude", "gemini"])
+    with pytest.raises(ValueError, match="gemini"):
         cfg.Config.load().available_agents()
 
 
@@ -161,4 +161,5 @@ def test_agents_cli_ask_default_and_whoami(env, no_spawn, capsys):
     payload = json.loads(res.content[0].text)
     assert payload["agent"] == "claude"
     assert payload["available_agents"] == ["codex"]
-    assert payload["unavailable_agents"] == {"antigravity": "not listed in config `agents`"}
+    assert payload["unavailable_agents"] == {"antigravity": "not listed in config `agents`",
+                                             "copilot": "not listed in config `agents`"}

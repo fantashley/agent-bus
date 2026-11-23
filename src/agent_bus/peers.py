@@ -93,6 +93,9 @@ class StreamState:
     denied: list = field(default_factory=list)  # actions the CLI reported denying (sanitised labels)
     api_error: str | None = None  # Claude: the last API error's own type ("model_not_found", ...)
     api_status: int | None = None  # and its HTTP status, if it gave one
+    # Set by an adapter's parser when the stream shows the turn can't run safely (say, an MCP
+    # server it couldn't switch off went live): the CLI is stopped at once and the turn fails.
+    abort: str | None = None
 
 
 Emit = Callable[[str, str], None]  # (kind, text)
@@ -117,6 +120,11 @@ class Adapter:
     # The CLI's usage report is the whole session's running total, so a resumed turn's own
     # share is the difference from the session's previous report (issue #26).
     session_usage: bool = False
+    # How the discussion preamble describes the web access a turn gets (issue #46).
+    web_note: str = " and search the web"
+    # Variables removed from the CLI's environment: ones that would widen what a headless
+    # turn may do, whatever its flags say.
+    drop_env: tuple[str, ...] = ()
 
     def event_type(self, obj: dict) -> str | None:
         t = obj.get("type")
@@ -237,7 +245,9 @@ class Adapter:
             pass  # only the usage-limit reading depends on it
         # Any agent-bus MCP server the peer CLI launches sees this and refuses every tool,
         # so a headless peer can't post, start jobs, or read blind proposals.
-        env = {**os.environ, **self.child_env(), "AGENT_BUS_PEER": peer_tag}
+        # drop_env goes last: a participant's configured env can't put one of them back.
+        env = {k: v for k, v in {**os.environ, **self.child_env()}.items() if k not in self.drop_env}
+        env["AGENT_BUS_PEER"] = peer_tag
         try:
             proc = subprocess.Popen(
                 inv.argv, cwd=cwd, stdin=subprocess.PIPE if inv.stdin is not None else subprocess.DEVNULL,
@@ -301,6 +311,9 @@ class Adapter:
                     self.parse_line(obj, st, emit)
                 except Exception as e:  # never let a format change kill the worker
                     emit("error", f"unparsed event: {e}")
+                if st.abort and proc.poll() is None:
+                    st.error = st.error or st.abort
+                    _killpg(proc)
         rc = proc.wait()
         killer_done.set()
         if not isinstance(st.external_id, str) or not st.external_id.strip():
@@ -326,6 +339,9 @@ class Adapter:
         if timed_out:
             return TurnResult(ok=False, text=text, external_id=st.external_id, error="turn timed out",
                               timed_out=True, usage=st.usage, partial_usage=partial, limits=limits)
+        if st.abort:
+            return TurnResult(ok=False, text="", external_id=st.external_id, error=st.abort, usage=st.usage,
+                              partial_usage=partial, limits=limits)
         if rc != 0 or st.error:
             err = st.error or f"exit {rc}: {''.join(stderr_tail)[-800:]}"
             # err already ends with the stderr tail unless the stream reported its own error.
@@ -1359,6 +1375,218 @@ class AntigravityAdapter(Adapter):
         return None  # nothing in the stream explains it: format drift
 
 
+# Copilot's read-only built-in tools (copilot 1.0.108, live probes 2026-11-23): file viewing,
+# search and globbing.  `--available-tools` makes these the session's whole tool set, so the
+# model never sees bash, apply_patch, task (sub-agents), skill, sql, the dynamic workflows or
+# any MCP server's tools.  `grep` is the name its bundled read-only agents use and `rg` the one
+# the main session declared; a name the build doesn't have is ignored.
+COPILOT_TOOLS = ("view", "grep", "rg", "glob")
+# Copilot has no web search tool; web_fetch fetches a page from this machine.  In -p mode a
+# fetch that no URL rule allows is denied, so with search on the turn also gets
+# --allow-all-urls (the same reach Claude's WebFetch has).
+COPILOT_WEB_TOOLS = ("web_fetch",)
+# Deny rules win over every allow, --allow-all-tools and allow-all settings included.
+COPILOT_DENY = ("shell", "write", "memory")
+# Options a configured `peers.copilot.args` may not pass: they widen the tool set, permissions,
+# MCP servers, paths or URLs (the URL ones are ours to give when web search is on), pick the
+# session, mode or output format, or send the session somewhere.  Valued and valueless alike:
+# each is dropped with the values after it (several take a variadic or optional value).
+_COPILOT_DROP = {
+    "-p", "--prompt", "-i", "--interactive", "--fleet", "--acp", "--connect",
+    "--available-tools", "--excluded-tools", "--allow-tool", "--allow-all-tools", "--allow-all-paths",
+    "--allow-all-urls", "--allow-url", "--allow-all", "--yolo", "--assisted-approval", "--trust-folder",
+    "--additional-mcp-config", "--enable-mcp-server", "--mcp-github-auth", "--plugin-dir", "--agent",
+    "--enable-all-github-mcp-tools", "--add-github-mcp-toolset", "--add-github-mcp-tool",
+    "--allow-all-mcp-server-instructions", "--enable-memory",
+    "--mode", "--autopilot", "--plan", "--max-autopilot-continues",
+    "-r", "--resume", "--continue", "--session-id", "-n", "--name", "-C",
+    "--output-format", "--stream", "-s", "--silent", "--share", "--share-gist", "--sync-session",
+    "--usage-output-file", "--log-dir",
+}
+# Environment variables equivalent to permission flags (`copilot help environment`).
+_COPILOT_DROP_ENV = ("COPILOT_ALLOW_ALL", "COPILOT_ASSISTED_APPROVAL")
+COPILOT_USAGE = {"input": "input", "output": "output", "cache_read": "cache_read", "cache_write": "cache_write"}
+# Copilot's own usage-limit messages (`copilot help limits` and `help billing`, 1.0.108):
+# "You've hit the rate limit for this model.", "You've hit your session rate limit.",
+# "You've reached your weekly rate limit.", "You've hit your rate limit.", and the plan's
+# "Plan: 100% used, resets <date>".  Not yet seen live.  Only the first is per model.
+_COPILOT_MODEL_QUOTA = r"hit the rate limit for this model"
+_COPILOT_QUOTA = (_COPILOT_MODEL_QUOTA, r"hit your (?:session )?rate limit", r"reached your (?:weekly|session) rate limit",
+                  r"plan: 100% used", r"usage limit (?:reached|exceeded)")
+
+
+def _copilot_strip(args: list[str], drop: set[str]) -> list[str]:
+    """Remove ``drop`` options from a copilot argv slice, with their ``=value`` or the
+    non-option tokens after them (copilot's variadic and optional values), up to a ``--``."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            out.extend(args[i:])
+            break
+        flag = a.split("=", 1)[0] if a.startswith("--") else a
+        short = len(a) > 2 and a[0] == "-" and a[1] != "-" and a[:2] in drop  # -Cdir, -rID
+        if flag in drop or short:
+            i += 1
+            if "=" not in a and not short:
+                while i < len(args) and not args[i].startswith("-"):
+                    i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+class CopilotAdapter(Adapter):
+    """GitHub Copilot CLI (`copilot -p`, 1.0.108; issue #2)."""
+    agent = "copilot"
+    recipe = "1"
+    default_command = cfg.AGENT_INFO["copilot"]["cli"]
+    # Every event type seen in live probes of 1.0.108 (2026-11-23), plus the error event its
+    # code emits.
+    known_events = frozenset({
+        "session.start", "session.resume", "session.info", "session.mcp_servers_loaded", "session.tools_updated",
+        "session.usage_checkpoint", "session.error", "session.warning", "session.indexed_search",
+        "instruction.update", "user.message",
+        "assistant.turn_start", "assistant.turn_end", "assistant.message_start", "assistant.message_delta",
+        "assistant.message", "assistant.tool_call_delta", "assistant.reasoning", "assistant.reasoning_delta",
+        "assistant.idle", "model.call_start", "model.call_finished", "model.call_final_result",
+        "tool.execution_start", "tool.execution_complete", "result"})
+    web_tools = "fetch pages (no search tool)"
+    web_note = " and fetch web pages"
+    # session.usage_checkpoint counts the whole session: a resumed probe's turn reported
+    # requests 4 / cost 2 after a first turn's 2 / 1.
+    session_usage = True
+    drop_env = _COPILOT_DROP_ENV
+    quota_patterns = _COPILOT_QUOTA
+
+    def classify(self, st, error):
+        found = super().classify(st, error)
+        # A harness for many vendors' models: one model's rate limit leaves the others usable.
+        if found and re.search(_COPILOT_MODEL_QUOTA, error, re.IGNORECASE):
+            found["scope"] = "model"
+        return found
+
+    def setting_args(self) -> list[str]:
+        args = []
+        if self.settings.get("model"):
+            args += ["--model", self.settings["model"]]
+        if self.settings.get("effort"):
+            args += ["--reasoning-effort", self.settings["effort"]]
+        return args
+
+    def extra_args(self) -> list[str]:
+        drop = set(_COPILOT_DROP)
+        if self.settings.get("model"):
+            drop.add("--model")
+        if self.settings.get("effort"):
+            drop.add("--reasoning-effort")
+        return _copilot_strip(self.extra, drop)
+
+    def mcp_servers(self, cwd: str) -> list[str]:
+        """Every MCP server copilot would load in ``cwd`` (user, workspace, plugin and
+        built-in), so each can be switched off.  Raises if they can't be listed."""
+        argv = [self.command, "mcp", "list", "--json"]
+        try:
+            out = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60,
+                                 stdin=subprocess.DEVNULL, env={**os.environ, "AGENT_BUS_PEER": "mcp-list"})
+            if out.returncode != 0:
+                raise PeerSetupError(f"`copilot mcp list` failed: {out.stderr.strip()[:300]}")
+            data = json.loads(out.stdout)
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+            raise PeerSetupError(f"could not list copilot MCP servers to disable them: {e}") from e
+        servers = data.get("mcpServers") if isinstance(data, dict) else None
+        if not isinstance(servers, dict):
+            raise PeerSetupError("unexpected `copilot mcp list --json` output")
+        bad = [n for n in servers if not (isinstance(n, str) and n and not n.startswith("-"))]
+        if bad:
+            raise PeerSetupError("`copilot mcp list --json` names a server that can't be switched off")
+        return sorted(servers)
+
+    def invocation(self, prompt, resume_id, cwd, add_dirs):
+        tools = list(COPILOT_TOOLS) + (list(COPILOT_WEB_TOOLS) if self.web_search else [])
+        # The prompt is read from stdin when -p is empty (live probe).  --no-auto-update runs
+        # the binary agent-bus fingerprinted, not a newer copy it downloaded earlier.
+        argv = [self.command, "-p", "", "--output-format", "json", "--stream", "on", "--no-ask-user",
+                "--no-auto-update", "--sync-session=off", "--disable-builtin-mcps",
+                f"--available-tools={','.join(tools)}"]
+        for rule in COPILOT_DENY:
+            argv.append(f"--deny-tool={rule}")
+        if self.web_search:
+            argv.append("--allow-all-urls")
+        for name in self.mcp_servers(cwd):
+            argv += ["--disable-mcp-server", name]
+        for d in add_dirs:
+            argv += ["--add-dir", d]
+        argv += self.setting_args()
+        sid = resume_id
+        if resume_id:
+            argv += ["--resume", resume_id]
+        else:
+            sid = new_uuid()
+            argv += ["--session-id", sid]
+        argv += self.extra_args()
+        return Invocation(argv=argv, stdin=prompt, external_id=sid)
+
+    def parse_line(self, obj, st, emit):
+        typ = obj.get("type")
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        if typ == "session.start" and isinstance(data.get("sessionId"), str):
+            st.external_id = data["sessionId"]
+        elif typ == "session.mcp_servers_loaded":
+            # Fail closed: every server should come up disabled.  One that is live (or in a
+            # state we don't know) wasn't switched off, so the turn stops before it runs.
+            servers = data.get("servers") if isinstance(data.get("servers"), list) else []
+            live = sorted({_safe_name(s.get("name")) for s in servers
+                           if isinstance(s, dict) and s.get("status") != "disabled"})
+            if live:
+                st.abort = (f"PEER_SETUP: copilot loaded MCP server(s) agent-bus didn't switch off "
+                            f"({', '.join(live)}); refusing to run the turn")
+        elif typ == "assistant.message":
+            content = data.get("content")
+            if isinstance(content, str) and content.strip():
+                st.final = content  # the last message with text is the reply
+                emit("text", _short(content))
+        elif typ == "tool.execution_start":
+            args = data.get("arguments") if isinstance(data.get("arguments"), dict) else {}
+            hint = next((args[k] for k in ("path", "pattern", "query", "url") if isinstance(args.get(k), str)), "")
+            emit("tool", _short(f"{_safe_name(data.get('toolName'))} {hint}".strip()))
+        elif typ == "session.usage_checkpoint":
+            st.usage = _copilot_usage(data)
+        elif typ == "session.error":
+            st.error = _short(str(data.get("message") or data.get("errorType") or "error"), 800)
+        elif typ == "result":
+            if isinstance(obj.get("sessionId"), str):
+                st.external_id = obj["sessionId"]
+            code = obj.get("exitCode")
+            if isinstance(code, int) and code != 0 and not st.error:
+                st.error = f"copilot reported exit code {code}"
+
+
+def _copilot_usage(data: dict) -> dict | None:
+    """The session's token counts so far, summed over its models.  ``tokenDetails`` splits
+    input from cache reads and writes (``usage.inputTokens`` is their sum); thinking is
+    ``usage.reasoningTokens``."""
+    snap = data.get("accountingSnapshot")
+    models = snap.get("modelMetrics") if isinstance(snap, dict) else None
+    if not isinstance(models, dict):
+        return None
+    total: dict = {}
+    for m in models.values():
+        if not isinstance(m, dict):
+            continue
+        details = m.get("tokenDetails") if isinstance(m.get("tokenDetails"), dict) else {}
+        counts = usage_from({k: (v or {}).get("tokenCount") for k, v in details.items() if isinstance(v, dict)},
+                            COPILOT_USAGE) or {}
+        thinking = _num((m.get("usage") or {}).get("reasoningTokens")) if isinstance(m.get("usage"), dict) else None
+        if thinking is not None:
+            counts["thinking"] = thinking
+        for k, v in counts.items():
+            total[k] = total.get(k, 0) + v
+    return total or None
+
+
 _NAME = re.compile(r"[A-Za-z0-9_.:-]{1,40}")
 
 
@@ -1385,7 +1613,7 @@ def _agy_hint(params) -> str:
     return ""
 
 
-ADAPTERS = {a.agent: a for a in (ClaudeAdapter, CodexAdapter, AntigravityAdapter)}
+ADAPTERS = {a.agent: a for a in (ClaudeAdapter, CodexAdapter, AntigravityAdapter, CopilotAdapter)}
 
 
 def adapter(agent: str, config: Config, settings: dict | None = None, repo: str | None = None) -> Adapter:

@@ -27,6 +27,10 @@ HARNESS_INFO = {
               "efforts": ("minimal", "low", "medium", "high", "xhigh")},
     "antigravity": {"cli": "agy", "app": "antigravity", "name": "Antigravity",
                     "efforts": ("low", "medium", "high", "xhigh", "max")},
+    # GitHub Copilot CLI (github/copilot-cli, 1.0.108; issue #2).  Its Rex app name is
+    # unverified: it may not report OSC 7501 program status at all.
+    "copilot": {"cli": "copilot", "app": "copilot", "name": "Copilot CLI",
+                "efforts": ("none", "minimal", "low", "medium", "high", "xhigh", "max")},
 }
 HARNESSES = tuple(HARNESS_INFO)
 # Before named participants (#43) a harness was also the only identity; kept as aliases.
@@ -68,7 +72,9 @@ ENV_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}")
 _AWS_REGION = re.compile(r"[a-z]{2}(?:-[a-z]+)+-\d+")
 # Set by agent-bus itself, or by a launch setting of its own.  PATH too: agent-bus finds and
 # fingerprints the CLI on its own PATH, so the turn must launch the same one (use `command`).
-_RESERVED_ENV = re.compile(r"AGENT_BUS_.*|CODEX_HOME|PATH")
+# COPILOT_ALLOW_ALL and COPILOT_ASSISTED_APPROVAL are Copilot CLI's permission switches as
+# environment variables (`copilot help environment`): a peer must never get them.
+_RESERVED_ENV = re.compile(r"AGENT_BUS_.*|CODEX_HOME|PATH|COPILOT_ALLOW_ALL|COPILOT_ASSISTED_APPROVAL")
 
 
 @dataclass(frozen=True)
@@ -145,7 +151,9 @@ def _check_env(where: str, env: object) -> None:
         if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
             raise ValueError(f"{where}.env: invalid variable name {name!r}")
         if _RESERVED_ENV.fullmatch(name):
-            hint = {"CODEX_HOME": " (use codex_home)", "PATH": " (set command to the CLI's path)"}.get(name, "")
+            hint = {"CODEX_HOME": " (use codex_home)", "PATH": " (set command to the CLI's path)",
+                    "COPILOT_ALLOW_ALL": " (headless Copilot turns stay read-only)",
+                    "COPILOT_ASSISTED_APPROVAL": " (headless Copilot turns stay read-only)"}.get(name, "")
             raise ValueError(f"{where}.env.{name} is set by agent-bus itself{hint}")
         if name.upper() in _SECRET_NAMES or _SECRET_NAME.search(name):
             raise ValueError(f"{where}.env.{name} looks like a credential: config.json must not hold secrets. "

@@ -2,7 +2,7 @@
 """Stand-in for claude / codex / agy that speaks each CLI's streaming JSON.
 
 Behaviour is driven by env vars so tests can script outcomes:
-  FAKE_AGENT      claude | codex | antigravity (which output format to emit)
+  FAKE_AGENT      claude | codex | antigravity | copilot (which output format to emit)
   FAKE_BEHAVIOUR  consensus (default) | stubborn | garbage | review
   FAKE_EXHAUSTED  comma-separated agents that fail every turn as out of usage, in their
                   CLI's own shape (FAKE_EXHAUSTED_LATER: the same, but only after round 1;
@@ -18,6 +18,8 @@ Behaviour is driven by env vars so tests can script outcomes:
                   denied_blank: a whitespace-only response; unfinished: the tool never reaches an end
                   state; toolerror: ERROR, no denial
   FAKE_MCP_LIST   what `codex mcp list --json` prints ($CODEX_HOME/fake-mcp.json wins if it exists)
+  FAKE_COPILOT_MCP_LIST  what `copilot mcp list --json` prints (FAKE_COPILOT_MCP_FAIL: it exits 1)
+  FAKE_COPILOT_LIVE_MCP  a server copilot reports loaded and live, as if it weren't switched off
   FAKE_APPROVE    comma-separated agents whose review verdicts approve (others request changes)
   FAKE_CLAUDE_USED / FAKE_CODEX_USED  how full the five_hour / primary usage-limit window is
                   (a fraction for claude's stream, a percentage in codex's rollout file)
@@ -64,6 +66,18 @@ if agent == "codex":
             [{"name": "agent-bus", "enabled": True}, {"name": "github", "enabled": True},
              {"name": "off", "enabled": False}]))
         sys.exit(0)
+
+if agent == "copilot" and argv[:2] == ["mcp", "list"]:
+    if os.environ.get("FAKE_COPILOT_MCP_FAIL"):
+        print("error: could not load MCP configuration", file=sys.stderr)
+        sys.exit(1)
+    # Like copilot 1.0.108: warnings on stderr, the configuration on stdout.
+    print("Warning: timed out checking for the built-in GitHub MCP server, so it is not shown here.", file=sys.stderr)
+    print(os.environ.get("FAKE_COPILOT_MCP_LIST") or json.dumps({"mcpServers": {
+        "agent-bus": {"type": "local", "command": "agent-bus", "args": ["mcp", "--agent", "copilot"],
+                      "enabled": True},
+        "computer-use": {"type": "stdio", "command": "computer-use-mcp", "source": "builtin", "enabled": True}}}))
+    sys.exit(0)
 
 if behaviour == "hang":
     import time
@@ -118,6 +132,8 @@ for flag in ("--session-id", "--resume", "--conversation"):
 if agent == "codex" and "resume" in argv:
     sid = argv[-2]
 resumed = sid is not None
+if agent == "copilot":  # its first turn names the new session with --session-id
+    resumed = "--resume" in argv
 sid = sid or str(uuid.uuid4())
 
 
@@ -130,7 +146,8 @@ def session_turns():
         c = json.loads(line)
         if c["agent"] == agent and sid in c["argv"]:
             n += 1
-    return 1 + n  # the first turn ran without the id in its argv
+    # The first turn ran without the id in its argv, except copilot's (--session-id).
+    return n if agent == "copilot" else 1 + n
 
 def out(obj):
     print(json.dumps(obj), flush=True)
@@ -153,6 +170,11 @@ if (listed("FAKE_EXHAUSTED") or (listed("FAKE_EXHAUSTED_LATER") and "round 1, wh
              "session_id": sid})
         out({"type": "result", "subtype": "success", "is_error": True,
              "result": "You've hit your limit · resets 3pm", "session_id": sid})
+    elif agent == "copilot":
+        out({"type": "session.start", "data": {"sessionId": sid, "copilotVersion": "1.0.108"}})
+        out({"type": "session.error", "data": {"errorType": "session",
+                                               "message": "You've reached your weekly rate limit. Wait, or switch to Auto."}})
+        out({"type": "result", "sessionId": sid, "exitCode": 1, "usage": {"premiumRequests": 0}})
     elif agent == "codex":
         out({"type": "thread.started", "thread_id": sid})
         out({"type": "error", "message": "You've hit your usage limit. Upgrade to Pro or try again in 2 hours 5 minutes."})
@@ -171,6 +193,8 @@ if (behaviour == "silent" or (repair and listed("FAKE_SILENT_REPAIR")) or listed
         out({"type": "system", "subtype": "init", "session_id": sid})
     elif agent == "codex":
         out({"type": "thread.started", "thread_id": sid})
+    elif agent == "copilot":
+        out({"type": "session.start", "data": {"sessionId": sid}})
     else:
         out({"event": "init", "conversation_id": sid})
     if os.environ.get("FAKE_STRAY"):
@@ -240,6 +264,32 @@ elif agent == "codex":
     n = session_turns()  # like codex 0.171.0: the session's running total
     out({"type": "turn.completed", "usage": {"input_tokens": 20 * n, "cached_input_tokens": 200 * n,
                                              "output_tokens": 6 * n, "reasoning_output_tokens": 4 * n}})
+elif agent == "copilot":
+    # The shape of copilot 1.0.108's `-p --output-format json` stream (live probes 2026-11-23).
+    out({"type": "session.resume" if resumed else "session.start",
+         "data": {"sessionId": sid, "copilotVersion": "1.0.108"} if not resumed else {"eventCount": 16}})
+    disabled = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--disable-mcp-server"]
+    servers = [{"name": n, "status": "disabled"} for n in disabled]
+    servers.append({"name": "github-mcp-server", "status": "disabled" if "--disable-builtin-mcps" in argv
+                    else "connected", "source": "builtin"})
+    if os.environ.get("FAKE_COPILOT_LIVE_MCP"):
+        servers.append({"name": os.environ["FAKE_COPILOT_LIVE_MCP"], "status": "connected"})
+    out({"type": "session.mcp_servers_loaded", "ephemeral": True, "data": {"servers": servers}})
+    if any(s["status"] != "disabled" for s in servers):
+        import time
+        time.sleep(30)  # a real turn would go on to run; agent-bus must stop it
+    out({"type": "user.message", "data": {"content": prompt}})
+    out({"type": "assistant.message", "data": {"content": "", "toolRequests": [{"name": "view", "arguments": {"path": "a.txt"}}]}})
+    out({"type": "tool.execution_start", "data": {"toolName": "view", "arguments": {"path": "a.txt"}}})
+    out({"type": "tool.execution_complete", "data": {"success": True}})
+    out({"type": "assistant.message_delta", "ephemeral": True, "data": {"deltaContent": reply[:5]}})
+    out({"type": "assistant.message", "data": {"content": reply, "toolRequests": []}})
+    n = session_turns()  # like copilot 1.0.108: the session's running total
+    out({"type": "session.usage_checkpoint", "data": {"accountingSnapshot": {"modelMetrics": {"gpt-6.2-sol": {
+        "usage": {"inputTokens": 330 * n, "outputTokens": 8 * n, "reasoningTokens": 2 * n},
+        "tokenDetails": {"input": {"tokenCount": 30 * n}, "cache_read": {"tokenCount": 300 * n},
+                         "cache_write": {"tokenCount": 0}, "output": {"tokenCount": 8 * n}}}}}}})
+    out({"type": "result", "sessionId": sid, "exitCode": 0, "usage": {"premiumRequests": n}})
 else:
     out({"event": "init", "conversation_id": sid})
     out({"event": "step_update", "step_update": {"conversation_id": sid, "state": "ACTIVE", "step_type": "agent_response", "text_delta": reply}})

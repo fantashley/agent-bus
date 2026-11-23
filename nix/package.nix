@@ -29,7 +29,7 @@ python3Packages.buildPythonApplication {
   '';
 
   meta = {
-    description = "Local message bus that lets Claude Code, Codex and Antigravity talk to each other over MCP";
+    description = "Local message bus that lets Claude Code, Codex, Antigravity and Copilot CLI talk to each other over MCP";
     mainProgram = "agent-bus";
     license = lib.licenses.mit;
     platforms = lib.platforms.unix;

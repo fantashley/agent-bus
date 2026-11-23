@@ -102,12 +102,16 @@ def model_scope(config: cfg.Config, agent: str, model: str | None) -> str:
     return model_key(model)
 
 
-def scope_for(config: cfg.Config, agent: str, model: str | None, source: str = "heuristic") -> str:
+def scope_for(config: cfg.Config, agent: str, model: str | None, source: str = "heuristic",
+              per_model: bool = False) -> str:
     """Claude and Codex limits are account-wide; an Antigravity quota may be per model, and
-    a Bedrock throttle or quota is per model and region.  Credentials are account-wide."""
+    a Bedrock throttle or quota is per model and region.  Copilot runs many vendors' models
+    and has both kinds (#2): its adapter says ``per_model`` for "the rate limit for this
+    model", and its session, weekly and plan limits stay account-wide.  Credentials are
+    account-wide."""
     if source == "auth":
         return ""
-    if config.harness_of(agent) == "antigravity" or config.bedrock(agent):
+    if per_model or config.harness_of(agent) == "antigravity" or config.bedrock(agent):
         return model_scope(config, agent, model)
     return ""
 

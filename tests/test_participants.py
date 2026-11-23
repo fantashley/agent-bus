@@ -53,7 +53,7 @@ MINI = {"codex-mini": {"harness": "codex", "model": "m-mini", "effort": "low"}}
 def test_default_config_is_unchanged(env):
     """No `participants`: exactly the built-in names, each its own harness, as before."""
     conf = cfg.Config.load()
-    assert list(conf.participant_map()) == ["claude", "codex", "antigravity"] == list(cfg.AGENTS)
+    assert list(conf.participant_map()) == ["claude", "codex", "antigravity", "copilot"] == list(cfg.AGENTS)
     assert list(conf.availability()) == list(cfg.AGENTS)
     for name in cfg.AGENTS:
         p = conf.participant(name)
@@ -67,10 +67,10 @@ def test_default_config_is_unchanged(env):
 def test_default_discussion_and_review_unchanged(env, no_spawn, monkeypatch):
     bus = env["bus"]
     tid = Service(bus, HUMAN).start_discussion("Q?", max_rounds=2)["thread"]["id"]
-    assert bus.thread(tid)["participants"] == ["claude", "codex", "antigravity"]
+    assert bus.thread(tid)["participants"] == ["claude", "codex", "antigravity", "copilot"]
     run_job(bus, tid)
     assert bus.thread(tid)["status"] == "resolved"
-    assert {c["agent"] for c in calls(env)} == {"claude", "codex", "antigravity"}
+    assert {c["agent"] for c in calls(env)} == {"claude", "codex", "antigravity", "copilot"}
 
     monkeypatch.setenv("FAKE_APPROVE", "codex")
     monkeypatch.setattr(Worker, "review_diff", FAKE_DIFF)
@@ -92,7 +92,8 @@ def test_participant_inherits_harness_settings(env):
                             "codex-web": {"harness": "codex", "web_search": True, "args": []}}
     config_path(env).write_text(json.dumps(data))
     conf = cfg.Config.load()
-    assert list(conf.participant_map()) == ["claude", "codex", "antigravity", "codex-mini", "codex-web"]
+    assert list(conf.participant_map()) == ["claude", "codex", "antigravity", "copilot", "codex-mini",
+                                         "codex-web"]
     assert conf.peer_command("codex-mini") == data["peers"]["codex"]["command"]
     assert conf.peer_args("codex-mini") == ["-c", "x=1"] and conf.peer_args("codex-web") == []
     assert conf.peer_settings("codex-mini") == {"model": "m-mini", "effort": "high"}

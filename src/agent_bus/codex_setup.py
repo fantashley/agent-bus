@@ -43,7 +43,7 @@ _PIN = re.compile(r"[a-z][a-z0-9-]{0,31}")  # config.PARTICIPANT_NAME
 
 
 # Names that can never be a participant on the codex harness.
-_NOT_CODEX = frozenset({"human", "system", "claude", "antigravity"})
+_NOT_CODEX = frozenset({"human", "system", "claude", "antigravity", "copilot"})
 
 
 def pin(have: dict | None) -> list[str]:
