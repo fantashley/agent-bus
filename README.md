@@ -57,6 +57,11 @@ its earlier findings; it gets the interdiff plus anything you posted on the thre
 `send` explaining how each finding was addressed). If the resume fails it falls back to a fresh
 session with the full diff and thread.
 
+If the repo doesn't have a pinned commit (base, head, or the previous head a follow-up diffs
+against), the reviewer isn't started. The thread goes to `needs_human` with a notice naming the
+missing commit, and the job is marked failed. Make the commit available in the repo, then request
+the review again (a first pass) or run `agent-bus resume <thread>` (either pass).
+
 ## Model and effort
 
 Headless peers use each CLI's default model and reasoning effort unless you set them:
