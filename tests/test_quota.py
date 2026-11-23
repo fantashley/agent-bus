@@ -237,6 +237,9 @@ def test_running_out_during_a_repair_turn_posts_nothing(env, no_spawn, monkeypat
 def test_quota_failure_keeps_the_pinned_session(env, no_spawn, monkeypatch):
     bus = env["bus"]
     monkeypatch.setenv("FAKE_EXHAUSTED_LATER", "codex")
+    # Round 1 runs in parallel, so codex's proposal may be P1; claude agreeing with it
+    # first in round 2 would then end the thread before codex's resumed turn (#58).
+    monkeypatch.setenv("FAKE_BEHAVIOUR", "stubborn")
     tid = Service(bus, HUMAN).start_discussion("Which DB?", peers=["claude", "codex"])["thread"]["id"]
     run_job(bus, tid)
     first = [c for c in calls(env, "codex")]
