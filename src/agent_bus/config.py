@@ -118,6 +118,8 @@ class Config:
         for agent, entry in (conf.peers or {}).items():  # reject a bad model/effort when loading
             if agent in AGENT_INFO and isinstance(entry, dict):
                 check_peer_settings(agent, {k: entry.get(k) for k in ("model", "effort")})
+                if not isinstance(entry.get("web_search", True), bool):
+                    raise ValueError(f"peers.{agent}.web_search must be true or false")
         return conf
 
     def peer_command(self, agent: str, default: str | None = None) -> str:
@@ -169,6 +171,11 @@ class Config:
         merged = {k: base[k] for k in ("model", "effort") if base.get(k) is not None}
         merged.update(check_peer_settings(agent, override))
         return check_peer_settings(agent, merged)
+
+    def web_search(self, agent: str) -> bool:
+        """Whether ``agent``'s headless turns may search the web (issue #46): on unless
+        config sets ``peers.<agent>.web_search = false``."""
+        return self.peers.get(agent, {}).get("web_search", True) is not False
 
     def peer_args(self, agent: str) -> list[str]:
         return list(self.peers.get(agent, {}).get("args", []))

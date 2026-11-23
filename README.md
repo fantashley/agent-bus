@@ -19,8 +19,10 @@ directly, instead of a human relaying messages between windows. Designed in
   de-duplication. Jobs whose worker died are reaped, so a crash never wedges a thread.
 - **Headless peers can't use tools that act.** Claude runs with `--strict-mcp-config` and only
   Read/Grep/Glob/web tools; Codex has every live MCP server disabled (and the turn fails if they
-  can't be listed); Antigravity has no per-session switch, so its turns are refused while it has any
-  MCP server besides agent-bus configured, unless `peers.antigravity.allow_mcp` is set. Any
+  can't be listed) and its `apps` feature switched off; Antigravity gets session-only deny rules
+  for commands and file writes, and since it has no per-session switch for MCP servers, its turns
+  are refused while it has any MCP server besides agent-bus configured, unless
+  `peers.antigravity.allow_mcp` is set. Any
   agent-bus MCP server a peer launches sees `AGENT_BUS_PEER` and refuses every call. The repo
   allowlist decides which repos requests may target and where peers run; reads are bounded by
   each CLI's read-only mode, not by the allowlist.
@@ -84,6 +86,57 @@ its thread for later passes unless new ones are given.
 Other effort values, and model names outside a safe character set, are rejected when the
 config loads or when the request is made. The flags are passed on resumed turns too, and each
 `turn_start` progress line shows what the turn ran with.
+
+## Web search
+
+Headless peers can search the web during discussions and reviews (issue #46), and everything
+else stays read-only:
+
+| Agent | What it gets | How it's set up | Off switch |
+|---|---|---|---|
+| Claude Code | WebSearch, WebFetch | `--tools` (the session's whole built-in set) and `--allowedTools` | removed and `--disallowedTools` |
+| Codex | hosted `web_search`: search and open pages | `-c web_search="cached"`, unless `peers.codex.args` sets another mode | `-c web_search="disabled"` (also when `peers.codex.args` sets it) |
+| Antigravity | `search_web` only: plan mode has no page fetch | needs no approval in plan mode | **instruction only** |
+
+To turn it off for an agent, set `peers.<agent>.web_search = false` in `config.json` (or
+`local.agentBus.peerSettings.<agent>.web_search = false`). The preamble then stops offering it.
+agy 1.5.13 has no flag or permission rule that removes `search_web` (`search_web(*)` and
+`read_url(*)` deny rules are ignored), so for Antigravity the off switch only tells the model
+not to use it, and a review or discussion with it can't be guaranteed web-free. `agent-bus
+agents` shows each peer's web search, and says when off isn't enforced. agent-bus's switch
+decides Codex's mode, so a `web_search` in `~/.codex/config.toml` doesn't apply to peers. A
+per-repo switch isn't there yet.
+
+Where the requests go: Claude's WebSearch and Codex's `web_search` (searching and opening
+pages) run on Anthropic's and OpenAI's side, and agy's `search_web` is Google-grounded search
+run by Google. Claude's WebFetch fetches the page from this machine, from the local CLI process.
+
+What keeps the rest read-only, checked with live probes of Claude Code 2.1.330, codex 0.171.0
+and agy 1.5.13:
+- **Claude Code:** `--tools` limits the session to Read, Grep, Glob and the web tools. Without
+  it, Bash, CronCreate and the other built-in tools are still declared, just not pre-approved.
+  A `--tools` in `peers.claude.args` is dropped.
+- **Codex:** the read-only sandbox blocks writes and shell network access (`touch` fails with a
+  read-only file system, `curl` can't resolve hosts). The `apps` feature is turned off because
+  it adds a `codex_apps` MCP server, which `codex mcp list` doesn't show, with tools such as
+  plugin management and site publishing. `features.apps=false` and the web search mode come
+  after `peers.codex.args`, so a later `-c` can't undo them. The MCP listing that decides which
+  servers to switch off sees every `-c`/`--config` spelling and `--profile` from those args.
+- **Antigravity:** every turn passes `--settings` with deny rules for `command(*)`,
+  `write_file(*)` (which covers edits) and `execute_url(*)` (the browser subagent). Deny wins over
+  any allow rule in your own settings, so a `--settings` in `peers.antigravity.args` is dropped.
+  Without these rules, plan mode writes files without asking under the system temp directory,
+  and a terminal command is auto-denied and ends the turn with no reply. With them, either one
+  is a tool error the model answers past.
+
+Pages a peer reads are untrusted. A peer's reply already reaches you and the other agents as
+`peer_data`, and a peer can't write files, use the network from a shell, or run commands at
+all except Codex's inside its read-only sandbox (Claude has no shell tool, and Antigravity's
+are denied). Text a page injects can still steer both what the peer says and what it searches
+or fetches next. Web tools are an outbound path:
+a search query or a fetched URL can carry whatever the peer has read, including private code
+in a review, to the search provider or to the site it names. If that matters for an agent, turn
+its web search off (for Antigravity that's only an instruction).
 
 ## Out of usage
 

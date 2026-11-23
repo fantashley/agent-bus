@@ -25,7 +25,7 @@ from typing import Iterator
 from . import config as cfg
 from . import prompts, quota, unvotable
 from .db import HUMAN, SYSTEM, Bus, BusError
-from .peers import ADAPTERS, TurnResult, adapter, cli_version, extract_json, format_usage
+from .peers import TurnResult, adapter, cli_version, extract_json, format_usage
 
 LEASE_S = 120
 
@@ -332,7 +332,7 @@ class Worker:
 
     def preamble(self, agent: str, t: dict) -> str:
         repo_note = f" in {t['repo']}" if t["repo"] else ""
-        web = ADAPTERS[agent].web_search if agent in ADAPTERS else True
+        web = adapter(agent, self.config).web_search  # as the turn itself resolves it
         return prompts.PREAMBLE.format(
             agent=agent, thread=t["id"], participants=", ".join(t["participants"]),
             initiator="the human user" if t["initiator"] == HUMAN else t["initiator"], repo_note=repo_note,

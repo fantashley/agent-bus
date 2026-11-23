@@ -169,13 +169,23 @@ in
               low, medium, high, xhigh. agent-bus rejects other values.
             '';
           };
+          web_search = lib.mkOption {
+            type = lib.types.nullOr lib.types.bool;
+            default = null;
+            example = false;
+            description = ''
+              Whether this agent's headless turns may search the web (null: on). Antigravity
+              has no switch for its search_web tool, so for it false is only an instruction.
+            '';
+          };
         };
       });
       default = { };
       example = lib.literalExpression ''{ codex.effort = "high"; claude.model = "opus"; }'';
       description = ''
-        Per-agent model and reasoning effort for the headless peers agent-bus runs in
-        discussions and reviews. A discussion or review can override them per thread.
+        Per-agent model, reasoning effort and web search for the headless peers agent-bus
+        runs in discussions and reviews. A discussion or review can override model and effort
+        per thread.
       '';
     };
 

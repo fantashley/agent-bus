@@ -41,6 +41,9 @@ def test_real_stream_parses(env, fx):
     for word in fx.get("final_contains", []):
         assert word in res.text
     assert res.usage and res.usage.get("input") is not None
+    # The tool calls the capture is about show up as progress (issue #46).
+    for tool in fx.get("tools", []):
+        assert any(k == "tool" and t.startswith(tool + " ") for k, t in events), (tool, events)
     # Every event type in a real capture is one the adapter knows.
     assert not [t for k, t in events if k == "format"], events
 
