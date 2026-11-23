@@ -1274,6 +1274,12 @@ class Bus:
                 "pending": [r for r in reviewers if by[r]["state"] in ("pending", "stale", "reviewing")],
                 "complete": bool(reviewers) and all(by[r]["state"] == "approved" for r in reviewers)}
 
+    def last_verdict(self, thread_id: str, agent: str) -> dict | None:
+        """``agent``'s newest review verdict on the thread, or None."""
+        row = self._one("SELECT * FROM messages WHERE thread_id=? AND sender=? AND kind='review_verdict'"
+                        " ORDER BY id DESC LIMIT 1", thread_id, agent)
+        return self._msg(row) if row else None
+
     def next_reviewer(self, thread_id: str, after: str | None) -> str | None:
         """The next required reviewer without a valid approval, going round the list from
         the one after ``after`` (the last round's reviewer), or None once all have approved."""

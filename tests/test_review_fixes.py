@@ -1007,3 +1007,106 @@ def test_single_standings_ignore_an_earlier_rounds_verdict_at_the_same_head(env,
         bus.transition(tid, "resolved")
         res = claude.request_review("codex", str(env["repo"]), x, head, prev_head_commit_id=prev)
     assert not res["review"]["complete"] and res["review"]["reviewers"]["codex"]["state"] != "approved"
+
+
+# ---- #69: the interdiff starts at the reviewer's own last verdict -----------
+
+def _reviewed_at_p(env):
+    """A single-reviewer thread whose reviewer (codex) gave a verdict at P on base X."""
+    repo = env["repo"]
+    sh, rev = _jj_repo(repo)
+    x, p = rev("@-"), rev("@")
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    a = claude.request_review("codex", str(repo), x, p)["thread"]["id"]
+    run_job(bus, a)
+    return repo, rev, bus, claude, a, x, p
+
+
+def test_followup_after_a_pass_that_never_reached_the_reviewer_covers_it(env, no_spawn):
+    """Verdict at O; the O -> P pass is reaped before codex runs; P -> H then resumes codex
+    with the interdiff from O, not P, so the changes in O..P reach it."""
+    repo, rev, bus, claude, a, x, o = _reviewed_at_p(env)
+    (repo / "a.txt").write_text("CHANGE-IN-P\n")
+    p = rev("@")
+    res = claude.request_review("codex", str(repo), x, p, prev_head_commit_id=o)
+    bus.conn.execute("UPDATE jobs SET status='failed', error='reaped' WHERE id=?", (res["job"]["id"],))
+    (repo / "b.txt").write_text("CHANGE-IN-H\n")
+    h = rev("@")
+    claude.request_review("codex", str(repo), x, h, prev_head_commit_id=p)
+    run_job(bus, a)
+    last = [c for c in calls(env) if c["agent"] == "codex"][-1]
+    assert last["argv"][:3] == ["exec", "resume", "--json"]
+    assert "Interdiff" in last["prompt"] and f"you last reviewed {o}" in last["prompt"]
+    assert "CHANGE-IN-P" in last["prompt"] and "CHANGE-IN-H" in last["prompt"]
+
+
+@pytest.mark.parametrize("how", ["replaced", "legacy"])
+def test_followup_needs_the_session_that_gave_the_last_verdict(env, no_spawn, how):
+    """The saved session isn't the one that gave the verdict at P (a later fresh session gave
+    none), or the verdict predates recording it: full diff in a fresh session."""
+    repo, rev, bus, claude, a, x, p = _reviewed_at_p(env)
+    if how == "replaced":
+        bus.set_peer_session(a, "codex", "a-later-session")
+    else:
+        m = bus.last_verdict(a, "codex")
+        data = {k: v for k, v in m["data"].items() if k != "session"}
+        bus.conn.execute("UPDATE messages SET data=? WHERE id=?", (json.dumps(data), m["id"]))
+    (repo / "a.txt").write_text("CHANGE-IN-H\n")
+    h = rev("@")
+    claude.request_review("codex", str(repo), x, h, prev_head_commit_id=p)
+    run_job(bus, a)
+    last = [c for c in calls(env) if c["agent"] == "codex"][-1]
+    assert last["argv"][:3] != ["exec", "resume", "--json"]
+    assert "Interdiff" not in last["prompt"] and "Diff from base to head" in last["prompt"]
+    assert f"Previous head (already reviewed): {p}" in last["prompt"]
+    # Its verdict came from the session now saved: the next follow-up resumes it.
+    (repo / "b.txt").write_text("more\n")
+    h2 = rev("@")
+    claude.request_review("codex", str(repo), x, h2, prev_head_commit_id=h)
+    run_job(bus, a)
+    last = [c for c in calls(env) if c["agent"] == "codex"][-1]
+    assert last["argv"][:3] == ["exec", "resume", "--json"] and f"you last reviewed {h}" in last["prompt"]
+
+
+def test_followup_on_a_new_base_sends_the_full_diff(env, no_spawn):
+    """A verdict at P on base X doesn't make P..H the change once the base moved (#75)."""
+    repo, rev, bus, claude, a, x, p = _reviewed_at_p(env)
+    (repo / "a.txt").write_text("CHANGE-IN-H\n")
+    h = rev("@")
+    claude.request_review("codex", str(repo), rev("root()"), h, prev_head_commit_id=p)
+    run_job(bus, a)
+    last = [c for c in calls(env) if c["agent"] == "codex"][-1]
+    assert last["argv"][:3] != ["exec", "resume", "--json"]
+    assert "Interdiff" not in last["prompt"] and "Diff from base to head" in last["prompt"]
+
+
+def test_verdict_session_is_not_shown_to_agents(env, no_spawn):
+    repo, rev, bus, claude, a, x, p = _reviewed_at_p(env)
+    assert bus.last_verdict(a, "codex")["data"]["session"] == bus.peer_session(a, "codex")
+    shown = [m for m in claude.history(a)["messages"] if m["kind"] == "review_verdict"]
+    assert shown and "session" not in shown[0]["data"]
+
+
+def test_verdict_from_a_turn_without_a_session_id_is_not_resumed(env, no_spawn, monkeypatch):
+    """A fresh turn that timed out with a parseable verdict but no session id leaves an older
+    session saved: that session never saw this pass, so the next follow-up doesn't resume it."""
+    from agent_bus.peers import TurnResult
+    repo, rev, bus, claude, a, x, p = _reviewed_at_p(env)
+    bus.set_peer_session(a, "codex", "a-later-session")  # so the next pass runs fresh
+    (repo / "a.txt").write_text("CHANGE-IN-H\n")
+    h = rev("@")
+    claude.request_review("codex", str(repo), x, h, prev_head_commit_id=p)
+    with monkeypatch.context() as m:
+        m.setattr(Worker, "turn", lambda self, *a, **k: TurnResult(
+            ok=False, text='{"verdict": "request_changes", "summary": "s", "findings": []}',
+            error="turn timed out"))
+        run_job(bus, a)
+    assert bus.last_verdict(a, "codex")["data"]["head_commit_id"] == h
+    assert bus.peer_session(a, "codex") == "a-later-session"
+    (repo / "b.txt").write_text("more\n")
+    h2 = rev("@")
+    claude.request_review("codex", str(repo), x, h2, prev_head_commit_id=h)
+    run_job(bus, a)
+    last = [c for c in calls(env) if c["agent"] == "codex"][-1]
+    assert last["argv"][:3] != ["exec", "resume", "--json"] and "Diff from base to head" in last["prompt"]

@@ -810,10 +810,13 @@ class Worker:
         refs = t["refs"] or {}
         reviewer = refs["reviewer"]
         followup = bool(refs.get("prev_head_commit_id"))
-        # A pass recovered after #59 never reached the session, which may not have seen
-        # the previous head: it gets the full diff.
-        resume = (followup and not refs.get("full_diff")
-                  and self.bus.peer_session(self.thread_id, reviewer) is not None)
+        mine = self.bus.last_verdict(self.thread_id, reviewer)
+        frm = self.interdiff_from(refs, reviewer, mine) if followup else None
+        resume = frm is not None
+        # The previous head the prompts name is one this reviewer gave a verdict on (#69): the
+        # interdiff's start, or for the full diff its last verdict's head, if it has one.
+        refs = {**refs, "prev_head_commit_id": frm if resume else
+                (mine["data"].get("head_commit_id") if mine else None)}
         everything = self.bus.history(self.thread_id)["messages"]  # one snapshot for prompt + watermark
         upto = everything[-1]["id"] if everything else 0
         since = self.bus.delivered(self.thread_id, reviewer)
@@ -856,6 +859,7 @@ class Worker:
         if res.ok or res.text:
             self.mark_delivered(reviewer, upto)
         verdict = normalize_verdict(extract_json(res.text) if res.text else None)
+        gave = res  # the turn the verdict came from
         if verdict is None and res.ok:
             res2 = self.turn(reviewer, "Reply again with only the JSON verdict object described above.",
                              fresh_prompt=fresh + "\n\nReply with only the JSON verdict object.")
@@ -867,7 +871,7 @@ class Worker:
                 return None
             if res2.incomplete:
                 res = res2
-            verdict = normalize_verdict(extract_json(res2.text) if res2.text else None)
+            verdict, gave = normalize_verdict(extract_json(res2.text) if res2.text else None), res2
         if verdict is None:
             if self.finish_thread("needs_human"):
                 self.safe_post(SYSTEM, f"{reviewer} did not return a usable verdict: "
@@ -878,12 +882,34 @@ class Worker:
         for f in verdict["findings"]:
             loc = f"{f['file']}:{f['line']}" if f["line"] else f["file"]
             lines.append(f"- [{f['severity']}] {loc}: {f['comment']}")
+        # The session that gave the verdict, so a later pass resumes it only if it is still
+        # the saved one (see interdiff_from).  That turn's own id: a turn that failed without
+        # reporting one leaves an older session saved, which never saw this pass.
         self.post(reviewer, "\n".join(lines).strip(), kind="review_verdict", session_id=f"job:{self.job['id']}",
                   recipient=t["initiator"],
                   data={"verdict": verdict["verdict"], "findings": verdict["findings"],
                         "head_commit_id": refs["head_commit_id"], "base_commit_id": refs["base_commit_id"],
-                        "revision": refs.get("revision", 0), "request_id": t["id"]})
+                        "revision": refs.get("revision", 0), "request_id": t["id"],
+                        "session": gave.external_id})
         return verdict
+
+    def interdiff_from(self, refs: dict, reviewer: str, mine: dict | None) -> str | None:
+        """The head to send ``reviewer`` only the interdiff from, resuming its session, or
+        None for the full base..head diff in a fresh session (#69).
+
+        Only from the head of its last verdict on this thread (``mine``), and only when that
+        verdict was on this base and came from the session still saved for it.  The
+        requester's previous head proves nothing: the pass at it may never have reached the
+        reviewer.  Nor does a verdict whose session has since been replaced (a later pass that
+        started a fresh one and gave no verdict), or one with no recorded base or session
+        (from an older agent-bus).  A pass #59 left without one is forced to the full diff."""
+        session = self.bus.peer_session(self.thread_id, reviewer)
+        if refs.get("full_diff") or mine is None or session is None:
+            return None
+        data = mine["data"]
+        if data.get("session") != session or data.get("base_commit_id") != refs["base_commit_id"]:
+            return None
+        return data.get("head_commit_id")
 
     def report_missing(self, t: dict, e: MissingRevision, followup: bool) -> None:
         """Tell the requester which pinned commit is missing, park the thread for them and fail
