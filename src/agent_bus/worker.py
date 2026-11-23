@@ -17,6 +17,7 @@ import secrets
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -774,9 +775,9 @@ class Worker:
             if nxt is None:
                 break
             mine = self.bus.review_standings(self.thread_id)["reviewers"][nxt]
-            # Interdiff from its own last head, unless it reviewed against another base.
-            last = mine["head_commit_id"] if mine["base_commit_id"] == refs["base_commit_id"] else None
-            self.set_thread(refs=json.dumps({**refs, "reviewer": nxt, "prev_head_commit_id": last}),
+            # Interdiff from its own last head (rebase-aware on another base, #75).
+            self.set_thread(refs=json.dumps({**refs, "reviewer": nxt,
+                                             "prev_head_commit_id": mine["head_commit_id"]}),
                             round=t["round"] + 1, max_rounds=t["round"] + 1)
         self.review_outcome()
 
@@ -824,9 +825,25 @@ class Worker:
         notes = lambda msgs: [m for m in msgs if m["sender"] not in (reviewer, SYSTEM)  # noqa: E731
                               and m["kind"] in ("message", "status", "review_verdict")]
         earlier = [m for m in everything if m["sender"] == reviewer and m["kind"] == "review_verdict"]
+        # Its last verdict was on another base (the change was rebased): a rebase-aware
+        # interdiff, or the full diff in a fresh session if that can't be trusted (#75).
+        old_base = mine["data"]["base_commit_id"] if resume else None
+        rebased = resume and old_base != refs["base_commit_id"]
+        rebase_note = fallback = ""
         try:
             full_diff, full_heading = self.review_diff(refs, interdiff=False)
-            inter, inter_heading = self.review_diff(refs, interdiff=True) if resume else ("", "")
+            if rebased:
+                inter, why = self.rebase_interdiff(refs, old_base, full_diff)
+                if inter is None:
+                    resume, fallback = False, f" Full diff: the base changed and {why}."
+                else:
+                    inter_heading = "Interdiff since the head you last reviewed (rebase-aware):"
+                    rebase_note = prompts.REBASE_NOTE.format(old_base=old_base, base=refs["base_commit_id"])
+                    if not inter:
+                        inter = "(empty diff: a pure rebase)"
+                        rebase_note += prompts.PURE_REBASE
+            elif resume:
+                inter, inter_heading = self.review_diff(refs, interdiff=True)
         except MissingRevision as e:
             # A later head on a several-reviewer thread is a follow-up of the thread, even for a
             # reviewer seeing it for the first time: only `agent-bus resume` retries it.
@@ -842,11 +859,11 @@ class Worker:
                 replies="\n\n".join(prompts.render_message(m) for m in notes([m for m in everything
                                                                               if m["id"] > since]))
                 or "(no replies)",
-                diff_heading=inter_heading, diff=inter)
+                rebase=rebase_note, diff_heading=inter_heading, diff=inter)
         else:
             prompt = fresh
         self.system(f"Review {'follow-up ' if followup else ''}{'(retry) ' if mode == 'retry' else ''}"
-                    f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.")
+                    f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.{fallback}")
         res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh)
         if res.quota or res.format_changed:
             # Head, reviewer and session stay pinned for `agent-bus resume` after the reset
@@ -898,7 +915,8 @@ class Worker:
         None for the full base..head diff in a fresh session (#69).
 
         Only from the head of its last verdict on this thread (``mine``), and only when that
-        verdict was on this base and came from the session still saved for it.  The
+        verdict came from the session still saved for it.  On another base the caller sends a
+        rebase-aware interdiff, or falls back to the full diff (#75).  The
         requester's previous head proves nothing: the pass at it may never have reached the
         reviewer.  Nor does a verdict whose session has since been replaced (a later pass that
         started a fresh one and gave no verdict), or one with no recorded base or session
@@ -907,7 +925,7 @@ class Worker:
         if refs.get("full_diff") or mine is None or session is None:
             return None
         data = mine["data"]
-        if data.get("session") != session or data.get("base_commit_id") != refs["base_commit_id"]:
+        if data.get("session") != session or data.get("base_commit_id") is None:
             return None
         return data.get("head_commit_id")
 
@@ -979,8 +997,8 @@ class Worker:
         jj_argv = ["jj", "diff", "--ignore-working-copy", "--git", "--from", frm, "--to", refs["head_commit_id"]]
         # ^{commit}: a tree or blob id is not a reviewable commit, even though git diff takes one.
         # The trailing "--" keeps an unresolvable id from being read as a path.
-        git_argv = ["git", "diff", "--no-ext-diff", "--no-textconv", f"{frm}^{{commit}}",
-                    f"{refs['head_commit_id']}^{{commit}}", "--"]
+        git_argv = ["git", "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none",
+                    f"{frm}^{{commit}}", f"{refs['head_commit_id']}^{{commit}}", "--"]
         if kind == "jj":
             # In a colocated repo, --ignore-working-copy skips importing plain git commits,
             # so fall back to git diff if jj cannot resolve the pinned commit ids.
@@ -1011,12 +1029,85 @@ class Worker:
                 if missing:
                     raise MissingRevision(repo, missing)
             raise RuntimeError(f"could not compute diff with {last_err}")
+        return self.cap_diff(out.stdout), heading
+
+    def rebase_interdiff(self, refs: dict, old_base: str, full_diff: str) -> tuple[str | None, str]:
+        """How the change itself differs from the one last reviewed on ``old_base`` (#75):
+        the previous head replayed onto the new base (a three-way merge with ``old_base`` as
+        the merge base, like `jj interdiff`), diffed against the new head.  Main's changes
+        between the two bases drop out, so it is empty for a pure rebase.
+
+        Returns (diff, ""), with "" for a pure rebase, or (None, why) when it can't be trusted
+        and the caller should send the full diff instead: the replay conflicts, a commit is
+        missing, a custom merge driver is configured, git can't compute it, or it comes out
+        bigger than the full diff as sent.  Always git (a jj repo's backing git
+        store), since jj has no merge that writes nothing.  The merge's objects go to a
+        throwaway object directory, so the repository is never written."""
+        repo, head = refs["repo"], refs["head_commit_id"]
+        env = dict(os.environ)
+        if not os.path.exists(os.path.join(repo, ".git")) and cfg.vcs(repo) == "jj":
+            # A jj repo that isn't colocated: git reads jj's own backing store.
+            try:
+                out = subprocess.run(["jj", "git", "root", "--ignore-working-copy"], cwd=repo,
+                                     capture_output=True, text=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired):
+                out = None
+            if out is None or out.returncode != 0 or not out.stdout.strip():
+                return None, "its git store could not be found to compute a rebase-aware interdiff"
+            env["GIT_DIR"] = out.stdout.strip()
+
+        def git(*argv: str) -> subprocess.CompletedProcess | None:
+            try:
+                return subprocess.run(["git", *argv], cwd=repo, env=env, capture_output=True, text=True,
+                                      timeout=120)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+
+        for sha in (old_base, refs["prev_head_commit_id"], refs["base_commit_id"], head):
+            out = git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
+            if out is None or out.returncode != 0:
+                return None, f"commit {sha} is not in the repository"
+        # A configured merge driver is an external command the merge would run (in the
+        # repository's directory): never run one, send the full diff instead.
+        drivers = git("config", "--get-regexp", r"^merge\..*\.driver$")
+        if drivers is not None and drivers.returncode == 0:
+            return None, "it has a custom merge driver configured, which agent-bus won't run"
+        if drivers is None or drivers.returncode != 1:  # 1: no such setting
+            return None, "git could not compute a rebase-aware interdiff"
+        objects = git("rev-parse", "--path-format=absolute", "--git-path", "objects")
+        if objects is None or objects.returncode != 0:
+            return None, "git could not compute a rebase-aware interdiff"
+        with tempfile.TemporaryDirectory(prefix="agent-bus-interdiff-") as scratch:
+            env.update(GIT_OBJECT_DIRECTORY=scratch, GIT_ALTERNATE_OBJECT_DIRECTORIES=objects.stdout.strip())
+            # Renormalizing would run clean/process filters, external commands too.
+            merged = git("-c", "merge.renormalize=false", "merge-tree", "--write-tree", "--no-messages",
+                         f"--merge-base={old_base}^{{commit}}",
+                         f"{refs['base_commit_id']}^{{commit}}", f"{refs['prev_head_commit_id']}^{{commit}}")
+            if merged is not None and merged.returncode == 1:
+                return None, "replaying the previous head onto the new base conflicts"
+            if merged is None or merged.returncode != 0 or not merged.stdout.strip():
+                return None, "git could not compute a rebase-aware interdiff"
+            tree = merged.stdout.split()[0]
+            same = git("rev-parse", f"{head}^{{tree}}")
+            out = git("diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", tree,
+                      f"{head}^{{commit}}", "--")
+            if same is None or same.returncode != 0 or out is None or out.returncode != 0:
+                return None, "git could not compute a rebase-aware interdiff"
+        if same.stdout.strip() == tree:
+            return "", ""  # the replay is the new head's tree exactly: a pure rebase
         diff = out.stdout
+        if not diff:
+            return None, "git shows no difference between trees that differ"
+        if len(diff.encode()) > len(full_diff.encode()):
+            return None, "the rebase-aware interdiff is bigger than the full diff"
+        return self.cap_diff(diff), ""
+
+    def cap_diff(self, diff: str) -> str:
         limit = self.config.max_diff_bytes
         if len(diff.encode()) > limit:
             diff = diff.encode()[:limit].decode(errors="ignore") + \
                 "\n[... diff truncated; read the changed files for the rest ...]"
-        return diff or "(empty diff)", heading
+        return diff or "(empty diff)"
 
     @staticmethod
     def has_commit(repo: str, tools: list[str], sha: str) -> bool:

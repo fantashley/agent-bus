@@ -240,11 +240,14 @@ def test_new_base_for_the_same_head_needs_new_approvals(env, no_spawn, monkeypat
     assert bus.review_standings(tid)["complete"]
     res = claude.request_review(None, str(repo), b1, h, prev_head_commit_id=h, reviewers=BOTH)
     assert res["job"] and not res["review"]["complete"] and res["review"]["pending"] == BOTH
-    assert bus.thread(tid)["refs"]["prev_head_commit_id"] is None  # full diff, not an empty interdiff
+    # Each starts from its own last head; replaying h onto the older base conflicts (#75, or
+    # an older git can't replay it), so each gets the full diff in a fresh session.
+    assert bus.thread(tid)["refs"]["prev_head_commit_id"] == h
     run_job(bus, tid)
     later = calls(env)[2:]
     assert [c["agent"] for c in later] == ["codex", "antigravity"]
     assert all("Diff from base to head" in c["prompt"] and "-start" in c["prompt"] for c in later)
+    assert sum("Full diff: the base changed" in m["body"] for m in bus.history(tid)["messages"]) == 2
     st = bus.review_standings(tid)
     assert st["complete"] and all(r["base_commit_id"] == b1 for r in st["reviewers"].values())
 

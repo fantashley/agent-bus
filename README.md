@@ -60,8 +60,13 @@ That continues the **same thread** and **resumes the reviewer's own conversation
 its earlier findings; it gets the interdiff plus anything you posted on the thread since (e.g. a
 `send` explaining how each finding was addressed). The interdiff starts at the head of that
 reviewer's own last verdict, which may be older than `prev_head_commit_id` if a pass never reached
-it. If that verdict was on another base, or came from a session that has since been replaced, or
-the resume fails, it gets a fresh session with the full diff, its earlier verdicts and the thread.
+it. If that verdict was on another base (the change was rebased), the interdiff is
+**rebase-aware**: the head it last reviewed is replayed onto the new base and compared with the new
+head, so changes that landed on the base drop out, and a pure rebase is reported as one. This uses
+git (a jj repo's backing git store) and writes nothing to the repository. If that replay conflicts,
+a commit is missing, or the result is bigger than the full diff, or the verdict came from a session
+that has since been replaced, or the resume fails, it gets a fresh session with the full diff, its
+earlier verdicts and the thread.
 
 ### Several required reviewers
 
@@ -80,7 +85,8 @@ same things in parallel:
 - A verdict counts only for the base and head it was given on. **Any new head (or a new base)
   makes every earlier approval stale**, so the review is complete (the thread resolves) once
   every required reviewer has approved the same base..head. Re-reviews are follow-ups, so
-  they're cheap; after a base change a reviewer gets the full diff again. Asking again for the
+  they're cheap; after a base change a reviewer gets the rebase-aware interdiff (or the full diff
+  when that can't be computed reliably). Asking again for the
   head someone requested changes on is refused with `CHANGES_REQUESTED`.
 - `request_review`, `history` and `wait` (on timeout) return a `review` object with
   `approved`, `changes_requested` and `pending` lists and each reviewer's state (`approved`,
