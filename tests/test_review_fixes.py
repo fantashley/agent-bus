@@ -80,6 +80,8 @@ def test_unclaimed_queued_job_is_reaped(env, no_spawn):
     tid = Service(bus, HUMAN).start_discussion("Q?", peers=["codex"])["thread"]["id"]
     jid = bus.jobs(tid)[0]["id"]
     bus.conn.execute("UPDATE jobs SET created_at=0 WHERE id=?", (jid,))
+    assert bus.active_job(tid)["id"] == jid  # relaunched by the next sweep, not failed (#64)
+    bus.conn.execute("UPDATE jobs SET launches=? WHERE id=?", (bus.MAX_LAUNCHES, jid))
     assert bus.active_job(tid) is None and bus.job(jid)["status"] == "failed"
 
 

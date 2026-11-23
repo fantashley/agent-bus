@@ -324,7 +324,7 @@ def test_a_followup_keeps_the_count_and_replaces_the_plan(env, no_spawn, monkeyp
 # ------------------------------------------------------------- review fixes (t-d44c64, pass 2)
 
 
-def test_a_known_launch_failure_fails_the_job_at_once(env, monkeypatch):
+def test_a_known_launch_failure_is_retried_then_fails_the_job(env, monkeypatch):
     bus = env["bus"]
     from agent_bus import worker
     monkeypatch.setattr(worker, "spawn", lambda jid: 0)
@@ -335,8 +335,15 @@ def test_a_known_launch_failure_fails_the_job_at_once(env, monkeypatch):
         raise OSError("no such file")
     monkeypatch.setattr(worker, "spawn", boom)
     assert autoresume.sweep(bus) == [tid]
-    assert bus.jobs(tid)[-1]["status"] == "failed" and not autoresume.pending(bus)
-    assert "its worker could not be started" in bus.history(tid)["messages"][-1]["body"]
+    # Only that attempt is written off: the next sweeps retry at once, up to the limit.
+    assert bus.jobs(tid)[-1]["status"] == "queued" and not autoresume.pending(bus)
+    for _ in range(bus.MAX_LAUNCHES - 1):
+        assert worker.relaunch_stalled(bus) == []
+    job = bus.jobs(tid)[-1]
+    assert job["status"] == "failed" and job["launches"] == bus.MAX_LAUNCHES
+    assert bus.history(tid)["messages"][-1]["body"] == (
+        "The automatic resume's worker never started (could not start its worker: no such file). "
+        f"Run `agent-bus resume {tid}` to retry.")
     monkeypatch.setattr(worker, "spawn", lambda jid: 0)
     assert Service(bus, HUMAN).resume(tid).get("job")  # the retry the notice suggests works now
 
@@ -369,7 +376,8 @@ def test_a_resume_whose_worker_never_started_says_so_when_reaped(env, monkeypatc
     expire(bus, "codex")
     monkeypatch.setattr(autoresume, "launch", lambda *a: None)
     assert autoresume.sweep(bus) == [tid]
-    bus.conn.execute("UPDATE jobs SET created_at=created_at-? WHERE status='queued'", (bus.QUEUE_GRACE_S + 1,))
+    bus.conn.execute("UPDATE jobs SET created_at=created_at-?, launches=? WHERE status='queued'",
+                     (bus.QUEUE_GRACE_S + 1, bus.MAX_LAUNCHES))
     bus.reap()
     bus.reap()
     notes = [m["body"] for m in bus.history(tid)["messages"] if "worker never started" in m["body"]]
@@ -408,7 +416,8 @@ def test_manual_resume_reaps_before_its_own_notice(env, monkeypatch):
     expire(bus, "codex")
     monkeypatch.setattr(autoresume, "launch", lambda *a: None)
     assert autoresume.sweep(bus) == [tid]
-    bus.conn.execute("UPDATE jobs SET created_at=created_at-? WHERE status='queued'", (bus.QUEUE_GRACE_S + 1,))
+    bus.conn.execute("UPDATE jobs SET created_at=created_at-?, launches=? WHERE status='queued'",
+                     (bus.QUEUE_GRACE_S + 1, bus.MAX_LAUNCHES))
     bus.set_thread(tid, status="needs_human")
     Service(bus, HUMAN).resume(tid)
     bodies = [m["body"] for m in bus.history(tid)["messages"]]

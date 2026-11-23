@@ -114,7 +114,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     pid INTEGER,
     error TEXT,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    launches INTEGER NOT NULL DEFAULT 1, -- worker launch attempts reserved, the first with the job (#64)
+    launched_at REAL                    -- when the latest relaunch was reserved (NULL: only the first, at created_at)
 );
 CREATE TABLE IF NOT EXISTS cli_versions (  -- `<cli> --version`, once per binary identity (#32)
     identity TEXT PRIMARY KEY,          -- real path, size and mtime
@@ -304,8 +306,9 @@ class Bus:
     def _needs_migration(self) -> bool:
         scols = {r["name"] for r in self._all("PRAGMA table_info(sessions)")}
         tcols = {r["name"] for r in self._all("PRAGMA table_info(threads)")}
+        jcols = {r["name"] for r in self._all("PRAGMA table_info(jobs)")}
         jobs_sql = self._one("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'")["sql"]
-        return (any(c not in scols for c, _ in self.SESSION_COLUMNS) or "blind" not in tcols
+        return (any(c not in scols for c, _ in self.SESSION_COLUMNS) or "blind" not in tcols or "launches" not in jcols
                 or "dedupe_key TEXT UNIQUE" in jobs_sql or not self._has_table("cli_version_timeouts"))
 
     def _has_table(self, name: str) -> bool:
@@ -331,8 +334,15 @@ class Bus:
                 # v0.1.0 made dedupe keys unique, which blocks retrying a failed job.
                 self.conn.execute("ALTER TABLE jobs RENAME TO jobs_v0")
                 self.conn.executescript_in_tx(SCHEMA)
-                self.conn.execute("INSERT INTO jobs SELECT * FROM jobs_v0")
+                old = ", ".join(r["name"] for r in self._all("PRAGMA table_info(jobs_v0)"))
+                self.conn.execute(f"INSERT INTO jobs ({old}) SELECT {old} FROM jobs_v0")
                 self.conn.execute("DROP TABLE jobs_v0")
+            jcols = {r["name"] for r in self._all("PRAGMA table_info(jobs)")}
+            if "launches" not in jcols:
+                # Before #64 every job had exactly one launch, at created_at: a queued one
+                # left behind gets the relaunches any other job would.
+                self.conn.execute("ALTER TABLE jobs ADD COLUMN launches INTEGER NOT NULL DEFAULT 1")
+                self.conn.execute("ALTER TABLE jobs ADD COLUMN launched_at REAL")
             if not self._has_table("cli_version_timeouts"):
                 # Older versions cached a timed-out `--version` probe as "unknown" for good,
                 # indistinguishable from other unknowns: drop them all, in the same
@@ -757,30 +767,96 @@ class Bus:
 
     # ---------------------------------------------------------------------- jobs
 
-    # Queued jobs are spawned immediately; one still unclaimed after this long lost its worker.
+    # Queued jobs are spawned immediately; one still unclaimed after this long lost its
+    # worker (its launcher died before starting it, or it exited before claiming the job).
     QUEUE_GRACE_S = 60
+    # Launch attempts a job gets, the first included, before it is failed as never started:
+    # a sweep (worker.relaunch_stalled) relaunches a stalled one until then (#64).
+    MAX_LAUNCHES = 3
+
+    # A queued job whose latest launch has had its grace period.
+    _STALLED = "status='queued' AND COALESCE(launched_at, created_at)<?"
 
     def reap(self) -> list[str]:
-        """Fail jobs whose worker died (expired lease, or never claimed).  Returns their ids.
+        """Fail jobs whose worker died (expired lease, or never claimed after every launch
+        attempt).  Returns their ids."""
+        return self._reap(unstarted_only=False)
 
-        One conditional UPDATE, so a lease renewed or a job claimed a moment ago is never
-        failed by mistake.
+    def reap_unstarted(self, exclude: frozenset = frozenset()) -> list[str]:
+        """Fail only the queued jobs never claimed after every launch attempt (not those on
+        the threads in ``exclude``)."""
+        return self._reap(unstarted_only=True, exclude=exclude)
+
+    def _reap(self, unstarted_only: bool, exclude: frozenset = frozenset()) -> list[str]:
+        """Fail jobs whose worker died (expired lease, unless ``unstarted_only``, or never
+        claimed after every launch attempt), except on the threads in ``exclude``.  Returns
+        their ids.
+
+        One conditional UPDATE, so a lease renewed or a job claimed or relaunched a moment
+        ago is never failed by mistake.
         """
         now = _now()
         with self.tx():
             rows = self.conn.execute(
                 "UPDATE jobs SET status='failed', error='worker died (lease expired or never claimed)',"
-                " updated_at=? WHERE (status='running' AND lease_expires<?)"
-                " OR (status='queued' AND created_at<?) RETURNING id, thread_id, dedupe_key, lease_owner",
-                (now, now, now - self.QUEUE_GRACE_S)).fetchall()
+                f" updated_at=? WHERE ((status='running' AND lease_expires<? AND NOT ?)"
+                f" OR ({self._STALLED} AND launches>=?)) AND thread_id NOT IN (SELECT value FROM json_each(?))"
+                " RETURNING id, thread_id, dedupe_key, lease_owner",
+                (now, now, unstarted_only, now - self.QUEUE_GRACE_S, self.MAX_LAUNCHES,
+                 json.dumps(sorted(exclude)))).fetchall()
             for r in rows:
-                # An automatic resume (see autoresume.py) has no one watching for it: say on
-                # the thread that it never started.
-                key, tid = r["dedupe_key"] or "", r["thread_id"]
-                if r["lease_owner"] is None and key.startswith((f"{tid}:resume:auto:", f"{tid}:retry:auto:")):
-                    self.post(r["thread_id"], SYSTEM, "The automatic resume's worker never started. Run "
-                              f"`agent-bus resume {r['thread_id']}` to retry.", kind="status")
+                if r["lease_owner"] is None:
+                    self._never_started(r)
         return [r["id"] for r in rows]
+
+    def _never_started(self, r: sqlite3.Row, detail: str = "") -> None:
+        """An automatic resume (see autoresume.py) has no one watching for it: say on the
+        thread that its worker never started."""
+        key, tid = r["dedupe_key"] or "", r["thread_id"]
+        if key.startswith((f"{tid}:resume:auto:", f"{tid}:retry:auto:")):
+            self.post(tid, SYSTEM, f"The automatic resume's worker never started{detail}. Run "
+                      f"`agent-bus resume {tid}` to retry.", kind="status")
+
+    def stalled_jobs(self) -> list[dict]:
+        """Queued jobs with launch attempts left whose latest launch never claimed them."""
+        return [dict(r) for r in self._all(f"SELECT id, thread_id FROM jobs WHERE {self._STALLED} AND launches<?"
+                                           " ORDER BY created_at", _now() - self.QUEUE_GRACE_S, self.MAX_LAUNCHES)]
+
+    def next_stall(self) -> float | None:
+        """When the earliest queued job's latest launch runs out of grace (it is relaunched
+        or reaped then, unless its worker claims it first); None with no job queued."""
+        row = self._one("SELECT MIN(COALESCE(launched_at, created_at)) AS t FROM jobs WHERE status='queued'")
+        return None if row["t"] is None else row["t"] + self.QUEUE_GRACE_S
+
+    def reserve_relaunch(self, jid: str) -> int | None:
+        """Reserve the next launch attempt of a stalled job; returns its number, or None if
+        the job isn't stalled (claimed, relaunched by someone else meanwhile, out of attempts).
+        One conditional UPDATE, so concurrent sweeps can't both relaunch it."""
+        now = _now()
+        with self.tx():
+            row = self.conn.execute(
+                f"UPDATE jobs SET launches=launches+1, launched_at=?, updated_at=? WHERE id=? AND {self._STALLED}"
+                " AND launches<? RETURNING launches",
+                (now, now, jid, now - self.QUEUE_GRACE_S, self.MAX_LAUNCHES)).fetchone()
+        return row["launches"] if row else None
+
+    def launch_failed(self, jid: str, attempt: int, error: str) -> bool:
+        """Launch attempt ``attempt`` of a job could not start its worker.  Only while that is
+        still the job's latest attempt and the job is queued: the job is failed if that was
+        its last attempt, and otherwise left for the next sweep to relaunch straight away.
+        Returns True if the job was failed."""
+        now = _now()
+        with self.tx():
+            if attempt >= self.MAX_LAUNCHES:
+                row = self.conn.execute(
+                    "UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=? AND status='queued'"
+                    " AND launches=? RETURNING id, thread_id, dedupe_key", (error, now, jid, attempt)).fetchone()
+                if row:
+                    self._never_started(row, f" ({error})")
+                return row is not None
+            self.conn.execute("UPDATE jobs SET launched_at=0, updated_at=? WHERE id=? AND status='queued'"
+                              " AND launches=?", (now, jid, attempt))
+            return False
 
     def create_job(self, thread_id: str, kind: str, params: dict, dedupe_key: str | None) -> tuple[dict, bool]:
         """Insert a job unless an equivalent one is active or already succeeded.  Returns (job, created).

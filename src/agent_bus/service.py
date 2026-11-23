@@ -371,7 +371,7 @@ class Service:
             else:
                 t, job_row, created = self._fresh_review(reviewer, repo_path, refs, override, request)
         if created:
-            worker.spawn(job_row["id"])
+            worker.launch(self.bus, job_row["id"])
         job = self._job_info(job_row, created)
         t = self.bus.thread(t["id"])
         return {"thread": thread_summary(t), "job": job, "review": self.bus.review_standings(t["id"]),
@@ -501,7 +501,7 @@ class Service:
             t = self.bus.thread(t["id"])
             st = self.bus.review_standings(t["id"])
         if created:
-            worker.spawn(job_row["id"])
+            worker.launch(self.bus, job_row["id"])
         job = self._job_info(job_row, created) if job_row else None
         if job is None:
             nxt = f"Every required reviewer has already approved head {head_commit_id[:12]}; nothing to run."
@@ -725,7 +725,7 @@ class Service:
             self._launch_later = None
         for job in launches:
             if job["created"]:
-                worker.spawn(job["id"])
+                worker.launch(self.bus, job["id"])
         return res
 
     def _resume(self, thread: str, extra_rounds: int) -> dict:
@@ -858,7 +858,7 @@ class Service:
         if self._launch_later is not None:
             self._launch_later.append({"id": job["id"], "created": created})
         elif created:
-            worker.spawn(job["id"])
+            worker.launch(self.bus, job["id"])
         return self._job_info(job, created)
 
     @staticmethod

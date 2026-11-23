@@ -122,21 +122,11 @@ def give_up(bus: Bus, thread_id: str, park_id: str, why: str) -> None:
 def launch(bus: Bus, thread_id: str, job: dict) -> None:
     """Start the worker for a resume's job, now that its transaction has committed.  Only
     the sweep that claimed the plan gets here, so there is one launch per resume.  Like
-    every other job agent-bus starts, one whose launcher dies before starting its worker
-    is reaped as never claimed (#64); for this one, Bus.reap also says so on the thread."""
+    every other job agent-bus starts, one whose worker never starts (its launcher died
+    first, or it couldn't be spawned) is relaunched by later sweeps, a bounded number of
+    times (worker.relaunch_stalled, #64); if it never starts, the thread is told so."""
     from . import worker
-    try:
-        worker.spawn(job["id"])
-    except OSError as e:
-        # Known to have failed: fail the job now, so the retry the notice suggests isn't
-        # held up by it.
-        with bus.tx():
-            failed = bus.conn.execute("UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=?"
-                                      " AND status='queued'",
-                                      (f"could not start its worker: {e}", time.time(), job["id"])).rowcount
-            if failed:  # not if it was cancelled meanwhile
-                bus.post(thread_id, SYSTEM, f"Resumed automatically, but its worker could not be started ({e}). "
-                         f"Run `agent-bus resume {thread_id}` to retry.", kind="status")
+    worker.launch(bus, job["id"])
 
 
 def resume_one(bus: Bus, config: cfg.Config, thread_id: str, now: float) -> dict | None:
@@ -169,11 +159,14 @@ def resume_one(bus: Bus, config: cfg.Config, thread_id: str, now: float) -> dict
 
 
 def sweep_quietly(bus: Bus, exclude: frozenset = frozenset()) -> None:
-    """A lazy sweep from an MCP call or CLI command: never fails the caller."""
-    try:
-        sweep(bus, exclude=exclude)
-    except Exception:  # noqa: BLE001
-        pass
+    """A lazy sweep from an MCP call or CLI command: never fails the caller.  It also
+    relaunches any job whose worker never started (#64)."""
+    from . import worker
+    for step in (sweep, worker.relaunch_stalled):
+        try:
+            step(bus, exclude=exclude)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def spawn_waiter() -> None:
@@ -186,8 +179,9 @@ def spawn_waiter() -> None:
 
 
 def wait(bus: Bus, until: float | None = None) -> int:
-    """Sweep whenever the next planned resume falls due, until none is left (or ``until``,
-    for tests).  One waiter per database at a time (a lock file next to it): another one
+    """Sweep whenever the next planned resume falls due, or a queued job's worker would
+    need relaunching (a resume's included, #64), until neither is left (or ``until``, for
+    tests).  One waiter per database at a time (a lock file next to it): another one
     started meanwhile exits straight away, and leaves the plans to this one."""
     lock_path = Path(f"{bus.path}.auto-resume.lock")
     with open(lock_path, "a") as lock:
@@ -197,11 +191,13 @@ def wait(bus: Bus, until: float | None = None) -> int:
             except BlockingIOError:
                 return 0  # another waiter has it
             while until is None or time.time() < until:
-                sweep(bus)
-                row = bus._one("SELECT MIN(due) AS due FROM auto_resumes")
-                if row["due"] is None:
+                sweep_quietly(bus)
+                bus.reap()  # a queued job out of launch attempts is failed, and a resume's says so
+                due = [t for t in (bus._one("SELECT MIN(due) AS due FROM auto_resumes")["due"], bus.next_stall())
+                       if t is not None]
+                if not due:
                     break
-                nap = min(max(row["due"] - time.time(), 1), RECHECK_S)
+                nap = min(max(min(due) - time.time(), 1), RECHECK_S)
                 time.sleep(nap if until is None else min(nap, max(until - time.time(), 0)))
             fcntl.flock(lock, fcntl.LOCK_UN)
             # A park that came in just as this one found nothing left may have had its own
