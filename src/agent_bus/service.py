@@ -461,8 +461,9 @@ class Service:
         waits for the author.  A follow-up (``prev_head_commit_id`` = the thread's current
         head) pins a new revision: a new head or base makes every earlier approval stale.
         It starts the reviewer after the last round's one, which gets the full diff and the
-        earlier verdicts and replies or, if it has reviewed this base before, resumes its own
-        conversation with the interdiff from the head it last reviewed.
+        earlier verdicts and replies or, if it has reviewed before, resumes its own
+        conversation with the interdiff from the head it last reviewed (rebase-aware if the
+        base has moved since, #75).
 
         Every decision, write and the reply's snapshot happen in one IMMEDIATE transaction."""
         order: list[str] = []
@@ -609,11 +610,10 @@ class Service:
         self._quota_check(nxt, "reviewer", merged.get(nxt))
         if focus:
             self.bus.post(t["id"], self.agent, focus, session_id=self.session_id)
-        # Its own last head, for the interdiff, unless that verdict was against another
-        # base: then it reviews the full diff again in a fresh session.
+        # Its own last head, for the interdiff (rebase-aware if that verdict was on another
+        # base, #75); the worker falls back to the full diff when it can't send one.
         last = self.bus.review_standings(t["id"])["reviewers"][nxt]
-        refs.update(reviewer=nxt, prev_head_commit_id=last["head_commit_id"]
-                    if last["base_commit_id"] == base else None)
+        refs.update(reviewer=nxt, prev_head_commit_id=last["head_commit_id"])
         autoresume.forget(self.bus, t["id"])  # this pass replaces the parked one
         self.bus.set_thread(t["id"], status="open", round=t["round"] + 1, max_rounds=t["round"] + 1,
                             goal=goal)

@@ -1070,7 +1070,9 @@ def test_followup_needs_the_session_that_gave_the_last_verdict(env, no_spawn, ho
 
 
 def test_followup_on_a_new_base_sends_the_full_diff(env, no_spawn):
-    """A verdict at P on base X doesn't make P..H the change once the base moved (#75)."""
+    """A verdict at P on base X doesn't make P..H the change once the base moved (#75); and
+    jj's root commit, the new base here, isn't in git, so there is no rebase-aware interdiff
+    either."""
     repo, rev, bus, claude, a, x, p = _reviewed_at_p(env)
     (repo / "a.txt").write_text("CHANGE-IN-H\n")
     h = rev("@")
@@ -1079,6 +1081,7 @@ def test_followup_on_a_new_base_sends_the_full_diff(env, no_spawn):
     last = [c for c in calls(env) if c["agent"] == "codex"][-1]
     assert last["argv"][:3] != ["exec", "resume", "--json"]
     assert "Interdiff" not in last["prompt"] and "Diff from base to head" in last["prompt"]
+    assert any("Full diff: the base changed" in m["body"] for m in bus.history(a)["messages"])
 
 
 def test_verdict_session_is_not_shown_to_agents(env, no_spawn):
