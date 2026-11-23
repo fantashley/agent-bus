@@ -79,7 +79,11 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
                     "versions": {a: cli_version(bus, a, svc.config.peer_command(a))
                                  for a, v in avail.items() if v["available"] and a != agent},
                     "out_of_usage": [{"agent": b["agent"], **quota.summary(b)}
-                                     for b in bus.quota_blocks() if b["agent"] != agent]}
+                                     for b in bus.quota_blocks() if b["agent"] != agent],
+                    # Usage-limit windows at or above usage_warn_at, by the last reading.
+                    "near_limit": [{"agent": w["agent"], **quota.limits_summary(w, svc.config.usage_warn_at)}
+                                   for w in bus.usage_limits() if w["agent"] != agent
+                                   and w["used"] >= svc.config.usage_warn_at]}
         return call(me)
 
     @mcp.tool()

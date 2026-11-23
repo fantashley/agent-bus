@@ -63,6 +63,7 @@ DEFAULTS = {
     "turn_timeout_s": 600,
     "initiator_grace_s": 180,
     "quota_cooldown_s": 900,
+    "usage_warn_at": 0.8,
     "max_messages": 60,
     "max_diff_bytes": 200_000,
     "peers": {},
@@ -100,6 +101,8 @@ class Config:
     initiator_grace_s: int = 180
     # How long an out-of-usage agent is skipped when its CLI gave no reset time (#26).
     quota_cooldown_s: int = 900
+    # Warn that an agent is close to its usage limit once a window is this full (#26).
+    usage_warn_at: float = 0.8
     max_messages: int = 60
     max_diff_bytes: int = 200_000
     # Per-agent overrides: {"claude": {"command": "/path/claude", "args": [...]}}
@@ -115,6 +118,9 @@ class Config:
             data.update(json.loads(path.read_text()))
         known = {k: data[k] for k in DEFAULTS}
         conf = cls(**known)
+        w = conf.usage_warn_at
+        if isinstance(w, bool) or not isinstance(w, (int, float)) or not 0 < w <= 1:
+            raise ValueError("usage_warn_at must be a fraction above 0 and at most 1, e.g. 0.8")
         for agent, entry in (conf.peers or {}).items():  # reject a bad model/effort when loading
             if agent in AGENT_INFO and isinstance(entry, dict):
                 check_peer_settings(agent, {k: entry.get(k) for k in ("model", "effort")})

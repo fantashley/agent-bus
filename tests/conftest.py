@@ -26,6 +26,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENT_BUS_PEER", raising=False)
     (tmp_path / "agy").mkdir()
     monkeypatch.setenv("AGY_CONFIG_DIR", str(tmp_path / "agy"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))  # rollout files (usage limits)
     bindir = tmp_path / "bin"
     bindir.mkdir()
     peers = {}

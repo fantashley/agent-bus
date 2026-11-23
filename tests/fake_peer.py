@@ -19,6 +19,8 @@ Behaviour is driven by env vars so tests can script outcomes:
                   state; toolerror: ERROR, no denial
   FAKE_MCP_LIST   what `codex mcp list --json` prints
   FAKE_APPROVE    comma-separated agents whose review verdicts approve (others request changes)
+  FAKE_CLAUDE_USED / FAKE_CODEX_USED  how full the five_hour / primary usage-limit window is
+                  (a fraction for claude's stream, a percentage in codex's rollout file)
 Round-1 prompts get a proposal; later prompts agree with the lowest proposal id
 mentioned (or object, for `stubborn`).
 """
@@ -186,8 +188,12 @@ if agent == "claude":
     out({"type": "system", "subtype": "init", "session_id": sid})
     out({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "x"}}]}, "session_id": sid})
     out({"type": "assistant", "message": {"content": [{"type": "text", "text": reply}]}, "session_id": sid})
-    out({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "resetsAt": 4102444800,
-                                                          "rateLimitType": "five_hour"}, "session_id": sid})
+    used = float(os.environ.get("FAKE_CLAUDE_USED", "0.5"))
+    out({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "allowed", "resetsAt": 4102444800, "rateLimitType": "five_hour",
+        "unifiedWindows": {"five_hour": {"utilization": used, "resetsAt": 4102444800, "status": "allowed"},
+                           "seven_day": {"utilization": 0.25, "resetsAt": 4102444800, "status": "allowed"}}},
+        "session_id": sid})
     out({"type": "result", "subtype": "success", "is_error": False, "result": reply, "session_id": sid,
          "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100,
                    "output_tokens_details": {"thinking_tokens": 3}}})
@@ -195,6 +201,17 @@ elif agent == "codex":
     out({"type": "thread.started", "thread_id": sid})
     out({"type": "item.started", "item": {"type": "command_execution", "command": "ls"}})
     out({"type": "item.completed", "item": {"type": "agent_message", "text": reply}})
+    if os.environ.get("CODEX_HOME"):  # its rollout file, as codex 0.171.0 writes one
+        from pathlib import Path
+        roll = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "11" / "23" / f"rollout-2026-11-23T00-00-00-{sid}.jsonl"
+        roll.parent.mkdir(parents=True, exist_ok=True)
+        real = (Path(__file__).parent / "data" / "rollouts" / "codex-token-count.jsonl").read_text().splitlines()[-1]
+        real = json.loads(real)
+        real["payload"]["rate_limits"]["primary"]["used_percent"] = float(os.environ.get("FAKE_CODEX_USED", "50"))
+        import datetime
+        real["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        with open(roll, "a") as f:
+            f.write(json.dumps(real) + "\n")
     n = session_turns()  # like codex 0.171.0: the session's running total
     out({"type": "turn.completed", "usage": {"input_tokens": 20 * n, "cached_input_tokens": 200 * n,
                                              "output_tokens": 6 * n, "reasoning_output_tokens": 4 * n}})

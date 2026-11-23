@@ -16,6 +16,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -55,6 +56,9 @@ class TurnResult:
     # Set by the worker for a ``session_usage`` CLI: the session's running total, while
     # ``usage`` becomes this turn's share of it (None when that isn't known).
     session_usage: dict | None = None
+    # The account's usage-limit windows as the CLI reported them with this turn (see
+    # Adapter.usage_limits); None when it reported none.
+    limits: list[dict] | None = None
     # ``usage`` counts only the steps reported before the turn stopped without its final report.
     partial_usage: bool = False
 
@@ -76,7 +80,9 @@ class StreamState:
     usage: dict | None = None
     step_usage: dict | None = None  # Antigravity: this run's steps' token counts, summed
     resumed: bool = False  # this run resumed an existing session
+    rollout: tuple | None = None  # Codex: (rollout file, its size) before a resumed turn ran
     rate_limit: dict | None = None  # Claude's latest rate_limit_event info
+    rate_limit_at: float | None = None  # when it arrived
     unknown: dict = field(default_factory=dict)  # event type -> count, for types the adapter doesn't know
     stray: int = 0  # non-JSON stdout lines (diagnostics), counted only
     pending: dict = field(default_factory=dict)  # step index -> tool name, for tool steps with no end state
@@ -140,6 +146,18 @@ class Adapter:
     def parse_line(self, obj: dict, st: StreamState, emit: Emit) -> None:
         raise NotImplementedError
 
+    def before_run(self, st: StreamState, resume_id: str | None) -> None:
+        """Note anything usage_limits needs from before the CLI runs."""
+
+    def usage_limits(self, st: StreamState) -> list[dict] | None:
+        """How much of each of the account's usage-limit windows is used, as this turn's
+        CLI reported it without spending a turn of its own (issue #26): a list of
+        {"window", "used" (a fraction), "minutes" (the window's length, if given),
+        "resets_at" (epoch, if given), "observed_at" (when the CLI took the reading, if
+        it says; else now)}, or None when the CLI reports none.  Only readings from this
+        turn count: an older one may be behind a newer one from another session."""
+        return None
+
     def incomplete(self, st: StreamState) -> str | None:
         """Why a normally-exited turn without a reply stopped partway, when the stream
         itself shows it; None leaves it to the format-drift check."""
@@ -166,6 +184,10 @@ class Adapter:
         except PeerSetupError as e:
             return TurnResult(ok=False, error=str(e))
         st = StreamState(external_id=inv.external_id, resumed=bool(resume_id))
+        try:
+            self.before_run(st, resume_id)
+        except OSError:
+            pass  # only the usage-limit reading depends on it
         # Any agent-bus MCP server the peer CLI launches sees this and refuses every tool,
         # so a headless peer can't post, start jobs, or read blind proposals.
         env = {**os.environ, "AGENT_BUS_PEER": peer_tag}
@@ -249,9 +271,14 @@ class Adapter:
         # still used their tokens: kept, marked as a partial count.
         partial = st.usage is None and st.step_usage is not None
         st.usage = st.usage or st.step_usage
+        try:
+            limits = self.usage_limits(st)
+        except Exception as e:  # noqa: BLE001 - the windows are a hint; never fail a turn on them
+            emit("format", f"could not read {self.agent}'s usage limits: {e!r}"[:300])
+            limits = None
         if timed_out:
             return TurnResult(ok=False, text=text, external_id=st.external_id, error="turn timed out",
-                              timed_out=True, usage=st.usage, partial_usage=partial)
+                              timed_out=True, usage=st.usage, partial_usage=partial, limits=limits)
         if rc != 0 or st.error:
             err = st.error or f"exit {rc}: {''.join(stderr_tail)[-800:]}"
             try:
@@ -260,7 +287,7 @@ class Adapter:
             except Exception:  # noqa: BLE001 - classification is best-effort
                 quota = None
             return TurnResult(ok=False, text=text, external_id=st.external_id, error=err, usage=st.usage,
-                              partial_usage=partial, quota=quota)
+                              partial_usage=partial, limits=limits, quota=quota)
         # Exited normally: the reply and a session id to resume are both required.
         missing = [what for what, ok in (("a reply", text.strip()), ("a session id", st.external_id)) if not ok]
         # Only the reply missing: the stream itself may show why the turn stopped early.  A
@@ -269,12 +296,12 @@ class Adapter:
         if why:
             # No reply text at all: a whitespace-only response must not reach JSON repair.
             return TurnResult(ok=False, text="", external_id=st.external_id, usage=st.usage,
-                              partial_usage=partial, incomplete=True, error=f"PEER_TURN_INCOMPLETE: {self.agent} {why}")
+                              partial_usage=partial, limits=limits, incomplete=True, error=f"PEER_TURN_INCOMPLETE: {self.agent} {why}")
         if missing:
             return TurnResult(ok=False, text=text, external_id=st.external_id, usage=st.usage,
-                              partial_usage=partial, format_changed=True, error=f"PEER_FORMAT_CHANGED: {self.agent} exited normally without "
+                              partial_usage=partial, limits=limits, format_changed=True, error=f"PEER_FORMAT_CHANGED: {self.agent} exited normally without "
                                     + " or ".join(missing))
-        return TurnResult(ok=True, text=text, external_id=st.external_id, usage=st.usage, partial_usage=partial)
+        return TurnResult(ok=True, text=text, external_id=st.external_id, usage=st.usage, partial_usage=partial, limits=limits)
 
 
 def cli_identity(command: str, cwd: str | None = None) -> tuple[str, str] | None:
@@ -441,6 +468,61 @@ def format_usage(u: dict | None, label: str = "tokens") -> str:
         return ""
     names = (("input", "in"), ("output", "out"), ("cache_read", "cache"), ("thinking", "thinking"))
     return f" · {label} " + " ".join(f"{name} {u[k]}" for k, name in names if k in u)
+
+
+def _limit(window: object, used: object, minutes: object = None, resets_at: object = None) -> dict | None:
+    """One usage-limit window, checked: a short name, a finite fraction used, and the
+    optional length and reset time when they're well formed."""
+    if not isinstance(window, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", window):
+        return None
+    if isinstance(used, bool) or not isinstance(used, (int, float)) or not 0 <= used <= 10:
+        return None  # also rejects nan
+    ok = lambda v: not isinstance(v, bool) and isinstance(v, (int, float)) and 0 < v < 1e11  # noqa: E731
+    return {"window": window, "used": float(used), "minutes": int(minutes) if ok(minutes) else None,
+            "resets_at": float(resets_at) if ok(resets_at) else None}
+
+
+def codex_rollout(thread_id: str, home: Path | None = None) -> Path | None:
+    """The rollout file Codex keeps for a session, $CODEX_HOME/sessions/Y/M/D/rollout-…-<id>.jsonl
+    (codex 0.171.0; a resumed session appends to the file of the day it started)."""
+    if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", thread_id or ""):
+        return None
+    home = home or Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    found = sorted((home / "sessions").glob(f"*/*/*/rollout-*-{thread_id}.jsonl"))
+    return found[-1] if found else None
+
+
+def _iso_time(v: object) -> float | None:
+    """Epoch seconds from an ISO 8601 UTC time like codex's "2026-11-23T04:48:28.191Z"."""
+    if not isinstance(v, str):
+        return None
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def codex_rate_limits(path: Path, offset: int = 0) -> tuple[dict, float] | None:
+    """(rate_limits, when) of the last token_count event in a Codex rollout file, among
+    the records written after byte ``offset`` (the file's size before this turn ran)."""
+    found = None
+    with open(path, "rb") as f:
+        f.seek(offset)
+        for raw in f:
+            if b'"token_count"' not in raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue  # e.g. a record still being written
+            payload = obj.get("payload") if isinstance(obj, dict) else None
+            rl = payload.get("rate_limits") if isinstance(payload, dict) else None
+            # One with no window at all says nothing: keep an earlier reading of this turn.
+            if isinstance(payload, dict) and payload.get("type") == "token_count" and isinstance(rl, dict) \
+                    and any(isinstance(rl.get(k), dict) for k in ("primary", "secondary")):
+                t = _iso_time(obj.get("timestamp"))
+                found = (payload["rate_limits"], t if t is not None else time.time())
+    return found
 
 
 def _short(text: str, n: int = 240) -> str:
@@ -617,6 +699,7 @@ class ClaudeAdapter(Adapter):
                     emit("tool", _short(f"{block.get('name')} {hint}".strip()))
         elif typ == "rate_limit_event" and isinstance(obj.get("rate_limit_info"), dict):
             st.rate_limit = obj["rate_limit_info"]
+            st.rate_limit_at = time.time()  # when the reading arrived, not when the turn ends
         elif typ == "result":
             st.usage = usage_from(obj.get("usage"), CLAUDE_USAGE)
             thinking = (obj.get("usage") or {}).get("output_tokens_details") if isinstance(obj.get("usage"), dict) else None
@@ -628,6 +711,17 @@ class ClaudeAdapter(Adapter):
                 st.final = obj["result"]
 
     quota_patterns = (r"usage limit reached", r"hit your (?:usage )?limit", r"out of (?:extra )?usage")
+
+    def usage_limits(self, st):
+        # rate_limit_event.rate_limit_info.unifiedWindows, e.g. {"five_hour": {"utilization":
+        # 0.58, "resetsAt": 1795423800, "status": "allowed"}, "seven_day": {...}}: Claude Code
+        # 2.1.330, live probe 2026-11-23 (tests/data/streams/claude-*.jsonl, scrubbed).
+        windows = (st.rate_limit or {}).get("unifiedWindows")
+        if not isinstance(windows, dict):
+            return None
+        out = [_limit(name, w.get("utilization"), resets_at=w.get("resetsAt"))
+               for name, w in windows.items() if isinstance(w, dict)]
+        return [{**w, "observed_at": st.rate_limit_at} for w in out if w] or None
 
     def classify(self, st, error):
         # Structured: the effective rate-limit status says this request was rejected, and
@@ -796,6 +890,40 @@ class CodexAdapter(Adapter):
         elif typ in ("turn.failed", "error"):
             err = obj.get("error") or obj.get("message") or obj
             st.error = _short(json.dumps(err) if not isinstance(err, str) else err, 800)
+
+    def usage_limits(self, st):
+        # `codex exec --json` streams no rate-limit info, but the session's rollout file has
+        # it: each token_count event carries rate_limits.primary/secondary = {used_percent,
+        # window_minutes, resets_at} (codex 0.171.0, live probe 2026-11-23;
+        # tests/data/rollouts/codex-token-count.jsonl, scrubbed).
+        path = codex_rollout(st.external_id) if st.external_id else None
+        if not path:
+            return None
+        # Only what this turn appended: a resumed session's file already holds earlier
+        # turns', so without a matching snapshot from before it ran there's no telling.
+        if st.resumed:
+            if not st.rollout or st.rollout[0] != path:
+                return None
+            offset = st.rollout[1]
+        else:
+            offset = 0  # a new session's file is new
+        found = codex_rate_limits(path, offset)
+        if not found:
+            return None
+        rl, seen = found
+        out = []
+        for name in ("primary", "secondary"):
+            w = rl.get(name)
+            if isinstance(w, dict):
+                used = w.get("used_percent")
+                out.append(_limit(name, used / 100 if isinstance(used, (int, float)) and not isinstance(used, bool)
+                                  else None, w.get("window_minutes"), w.get("resets_at")))
+        return [{**w, "observed_at": seen} for w in out if w] or None
+
+    def before_run(self, st, resume_id):
+        path = codex_rollout(resume_id) if resume_id else None
+        if path:
+            st.rollout = (path, path.stat().st_size)
 
     # Codex's own usage-limit and quota errors (codex-rs protocol error.rs).
     quota_patterns = (r"you've hit your usage limit", r"usage_limit_(?:reached|exceeded)", r"insufficient_quota",

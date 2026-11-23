@@ -426,10 +426,16 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         blocks: dict[str, list] = {}
         for b in bus.quota_blocks():
             blocks.setdefault(b["agent"], []).append(b)
+        limits: dict[str, list] = {}
+        for w in bus.usage_limits():
+            limits.setdefault(w["agent"], []).append(w)
         if args.json:
             for a, v in avail.items():
                 if a in blocks:
                     v["out_of_usage"] = [quota.summary(b) for b in blocks[a]]
+                if a in limits:
+                    v["usage_limits"] = [quota.limits_summary(w, conf.usage_warn_at) for w in limits[a]]
+                    v["near_limit"] = any(w["used"] >= conf.usage_warn_at for w in limits[a])
             print(json.dumps(avail, indent=2))
             return 0
         source = "config `agents`" if conf.agents is not None else "detected on PATH"
@@ -440,6 +446,10 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
             if v.get("web_search"):
                 print(f"       web search as a peer: {'on, ' if v['web_search']['enabled'] else ''}"
                       f"{v['web_search']['note']}")
+            if limits.get(a):
+                near = any(w["used"] >= conf.usage_warn_at for w in limits[a])
+                print(f"       usage limits{' (NEAR THE LIMIT)' if near else ''}: "
+                      + "; ".join(map(quota.describe_window, limits[a])))
             for b in blocks.get(a, []):
                 when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(b["until"]))
                 print(f"       out of usage{' for model ' + b['scope'] if b['scope'] else ''} until {when}"

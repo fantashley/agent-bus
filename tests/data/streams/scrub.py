@@ -4,8 +4,8 @@
 
 Keeps every event, key and the event order; replaces ids (in values and keys) with
 stable placeholders, local paths with /repo and /home/user, thinking signatures with
-"redacted", account-specific values (quota utilization, reset times, credential
-expiry, socket paths) with synthetic ones, and trims long lists to three entries.
+"redacted", account-specific values (quota utilization, reset times, credit balances,
+credential expiry, socket paths) with synthetic ones, and trims long lists to three entries.
 
 It works one string at a time, so text a CLI streams in fragments (Antigravity's
 text_delta) can still spell out a path once joined.  Capture with prompts whose
@@ -24,6 +24,11 @@ PREFIXED = re.compile(r"\b(msg|toolu|req|call|item)_[A-Za-z0-9]{6,}\b")
 SYNTHETIC = {
     "resetsAt": 4102444800,
     "utilization": 0.5,
+    # Codex rollout files' rate_limits windows and credits (tests/data/rollouts).
+    "resets_at": 4102444800,
+    "used_percent": 50.0,
+    "balance": "0",
+    "plan_type": "plus",
     "credential_expires_at": "2099-01-01T00:00:00.000Z",
     "messaging_socket_path": "/run/user/1000/agent.sock",
 }
