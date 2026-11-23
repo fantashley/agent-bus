@@ -1,5 +1,6 @@
 """#46: headless peers search the web, with everything else still read-only."""
 import json
+from pathlib import Path
 
 import pytest
 
@@ -104,6 +105,16 @@ def test_codex_final_overrides_stay_before_a_double_dash(env):
     assert 'web_search="disabled"' in a[:cut] and "features.apps=false" in a[:cut]
 
 
+def agy_agent(a):
+    """The --agent a turn runs as, and its definition's frontmatter lines (in an --add-dir)."""
+    name = a[a.index("--agent") + 1]
+    dirs = [a[i + 1] for i, x in enumerate(a) if x == "--add-dir"]
+    found = [Path(d) / ".agents" / "agents" / f"{name}.md" for d in dirs]
+    found = [f for f in found if f.exists()]
+    assert len(found) == 1
+    return name, found[0].read_text().split("---")[1].strip().splitlines()
+
+
 def test_agy_denies_commands_and_writes_and_guides_by_switch(env):
     a = argv(env, "antigravity")
     settings = json.loads(a[a.index("--settings") + 1])
@@ -113,6 +124,106 @@ def test_agy_denies_commands_and_writes_and_guides_by_switch(env):
     a = argv(env, "antigravity", "conv-1")
     assert a.count("--settings") == 1 and "{}" not in a and "--settings={}" not in a and "--x" in a
     assert a[-1] == AGY_HEADLESS_NO_WEB + "PROMPT" and "do not use search_web" in AGY_HEADLESS_NO_WEB
+
+
+def test_agy_runs_as_an_agent_whose_tools_are_the_whole_inventory(env):
+    # A custom agent's `tools` drops invoke_subagent, swarm, schedule, run_workflow… and,
+    # with web search off, search_web, which no deny rule removes (agy 1.5.13, issue #54).
+    for resume_id in (None, "conv-1"):
+        name, front = agy_agent(argv(env, "antigravity", resume_id))
+        assert "mainAgent: true" in front and "subagent: false" in front
+        assert "tools: [read_file, search_web]" in front
+    # agy parses flags Go-style: one dash works as well as two.
+    set_peers(env, antigravity={"web_search": False, "args": ["--agent", "mine", "--agent=mine", "-agent", "mine2",
+                                                              "-agent=mine3", "-settings", "{}", "-settings={}", "--x"]})
+    a = argv(env, "antigravity")
+    off, front = agy_agent(a)
+    assert off != name and "tools: [read_file]" in front
+    assert a.count("--agent") == 1 and a.count("--settings") == 1 and "--x" in a
+    for gone in ("mine", "--agent=mine", "-agent", "mine2", "-agent=mine3", "-settings", "{}", "-settings={}"):
+        assert gone not in a, gone
+    assert "manage_task" not in front[-1] and not any("subagent" in t for t in front[-1].split(","))
+
+
+def test_codex_overrides_consume_their_value(env):
+    from agent_bus.peers import _codex_overrides
+    # A value is never read as a flag: `--` doesn't end the scan, and `-c…` isn't read twice.
+    assert _codex_overrides(["-c", "--", "-c", 'web_search="disabled"']) == ["--", 'web_search="disabled"']
+    assert _codex_overrides(["--config", "-cx=1", "-cy=2"]) == ["-cx=1", "y=2"]
+    assert _codex_overrides(["-c", "a=1", "--", "-c", "b=2"]) == ["a=1"]
+    set_peers(env, codex={"args": ["-c", "--", "-c", 'web_search="disabled"', "-p", "prof", "--enable", "apps"]})
+    assert adapter("codex", cfg.Config.load()).web_search is False
+    a = argv(env, "codex")
+    # Nor does any other walker stop at it: the profile moves, apps is dropped, and our
+    # overrides go after the whole slice, not between a -c and its value.
+    assert a[1:4] == ["--profile", "prof", "exec"] and "apps" not in a
+    cs = configs(a)
+    assert cs[:2] == ["--", 'sandbox_mode="read-only"'] and cs[-1] == 'web_search="disabled"'
+
+
+def test_codex_sandbox_approval_and_risky_features_come_last(env):
+    # Configured args can't loosen the sandbox, approvals or the switched-off features (#54):
+    # a later -c wins, and sandbox flags (which beat -c) are dropped.
+    extra = ["-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="on-request"',
+             "-s", "workspace-write", "--sandbox=danger-full-access", "-sdanger-full-access",
+             "--dangerously-bypass-approvals-and-sandbox", "--approve-for-me", "--worktree", "--trust", "--yolo", "--not-so-yolo",
+             "-c", "features.goals=true", "--enable", "image_generation", "--enable=tool_suggest", "--keep",
+             "-c", "--dangerously-bypass-approvals-and-sandbox"]
+    set_peers(env, codex={"args": extra})
+    for resume_id in (None, "thread-1"):
+        a = argv(env, "codex", resume_id)
+        cs = configs(a)
+        for flag in ("-s", "--sandbox=danger-full-access", "-sdanger-full-access", "--approve-for-me", "--worktree", "--trust", "--yolo", "--not-so-yolo",
+                     "--enable", "--enable=tool_suggest", "workspace-write", "features.goals=true"):
+            assert flag not in a, flag
+        assert "--keep" in a
+        # A -c value is a value, not the flag it looks like: it's kept, as a (bogus) override.
+        assert cs.count("--dangerously-bypass-approvals-and-sandbox") == 1
+        assert a.count("--dangerously-bypass-approvals-and-sandbox") == 1
+        tail = cs[cs.index('sandbox_mode="read-only"'):]
+        assert tail[:6] == ['sandbox_mode="read-only"', 'approval_policy="never"', "features.apps=false",
+                            "features.goals=false", "features.image_generation=false", "features.tool_suggest=false"]
+        assert cs.index('sandbox_mode="danger-full-access"') < cs.index('sandbox_mode="read-only"')
+        assert cs.index('approval_policy="on-request"') < cs.index('approval_policy="never"')
+
+
+def test_per_repo_switch_turns_web_search_off(env, capsys):
+    from agent_bus.db import HUMAN
+    from agent_bus.worker import Worker
+    path = env["tmp"] / "config" / "agent-bus" / "config.json"
+    data = json.loads(path.read_text())
+    repo = str(env["repo"])
+    other = env["tmp"] / "other"
+    other.mkdir()
+    for bad, msg in (([{"path": repo, "web_search": "no"}], r"repos\[0\].web_search"),
+                     ([{"web_search": False}], r"repos\[0\].path"), ([{"path": repo, "x": 1}], "unknown key"),
+                     ([3], r"repos\[0\] must be"), ("~/src", "must be a list")):
+        path.write_text(json.dumps({**data, "repos": bad}))
+        with pytest.raises(ValueError, match=msg):
+            cfg.Config.load()
+    # Entries can only turn it off, so any one covering the repo does (here the parent).
+    path.write_text(json.dumps({**data, "repos": [{"path": str(env["tmp"]), "web_search": False}, repo,
+                                                  {"path": str(other), "web_search": True}]}))
+    conf = cfg.Config.load()
+    assert conf.repo_allowed(repo) and conf.repo_allowed(other) and not conf.repo_allowed("/elsewhere")
+    assert conf.web_search("codex") is True and conf.web_search("codex", "/elsewhere") is True
+    assert conf.web_search("codex", repo) is False and conf.web_search("codex", str(env["repo"] / "sub")) is False
+    for agent in cfg.AGENTS:
+        assert adapter(agent, conf).web_search is True
+        assert adapter(agent, conf, repo=repo).web_search is False
+    assert configs(adapter("codex", conf, repo=repo).invocation("P", None, repo, []).argv)[-1] == 'web_search="disabled"'
+    _, front = agy_agent(adapter("antigravity", conf, repo=repo).invocation("P", None, repo, []).argv)
+    assert "tools: [read_file]" in front
+    w = Worker.__new__(Worker)
+    w.config = conf
+    t = {"id": "t-x", "participants": ["codex"], "initiator": HUMAN}
+    assert "search the web" not in w.preamble("codex", {**t, "repo": repo})
+    assert "search the web" in w.preamble("codex", {**t, "repo": None})
+    assert cli.main(["agents", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)["codex"]["web_search"]
+    assert report["enabled"] is True and report["off_in_repos"] == [str(env["tmp"])]
+    assert cli.main(["agents"]) == 0
+    assert f"off in {env['tmp']}" in capsys.readouterr().out
 
 
 def test_codex_web_search_progress_names_the_query_or_page(env):
@@ -136,13 +247,13 @@ def test_agents_reports_web_search(env, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["claude"]["web_search"]["enabled"] is True
     assert out["codex"]["web_search"] == {"enabled": False, "off_enforced": True, "tools": "search and fetch pages",
-                                          "note": "off"}
+                                          "note": "off", "off_in_repos": []}
     agy = out["antigravity"]["web_search"]
-    assert agy["enabled"] is False and agy["off_enforced"] is False and "instruction only" in agy["note"]
+    assert agy["enabled"] is False and agy["off_enforced"] is True and agy["note"] == "off"  # its agent has no search_web
     assert cli.main(["agents"]) == 0
     text = capsys.readouterr().out
     assert "web search as a peer: on, search and fetch pages" in text
-    assert "web search as a peer: off by instruction only" in text
+    assert "web search as a peer: off" in text and "instruction only" not in text
 
 
 def test_codex_mcp_off_switches_come_after_configured_server_tables(env):

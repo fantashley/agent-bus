@@ -64,7 +64,8 @@ If a tool you want is unavailable, complete your reply from the context you were
 
 """
 AGY_HEADLESS = _AGY_HEADLESS.format(web=" and web search (search_web)", off="")
-# peers.antigravity.web_search = false: agy has no switch for search_web, so this is advisory.
+# Web search off: the turn's custom agent has no search_web (issue #54); this says so, so the
+# model doesn't look for it.
 AGY_HEADLESS_NO_WEB = _AGY_HEADLESS.format(
     web="", off=" Web search is turned off for agent-bus peers: do not use search_web.")
 

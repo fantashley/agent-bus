@@ -146,7 +146,9 @@ def db_path() -> Path:
 
 @dataclass
 class Config:
-    repos: list[str] = field(default_factory=list)
+    # Allow-listed repos: a path, or {"path": ..., "web_search": false} to keep peers off the
+    # web while they work in it (issue #54).
+    repos: list = field(default_factory=list)
     max_rounds: int = 4
     deadline_minutes: int = 30
     turn_timeout_s: int = 600
@@ -184,6 +186,7 @@ class Config:
         if isinstance(conf.auto_resume_max, bool) or not isinstance(conf.auto_resume_max, int) \
                 or conf.auto_resume_max < 0:
             raise ValueError("auto_resume_max must be a whole number, 0 or more")
+        conf._repo_entries()  # reject a malformed repos entry when loading
         if not isinstance(conf.peers, dict):
             raise ValueError("config `peers` must be an object keyed by harness")
         for agent, entry in conf.peers.items():  # reject a bad model/effort when loading
@@ -314,9 +317,12 @@ class Config:
         merged.update(self.check_settings(agent, override))
         return self.check_settings(agent, merged)
 
-    def web_search(self, agent: str) -> bool:
+    def web_search(self, agent: str, repo: str | os.PathLike | None = None) -> bool:
         """Whether ``agent``'s headless turns may search the web (issue #46): on unless
-        config sets ``web_search = false`` for it (or for its harness in ``peers``)."""
+        config sets ``web_search = false`` for it (or for its harness in ``peers``), or for
+        an allow-listed ``repos`` entry that covers ``repo`` (issue #54)."""
+        if repo is not None and not self.repo_web_search(repo):
+            return False
         return self.launch(agent).get("web_search", True) is not False
 
     def peer_args(self, agent: str) -> list[str]:
@@ -326,13 +332,48 @@ class Config:
         """The account label ``agent``'s usage counts against, if configured."""
         return self.launch(agent).get("account") or None
 
-    def repo_allowed(self, repo: str | os.PathLike) -> bool:
-        real = os.path.realpath(repo)
-        for allowed in self.repos:
-            root = os.path.realpath(os.path.expanduser(allowed))
+    def _repo_entries(self) -> list[dict]:
+        """``repos`` as {"path", "web_search"?} entries: a bare string is a path."""
+        if not isinstance(self.repos, list):
+            raise ValueError("config `repos` must be a list of paths or {path, web_search} objects")
+        out = []
+        for i, entry in enumerate(self.repos):
+            if isinstance(entry, str):
+                entry = {"path": entry}
+            where = f"repos[{i}]"
+            if not isinstance(entry, dict):
+                raise ValueError(f"{where} must be a path or an object with `path` (and `web_search`)")
+            extra = set(entry) - {"path", "web_search"}
+            if extra:
+                raise ValueError(f"unknown key(s) in {where}: {', '.join(sorted(extra))} (expected path, web_search)")
+            if not isinstance(entry.get("path"), str) or not entry["path"]:
+                raise ValueError(f"{where}.path must be a non-empty string")
+            if not isinstance(entry.get("web_search", True), bool):
+                raise ValueError(f"{where}.web_search must be true or false")
+            out.append(entry)
+        return out
+
+    def _covering(self, repo: str | os.PathLike) -> list[dict]:
+        """The ``repos`` entries that ``repo`` is, or is inside."""
+        real = os.path.realpath(os.path.expanduser(str(repo)))
+        out = []
+        for entry in self._repo_entries():
+            root = os.path.realpath(os.path.expanduser(entry["path"]))
             if real == root or real.startswith(root.rstrip(os.sep) + os.sep):
-                return True
-        return False
+                out.append(entry)
+        return out
+
+    def repo_allowed(self, repo: str | os.PathLike) -> bool:
+        return bool(self._covering(repo))
+
+    def repo_web_search(self, repo: str | os.PathLike) -> bool:
+        """False when any allow-listed entry covering ``repo`` turns peer web search off:
+        an entry can only turn it off, so the most restrictive one wins (issue #54)."""
+        return all(e.get("web_search", True) for e in self._covering(repo))
+
+    def web_search_off_repos(self) -> list[str]:
+        """The allow-listed paths whose peers may not search the web, as configured."""
+        return [e["path"] for e in self._repo_entries() if e.get("web_search") is False]
 
 
 def _is_bare_git(d: Path) -> bool:
