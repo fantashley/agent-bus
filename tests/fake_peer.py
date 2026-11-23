@@ -44,7 +44,7 @@ if agent == "codex":
             sys.exit(1)
 
     rest = list(argv)
-    while len(rest) >= 2 and rest[0] == "-c":
+    while len(rest) >= 2 and rest[0] in ("-c", "--profile"):
         rest = rest[2:]
     if rest[:2] == ["mcp", "list"]:
         print(os.environ.get("FAKE_MCP_LIST") or json.dumps(

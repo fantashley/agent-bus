@@ -1,0 +1,7 @@
+{"type": "thread.started", "thread_id": "00000000-0000-4000-8000-000000000001"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "I’ll check the page for its first top-level heading."}}
+{"type": "item.started", "item": {"id": "exec-00000000-0000-4000-8000-000000000002", "type": "web_search", "query": "", "action": {"type": "other"}}}
+{"type": "item.completed", "item": {"id": "exec-00000000-0000-4000-8000-000000000002", "type": "web_search", "query": "https://jj-vcs.github.io/jj/latest/install-and-setup/", "action": {"type": "open_page", "url": "https://jj-vcs.github.io/jj/latest/install-and-setup/"}, "results": [{"type": "text_result", "domain": "jj-vcs.github.io", "ref_id": "turn0view0", "snippet": "Total lines: 400", "title": "Installation and setup - Jujutsu docs", "url": "https://jj-vcs.github.io/jj/latest/install-and-setup/"}]}}
+{"type": "item.completed", "item": {"id": "item_2", "type": "agent_message", "text": "Installation and setup"}}
+{"type": "turn.completed", "usage": {"input_tokens": 38965, "cached_input_tokens": 30976, "cache_write_input_tokens": 0, "output_tokens": 72, "reasoning_output_tokens": 0}}

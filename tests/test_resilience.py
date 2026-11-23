@@ -46,7 +46,7 @@ def test_version_is_probed_once_per_binary_and_recorded_per_turn(env, no_spawn, 
     tid = Service(bus, HUMAN).start_discussion("q", peers=["codex"])["thread"]["id"]
     run_job(bus, tid)
     starts = events(bus, tid, "turn_start")
-    assert starts and all("codex-cli 1.0.0 · recipe codex/1" in s for s in starts)
+    assert starts and all("codex-cli 1.0.0 · recipe codex/2" in s for s in starts)
 
 
 def test_exit_zero_without_a_reply_is_format_drift(env, no_spawn, monkeypatch):
@@ -267,10 +267,13 @@ def test_agy_whitespace_only_denial_reaches_no_repair(env, no_spawn, monkeypatch
     assert agy and not any("did not end with the JSON object" in c["prompt"] for c in agy)
 
 
-def test_preamble_offers_web_search_only_where_it_works(env, no_spawn):
+def test_preamble_offers_web_search_unless_it_is_off(env, no_spawn):
     t = {"id": "t-x", "participants": ["codex", "antigravity"], "initiator": HUMAN, "repo": "/r"}
     w = Worker.__new__(Worker)
-    assert "search the web" in w.preamble("codex", t) and "search the web" in w.preamble("claude", t)
+    w.config = cfg.Config.load()
+    for agent in cfg.AGENTS:  # every adapter can search headless now (issue #46)
+        assert "You may read files in /r and search the web if that helps you answer." in w.preamble(agent, t)
+    w.config.peers["antigravity"]["web_search"] = False
     agy = w.preamble("antigravity", t)
     assert "search the web" not in agy and "You may read files in /r if that helps you answer." in agy
 
@@ -284,7 +287,8 @@ def test_agy_reply_after_a_denial_is_a_normal_turn(env, monkeypatch):
 def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     from agent_bus.prompts import AGY_HEADLESS
     ad = adapter("antigravity", cfg.Config.load())
-    assert ad.recipe == "2" and "run_command" in AGY_HEADLESS and "web search" in AGY_HEADLESS
+    assert ad.recipe == "3" and "run_command" in AGY_HEADLESS and "search_web" in AGY_HEADLESS
+    assert "do not use search_web" not in AGY_HEADLESS.lower()  # no contradiction with the preamble
     for resume_id in (None, "conv-1"):
         argv = ad.invocation("PROMPT-BODY", resume_id, str(env["repo"]), []).argv
         assert argv[-1] == AGY_HEADLESS + "PROMPT-BODY"
@@ -298,7 +302,7 @@ def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     (written,) = scratch.glob("prompt-*.md")
     assert written.read_text() == AGY_HEADLESS + big
 
-    # Through the worker: first and resumed turns are guided and recorded as recipe 2; other peers aren't.
+    # Through the worker: first and resumed turns are guided and recorded as recipe 3; other peers aren't.
     monkeypatch.setenv("FAKE_BEHAVIOUR", "stubborn")  # every peer takes a round-2 turn
     tid = Service(env["bus"], HUMAN).start_discussion("q", peers=["codex", "antigravity"], max_rounds=2)["thread"]["id"]
     run_job(env["bus"], tid)
@@ -308,7 +312,7 @@ def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     assert not any(AGY_HEADLESS.strip() in c["prompt"] for c in calls(env, "codex"))
     starts = [e["text"] for e in env["bus"]._all(
         "SELECT * FROM events WHERE thread_id=? AND kind='turn_start' AND agent='antigravity'", tid)]
-    assert starts and all("recipe antigravity/2" in s for s in starts)
+    assert starts and all("recipe antigravity/3" in s for s in starts)
 
 
 def test_incomplete_agy_discussion_turn_is_reported_without_a_drift_notice(env, no_spawn, monkeypatch):

@@ -22,7 +22,7 @@ from typing import Callable
 from . import config as cfg
 from .config import Config
 from .db import new_uuid
-from .prompts import AGY_HEADLESS
+from .prompts import AGY_HEADLESS, AGY_HEADLESS_NO_WEB
 
 # argv entries above this size go through stdin or a file instead.
 MAX_ARG = 100_000
@@ -87,9 +87,11 @@ class Adapter:
     # Stream event types this adapter understands.  Anything else is counted and
     # reported, never fatal on its own: CLIs add event types often.
     known_events: frozenset = frozenset()
-    # Whether a headless turn can search the web, so the prompt doesn't offer a tool the
-    # CLI would deny (issue #46).
-    web_search: bool = True
+    # What web access a headless turn gets when web search is on (issue #46), and whether
+    # turning it off (peers.<agent>.web_search = false) is enforced by the CLI or only asked
+    # of the model.  Searches run on the vendor's side, not from this machine.
+    web_tools: str = "search and fetch pages"
+    web_off_enforced: bool = True
 
     def event_type(self, obj: dict) -> str | None:
         t = obj.get("type")
@@ -100,6 +102,7 @@ class Adapter:
         self.command = config.peer_command(self.agent, self.default_command)
         self.extra = config.peer_args(self.agent)
         self.settings = settings or {}  # validated {model, effort}; see Config.peer_settings
+        self.web_search = config.web_search(self.agent)
 
     def setting_args(self) -> list[str]:
         """This CLI's flags for the configured model and effort (none: its defaults)."""
@@ -429,6 +432,81 @@ def _short(text: str, n: int = 240) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+def _drop_codex_feature(args: list[str], feature: str) -> list[str]:
+    """Remove ``--enable <feature>`` / ``--enable=<feature>`` from a codex argv slice."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            out.extend(args[i:])
+            break
+        if a == "--enable" and i + 1 < len(args) and args[i + 1] == feature:
+            i += 2
+            continue
+        if a == f"--enable={feature}":
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def _codex_overrides(args: list[str]) -> list[str]:
+    """The values of every ``-c``/``--config`` override in a codex argv slice."""
+    out: list[str] = []
+    for i, a in enumerate(args):
+        if a == "--":
+            break
+        if a in ("-c", "--config"):
+            if i + 1 < len(args):
+                out.append(args[i + 1])
+        elif a.startswith("--config="):
+            out.append(a.split("=", 1)[1])
+        elif a.startswith("-c") and len(a) > 2 and not a.startswith("--"):
+            out.append(a[3:] if a.startswith("-c=") else a[2:])
+    return out
+
+
+def _codex_split_profile(args: list[str]) -> tuple[list[str], list[str]]:
+    """(``--profile`` args, everything else) from a codex argv slice: a profile is a
+    top-level option that ``exec resume`` doesn't accept."""
+    profile: list[str] = []
+    rest: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            rest.extend(args[i:])
+            break
+        if a in ("-p", "--profile") and i + 1 < len(args):
+            profile, i = ["--profile", args[i + 1]], i + 2
+            continue
+        if a.startswith("--profile=") or (a.startswith("-p") and len(a) > 2 and not a.startswith("--")):
+            val = a.split("=", 1)[1] if a.startswith("--profile=") or a.startswith("-p=") else a[2:]
+            profile, i = ["--profile", val], i + 1
+            continue
+        rest.append(a)
+        i += 1
+    return profile, rest  # the last profile given wins, as in codex
+
+
+def _codex_config_args(args: list[str]) -> list[str]:
+    """The config overrides and profile in a codex argv slice, as ``-c``/``--profile`` args."""
+    return _codex_split_profile(args)[0] + [x for o in _codex_overrides(args) for x in ("-c", o)]
+
+
+def _codex_value(override: str) -> object:
+    """An override's value as codex 0.171.0 reads it (utils/cli config_override.rs): trimmed,
+    then TOML (comments and all), else the text with surrounding quote characters stripped."""
+    import tomllib
+    raw = override.split("=", 1)[1].strip()
+    try:
+        return tomllib.loads(f"v = {raw}")["v"]
+    except tomllib.TOMLDecodeError:
+        return raw.strip("\"'")
+
+
 def _config_key(override: str) -> str:
     return override.split("=", 1)[0].strip() if "=" in override else ""
 
@@ -476,17 +554,25 @@ def _strip_flags(args: list[str], flags: set[str], config_keys: set[str] = froze
 
 class ClaudeAdapter(Adapter):
     agent = "claude"
+    # 2: --tools limits the built-in tool inventory, not just what is pre-approved (issue #46).
+    recipe = "2"
     known_events = frozenset({"system", "assistant", "user", "result", "rate_limit_event", "stream_event"})
     default_command = cfg.AGENT_INFO["claude"]["cli"]
     # Read-only tools only. No Bash at all: `jj`/`git` accept flags (--tool, --output,
     # --ext-diff) that run commands or write files, and reviews get the diff in the prompt.
     allowed_tools = ["Read", "Grep", "Glob", "WebSearch", "WebFetch"]
+    web_tool_names = ("WebSearch", "WebFetch")
 
     def invocation(self, prompt, resume_id, cwd, add_dirs):
-        # --strict-mcp-config with no --mcp-config loads no MCP servers at all.
+        # --strict-mcp-config with no --mcp-config loads no MCP servers at all.  --tools is
+        # the session's whole built-in tool set (without it Bash, CronCreate and the rest stay
+        # declared, only unapproved); --allowedTools pre-approves the same list.
+        tools = ",".join(t for t in self.allowed_tools if self.web_search or t not in self.web_tool_names)
         argv = [self.command, "-p", "--output-format", "stream-json", "--verbose",
-                "--permission-mode", "plan", "--strict-mcp-config",
-                "--allowedTools", ",".join(self.allowed_tools)]
+                "--permission-mode", "plan", "--strict-mcp-config", "--tools", tools,
+                "--allowedTools", tools]
+        if not self.web_search:  # removed from the session, not just left unapproved
+            argv += ["--disallowedTools", ",".join(self.web_tool_names)]
         for d in add_dirs:
             argv += ["--add-dir", d]
         argv += self.setting_args()
@@ -496,7 +582,7 @@ class ClaudeAdapter(Adapter):
         else:
             sid = new_uuid()
             argv += ["--session-id", sid]
-        argv += self.extra_args()
+        argv += _strip_flags(self.extra_args(), {"--tools"})  # ours is the whole inventory
         return Invocation(argv=argv, stdin=prompt, external_id=sid)
 
     def parse_line(self, obj, st, emit):
@@ -510,7 +596,8 @@ class ClaudeAdapter(Adapter):
                     emit("text", _short(block["text"]))
                 elif block.get("type") == "tool_use":
                     inp = block.get("input") or {}
-                    hint = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("query") or ""
+                    hint = (inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("query")
+                            or inp.get("url") or "")
                     emit("tool", _short(f"{block.get('name')} {hint}".strip()))
         elif typ == "rate_limit_event" and isinstance(obj.get("rate_limit_info"), dict):
             st.rate_limit = obj["rate_limit_info"]
@@ -557,6 +644,9 @@ _CODEX_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
 class CodexAdapter(Adapter):
     agent = "codex"
+    # 2: the `apps` feature (its codex_apps MCP server) is switched off, and web search can be
+    # (issue #46).
+    recipe = "2"
     known_events = frozenset({"thread.started", "turn.started", "item.started", "item.updated", "item.completed",
                               "turn.completed", "turn.failed", "error"})
     default_command = cfg.AGENT_INFO["codex"]["cli"]
@@ -567,8 +657,8 @@ class CodexAdapter(Adapter):
         Raises if they can't be listed: without the list we can't switch them off,
         and running a peer with unknown integrations live is not read-only.
         """
-        overrides = [a for i, a in enumerate(self.extra) if i > 0 and self.extra[i - 1] == "-c"]
-        argv = [self.command, *sum((["-c", o] for o in overrides), []), "mcp", "list", "--json"]
+        # Listed with the same config the turn runs with: every override and profile spelling.
+        argv = [self.command, *_codex_config_args(self.extra_args()), "mcp", "list", "--json"]
         try:
             out = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30)
             if out.returncode != 0:
@@ -593,6 +683,14 @@ class CodexAdapter(Adapter):
         return sorted({d["name"] for d in data
                        if isinstance(d, dict) and isinstance(d.get("name"), str) and d.get("enabled", True)})
 
+    def __init__(self, config: Config, settings: dict | None = None):
+        super().__init__(config, settings)
+        # A web_search="disabled" in peers.codex.args turns search off for the preamble and
+        # the report too, so they say what the turn will really have.
+        modes = [_codex_value(o) for o in _codex_overrides(self.extra) if _config_key(o) == "web_search"]
+        if modes and modes[-1] == "disabled":
+            self.web_search = False
+
     def setting_args(self) -> list[str]:
         args = []
         if self.settings.get("model"):
@@ -602,17 +700,30 @@ class CodexAdapter(Adapter):
         return args
 
     def extra_args(self) -> list[str]:
-        flags, keys = set(), set()
+        # apps stays off: a features table is kept, and the final -c features.apps=false wins.
+        flags, keys = set(), {"features.apps"}
         if self.settings.get("model"):
             flags |= {"-m", "--model"}
             keys.add("model")
         if self.settings.get("effort"):
             keys.add("model_reasoning_effort")
-        return _strip_flags(self.extra, flags, keys) if (flags or keys) else list(self.extra)
+        if not self.web_search:
+            keys.add("web_search")
+        return _drop_codex_feature(_strip_flags(self.extra, flags, keys), "apps")
 
     def invocation(self, prompt, resume_id, cwd, add_dirs):
+        # `apps` (on by default in 0.171.0) adds a codex_apps MCP server that `codex mcp list`
+        # doesn't show and that the read-only sandbox doesn't cover: live probe 2026-11-23, it
+        # offered plugin management, site publishing and more.  Web search is codex's hosted
+        # tool (search and open_page, run by OpenAI), on by default ("cached" in a read-only
+        # sandbox); off sets web_search="disabled" (issue #46).
         common = ["--json", "--skip-git-repo-check", "-c", 'sandbox_mode="read-only"',
                   "-c", 'approval_policy="never"']
+        common += self.setting_args()
+        extra = self.extra_args()
+        # After the configured args, since a later -c wins (a features table, or a server
+        # table, merges with it or would replace an earlier dotted key).
+        last = ["-c", "features.apps=false"]
         # The read-only sandbox doesn't cover MCP side effects, so switch every server off.
         for name in self.mcp_servers(cwd):
             # `-c` takes a dotted path with bare keys: a quoted key names a *different*
@@ -621,13 +732,23 @@ class CodexAdapter(Adapter):
             if not _CODEX_KEY.fullmatch(name):
                 raise PeerSetupError(f"can't switch off codex MCP server {name!r} for a read-only turn "
                                      "(its name can't be written in a `-c` override)")
-            common += ["-c", f"mcp_servers.{name}.enabled=false"]
-        common += self.setting_args()
-        extra = self.extra_args()
+            last += ["-c", f"mcp_servers.{name}.enabled=false"]
+        # The mode is pinned: agent-bus's switch, not ~/.codex/config.toml, decides, so the
+        # preamble never offers a tool codex dropped.  A mode in peers.codex.args is kept while
+        # search is on (one that disables it turns self.web_search off).
+        if not self.web_search:
+            last += ["-c", 'web_search="disabled"']
+        elif not any(_config_key(o) == "web_search" for o in _codex_overrides(extra)):
+            last += ["-c", 'web_search="cached"']
+        # ...but before a `--`, after which everything is positional.
+        cut = extra.index("--") if "--" in extra else len(extra)
+        extra = extra[:cut] + last + extra[cut:]
+        # A profile goes before `exec`: `exec resume` rejects --profile (codex 0.171.0).
+        profile, extra = _codex_split_profile(extra)
         if resume_id:
-            argv = [self.command, "exec", "resume", *common, *extra, resume_id, "-"]
+            argv = [self.command, *profile, "exec", "resume", *common, *extra, resume_id, "-"]
         else:
-            argv = [self.command, "exec", *common, "-C", cwd, *extra, "-"]
+            argv = [self.command, *profile, "exec", *common, "-C", cwd, *extra, "-"]
         return Invocation(argv=argv, stdin=prompt, external_id=resume_id)
 
     def parse_line(self, obj, st, emit):
@@ -644,7 +765,12 @@ class CodexAdapter(Adapter):
                 emit("text", _short(item["text"]))
             elif itype == "command_execution" and typ == "item.started":
                 emit("tool", _short(f"shell {item.get('command', '')}"))
-            elif itype in ("web_search", "mcp_tool_call", "file_change") and typ == "item.started":
+            elif itype == "web_search" and typ == "item.completed":
+                # The started item has an empty query (codex 0.171.0); the completed one says
+                # what was searched or opened.
+                action = item.get("action") if isinstance(item.get("action"), dict) else {}
+                emit("tool", _short(f"web_search {item.get('query') or action.get('url') or ''}".strip()))
+            elif itype in ("mcp_tool_call", "file_change") and typ == "item.started":
                 emit("tool", _short(f"{itype} {item.get('query') or item.get('tool') or ''}"))
         elif typ == "turn.completed":
             st.usage = usage_from(obj.get("usage"), CODEX_USAGE)
@@ -660,8 +786,19 @@ class CodexAdapter(Adapter):
 class AntigravityAdapter(Adapter):
     agent = "antigravity"
     # 2: headless tool guidance in every prompt; denied actions reported as an incomplete turn.
-    recipe = "2"
-    web_search = False  # denied headless (agy 1.5.13); see prompts.AGY_HEADLESS
+    # 3: deny rules for commands and file writes; the guidance offers web search (issue #46).
+    recipe = "3"
+    # agy 1.5.13 in plan mode declares search_web (Google-grounded search, run server side) but
+    # no page fetch, and no permission rule or flag switches search_web off (live probes,
+    # 2026-11-23): `search_web(*)` and `read_url(*)` deny rules are ignored.
+    web_tools = "search only (plan mode has no page fetch)"
+    web_off_enforced = False
+    # Session-only permission rules (Deny wins over any Allow or Ask, in agy's own settings
+    # too).  Without them a command is auto-denied as needing approval and the turn ends with
+    # no reply; with them it is a tool error the model answers past.  write_file also covers
+    # edit_file, and plan mode allows workspace writes under the system temp directory without
+    # asking (live probes, agy 1.5.13, 2026-11-23).  execute_url is the browser subagent.
+    deny_rules = ("command(*)", "write_file(*)", "execute_url(*)")
     known_events = frozenset({"init", "step_update", "result"})
 
     def event_type(self, obj):
@@ -697,22 +834,25 @@ class AntigravityAdapter(Adapter):
 
     def invocation(self, prompt, resume_id, cwd, add_dirs):
         self.check_isolation()
-        argv = [self.command, "--mode", "plan", "--sandbox", "--output-format", "stream-json"]
+        argv = [self.command, "--mode", "plan", "--sandbox", "--output-format", "stream-json",
+                "--settings", json.dumps({"permissions": {"deny": list(self.deny_rules)}})]
         for d in add_dirs:
             argv += ["--add-dir", d]
         if resume_id:
             argv += ["--conversation", resume_id]
         argv += self.setting_args()
-        argv += self.extra_args()
+        # Our --settings carries the deny rules: one in the configured args could replace it.
+        argv += _strip_flags(self.extra_args(), {"--settings"})
         # Every turn, resumed or not, says which tools work unattended (recipe 2).
-        prompt = AGY_HEADLESS + prompt
+        guide = AGY_HEADLESS if self.web_search else AGY_HEADLESS_NO_WEB
+        prompt = guide + prompt
         # agy takes the prompt as the value of --print; there is no stdin mode
         # for plain text, so very long prompts go through a file.
         if len(prompt.encode()) > MAX_ARG:
             path = os.path.join(add_dirs[0] if add_dirs else cwd, f"prompt-{new_uuid()}.md")
             with open(path, "w") as f:
                 f.write(prompt)
-            prompt = (AGY_HEADLESS + f"Your full instructions are in the file {path}. "
+            prompt = (guide + f"Your full instructions are in the file {path}. "
                       "Read it with read_file and follow it exactly.")
         argv += ["--print", prompt]
         return Invocation(argv=argv, external_id=resume_id)
@@ -834,6 +974,15 @@ def adapter(agent: str, config: Config, settings: dict | None = None) -> Adapter
         return ADAPTERS[agent](config, settings)
     except KeyError:
         raise ValueError(f"unknown agent {agent!r}; expected one of {', '.join(ADAPTERS)}") from None
+
+
+def web_search_report(agent: str, config: Config) -> dict:
+    """What a headless turn of ``agent`` gets for web search, for `agent-bus agents` (#46)."""
+    cls = ADAPTERS[agent]
+    on = adapter(agent, config).web_search  # the same resolution the turn and preamble use
+    note = cls.web_tools if on else ("off" if cls.web_off_enforced
+                                     else "off by instruction only: the CLI has no switch for it")
+    return {"enabled": on, "off_enforced": cls.web_off_enforced, "tools": cls.web_tools, "note": note}
 
 
 def extract_json(text: str) -> dict | None:

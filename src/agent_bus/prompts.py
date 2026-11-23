@@ -53,15 +53,20 @@ End your reply with a single JSON object on its own line, and nothing after it. 
 """
 
 # Prepended to every headless Antigravity turn, resumed ones included.  agy auto-denies
-# actions that need approval when no one can give it (a terminal command, live probe of
-# agy 1.5.13 on 2026-11-23), and the turn then ends with no reply.
-AGY_HEADLESS = """\
-[agent-bus: unattended turn; no one can approve actions.] Use only your built-in read-only \
-workspace tools (such as read_file). Do not use the terminal or shell (run_command) or web \
-search: they are denied here and end your turn with no reply. If a tool you want is \
-unavailable, complete your reply from the context you were given.
+# actions that need approval when no one can give it, and the turn then ends with no reply
+# (live probe of agy 1.5.13, 2026-11-23).  The adapter's deny rules turn the terminal and
+# file writes into plain tool errors; search_web needs no approval in plan mode (issue #46).
+_AGY_HEADLESS = """\
+[agent-bus: unattended turn; no one can approve actions.] Use only read-only tools: your \
+built-in workspace tools (such as read_file){web}. The terminal or shell (run_command) and \
+file edits are denied here, and an action that needs approval can end your turn with no reply.{off} \
+If a tool you want is unavailable, complete your reply from the context you were given.
 
 """
+AGY_HEADLESS = _AGY_HEADLESS.format(web=" and web search (search_web)", off="")
+# peers.antigravity.web_search = false: agy has no switch for search_web, so this is advisory.
+AGY_HEADLESS_NO_WEB = _AGY_HEADLESS.format(
+    web="", off=" Web search is turned off for agent-bus peers: do not use search_web.")
 
 REPAIR = """\
 Your last reply did not end with the JSON object the protocol needs, so it could not be counted.

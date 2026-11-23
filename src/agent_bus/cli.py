@@ -400,10 +400,11 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
             print(f"cleared {n} out-of-usage block(s) for {args.clear_quota}")
             return 0
         avail = conf.availability()
-        from .peers import cli_version
+        from .peers import cli_version, web_search_report
         for a, v in avail.items():
             if v["available"]:
                 v["version"] = cli_version(bus, a, conf.peer_command(a))
+                v["web_search"] = web_search_report(a, conf)
         blocks: dict[str, list] = {}
         for b in bus.quota_blocks():
             blocks.setdefault(b["agent"], []).append(b)
@@ -418,6 +419,9 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         for a, v in avail.items():
             print(f"  {'yes' if v['available'] else 'no ':<4} {a:<12} {v['reason']}"
                   + (f" ({v['version']})" if v.get("version") else ""))
+            if v.get("web_search"):
+                print(f"       web search as a peer: {'on, ' if v['web_search']['enabled'] else ''}"
+                      f"{v['web_search']['note']}")
             for b in blocks.get(a, []):
                 when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(b["until"]))
                 print(f"       out of usage{' for model ' + b['scope'] if b['scope'] else ''} until {when}"

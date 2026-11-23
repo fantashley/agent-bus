@@ -20,6 +20,18 @@
       "recipe": "claude/1"
     },
     {
+      "file": "claude-webfetch.jsonl",
+      "agent": "claude",
+      "cli": "Claude Code 2.1.330",
+      "captured": "2026-11-23",
+      "scenario": "first turn: --tools limits the session to Read/Grep/Glob/WebSearch/WebFetch; two WebFetch calls, then a reply (issue #46)",
+      "final": "Installation and setup",
+      "recipe": "claude/2",
+      "tools": [
+        "WebFetch"
+      ]
+    },
+    {
       "file": "codex-start.jsonl",
       "agent": "codex",
       "cli": "codex-cli 0.171.0",
@@ -54,6 +66,42 @@
       "scenario": "--conversation resume of antigravity-start, recalling the file it read",
       "final": "notes.txt",
       "recipe": "antigravity/1"
+    },
+    {
+      "file": "codex-websearch.jsonl",
+      "agent": "codex",
+      "cli": "codex-cli 0.171.0",
+      "captured": "2026-11-23",
+      "scenario": "first turn: the hosted web_search tool opens a page (open_page), then a reply (issue #46)",
+      "final": "Installation and setup",
+      "recipe": "codex/2",
+      "tools": [
+        "web_search"
+      ]
+    },
+    {
+      "file": "antigravity-websearch.jsonl",
+      "agent": "antigravity",
+      "cli": "agy 1.5.13",
+      "captured": "2026-11-23",
+      "scenario": "first turn: search_web in plan mode with --sandbox and the deny rules, no approval needed, then a reply (issue #46)",
+      "final": "Google",
+      "recipe": "antigravity/3",
+      "tools": [
+        "search_web"
+      ]
+    },
+    {
+      "file": "antigravity-denied-command.jsonl",
+      "agent": "antigravity",
+      "cli": "agy 1.5.13",
+      "captured": "2026-11-23",
+      "scenario": "first turn: run_command hits the command(*) deny rule as a tool error (not an auto-denied action), and the model still replies (issue #46)",
+      "final": "denied",
+      "recipe": "antigravity/3",
+      "tools": [
+        "run_command"
+      ]
     }
   ]
 }
