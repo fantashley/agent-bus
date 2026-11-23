@@ -932,6 +932,62 @@ class Bus:
                         " ORDER BY id DESC LIMIT 1", thread_id, agent)
         return bool(row and row["kind"] == "turn_start")
 
+    # ------------------------------------------------------------------- reviews
+
+    def review_standings(self, thread_id: str) -> dict:
+        """Where each required reviewer of a review thread stands at its current head (#47).
+
+        A verdict counts only for the revision it was given on.  A several-reviewer thread
+        starts a new revision whenever a follow-up changes its base or head, so an approval
+        from any earlier revision is ``stale`` and needs a re-review, like a request for
+        changes on one.  (A single-reviewer thread compares heads.)  ``pending`` lists
+        everyone without a verdict on the current revision."""
+        t = self.thread(thread_id)
+        refs = t["refs"] or {}
+        reviewers = list(refs.get("reviewers") or [r for r in [refs.get("reviewer")] if r])
+        head, base = refs.get("head_commit_id"), refs.get("base_commit_id")
+        last: dict[str, dict] = {}
+        for row in self._all("SELECT * FROM messages WHERE thread_id=? AND kind='review_verdict' ORDER BY id",
+                             thread_id):
+            m = self._msg(row)
+            if m["sender"] in reviewers:
+                last[m["sender"]] = m
+        active = self._one("SELECT 1 FROM jobs WHERE thread_id=? AND status IN ('queued','running')", thread_id)
+        by: dict[str, dict] = {}
+        for r in reviewers:
+            m = last.get(r)
+            verdict = m["data"].get("verdict") if m else None
+            at = m["data"].get("head_commit_id") if m else None
+            # Single-reviewer verdicts carry no revision or base; they count for the thread's.
+            on_base = m["data"].get("base_commit_id", base) if m else None
+            current = (m["data"].get("revision") == refs.get("revision", 0) if "reviewers" in refs
+                       else at == head) if m else False
+            if m is None:
+                state = "pending"
+            elif not current:
+                state = "stale"
+            else:
+                state = "approved" if verdict == "approve" else "changes_requested"
+            if active and r == refs.get("reviewer") and state in ("pending", "stale"):
+                state = "reviewing"
+            by[r] = {"state": state, "verdict": verdict, "head_commit_id": at, "base_commit_id": on_base}
+        return {"head_commit_id": head, "reviewers": by,
+                "approved": [r for r in reviewers if by[r]["state"] == "approved"],
+                "changes_requested": [r for r in reviewers if by[r]["state"] == "changes_requested"],
+                "pending": [r for r in reviewers if by[r]["state"] in ("pending", "stale", "reviewing")],
+                "complete": bool(reviewers) and all(by[r]["state"] == "approved" for r in reviewers)}
+
+    def next_reviewer(self, thread_id: str, after: str | None) -> str | None:
+        """The next required reviewer without a valid approval, going round the list from
+        the one after ``after`` (the last round's reviewer), or None once all have approved."""
+        st = self.review_standings(thread_id)
+        order = list(st["reviewers"])
+        start = order.index(after) + 1 if after in order else 0
+        for r in order[start:] + order[:start]:
+            if st["reviewers"][r]["state"] != "approved":
+                return r
+        return None
+
 
 def new_uuid() -> str:
     return str(uuid.uuid4())

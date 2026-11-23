@@ -28,7 +28,8 @@ Codex and Antigravity are available; `whoami` lists them) and to the human user'
 - To get several agents to agree on something, call start_discussion, post your own initial view
   with send(kind="proposal") BEFORE reading anything else (round 1 is blind), then loop
   wait(thread) and respond with send(kind="vote", on=..., stance=...) or a revised proposal.
-- To get a change reviewed, call request_review with pinned commit ids.
+- To get a change reviewed, call request_review with pinned commit ids (`reviewers=[...]` when
+  several agents must all approve: they review one at a time).
 - Don't ping-pong: reply only when you have something new. Threads have hard message and round caps.
 """
 
@@ -155,23 +156,36 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
         return call(svc.advance_discussion, thread=thread)
 
     @mcp.tool()
-    def request_review(reviewer: str, repo: str, base_commit_id: str, head_commit_id: str,
-                       change_id: str | None = None, prev_head_commit_id: str | None = None,
-                       focus: str | None = None, model: str | None = None,
-                       effort: str | None = None) -> dict[str, Any]:
-        """Ask another agent for a read-only review of a pinned change in an allow-listed repo.
+    def request_review(repo: str, base_commit_id: str, head_commit_id: str, reviewer: str | None = None,
+                       reviewers: list[str] | None = None, change_id: str | None = None,
+                       prev_head_commit_id: str | None = None, focus: str | None = None,
+                       model: str | None = None, effort: str | None = None,
+                       peer_settings: dict | None = None, thread: str | None = None) -> dict[str, Any]:
+        """Ask other agents for a read-only review of a pinned change in an allow-listed repo.
 
         Pin full commit ids (`git rev-parse HEAD`, or `jj log --no-graph -r @ -T commit_id` in a jj
         repo); change_id is an optional label (jj change id, branch name, "PR #12"). For a follow-up
-        pass, pass the head that reviewer last reviewed as prev_head_commit_id: the request
+        pass, pass the head last reviewed on the thread as prev_head_commit_id: the request
         continues the same review thread and resumes the reviewer's own conversation, so it keeps
         its earlier findings and sees only the interdiff plus any replies you posted on the thread.
         model/effort optionally set the reviewer's model and reasoning effort for this review
         thread (kept for follow-up passes unless given again).
+
+        Give `reviewers` (a list) instead of `reviewer` when several agents must all approve.
+        They review one at a time on one thread: each approval hands the head to the next, a
+        request for changes waits for your fix, and each later reviewer sees the earlier
+        verdicts and your replies. Verdicts count only for the head they were given on, so the
+        change is ready once every reviewer has approved the same head (the result's `review`
+        shows who approved, who asked for changes and who is pending). For the next head, call
+        again with the same reviewers and prev_head_commit_id = the thread's current head.
+        Per-reviewer model/effort go in peer_settings, e.g. {"codex": {"effort": "high"}}. If
+        several of your reviews could match a follow-up, it fails with REVIEW_AMBIGUOUS: pass
+        `thread` to name the one to continue.
         """
         return call(svc.request_review, reviewer=reviewer, repo=repo, change_id=change_id,
                     base_commit_id=base_commit_id, head_commit_id=head_commit_id,
-                    prev_head_commit_id=prev_head_commit_id, focus=focus, model=model, effort=effort)
+                    prev_head_commit_id=prev_head_commit_id, focus=focus, model=model, effort=effort,
+                    reviewers=reviewers, peer_settings=peer_settings, thread=thread)
 
     return mcp
 

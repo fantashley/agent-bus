@@ -20,6 +20,8 @@ reply is posted for you, and you must not call agent-bus tools.
   as a jj change id, a branch name or "PR #12". A new head needs a new request; pass the previously
   reviewed head as `prev_head_commit_id`: that resumes the reviewer's own conversation on the same
   thread, so first `send` it a short note on how you addressed each finding. Then `wait(thread)`.
+  When several agents must all approve, pass `reviewers=[...]` instead of `reviewer`: they review
+  one at a time on one thread, and the change is ready once all of them approve the same head.
 - **Don't ping-pong.** Reply only when you have something new. Threads have message and round caps;
   `THREAD_LIMIT_REACHED` means stop and tell the user.
 - Peers run headless and read-only in allow-listed repos. Discussions produce decisions, not edits.

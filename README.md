@@ -59,6 +59,34 @@ its earlier findings; it gets the interdiff plus anything you posted on the thre
 `send` explaining how each finding was addressed). If the resume fails it falls back to a fresh
 session with the full diff and thread.
 
+### Several required reviewers
+
+Pass `reviewers=["codex", "antigravity"]` instead of `reviewer` when every one of them must
+approve. They review **one at a time, on one thread**, so they don't spend tokens finding the
+same things in parallel:
+
+- The first reviewer in the list goes first. An approval hands the same head straight to the
+  next reviewer without a valid approval; a request for changes stops and waits for you.
+- Fix the findings, `send` a note on the thread saying how, then call `request_review` again
+  with the same reviewers, the new head and `prev_head_commit_id` = the thread's current head.
+  The next round goes to the reviewer after the one that asked for changes (round robin). A
+  reviewer new to the change gets the full diff plus the earlier verdicts (each naming the head
+  it was given on) and your notes; one that reviewed before resumes its own conversation with
+  the interdiff since the head it last saw and everything posted since.
+- A verdict counts only for the base and head it was given on. **Any new head (or a new base)
+  makes every earlier approval stale**, so the review is complete (the thread resolves) once
+  every required reviewer has approved the same base..head. Re-reviews are follow-ups, so
+  they're cheap; after a base change a reviewer gets the full diff again. Asking again for the
+  head someone requested changes on is refused with `CHANGES_REQUESTED`.
+- `request_review`, `history` and `wait` (on timeout) return a `review` object with
+  `approved`, `changes_requested` and `pending` lists and each reviewer's state (`approved`,
+  `changes_requested`, `stale`, `pending` or `reviewing`); `agent-bus history` and
+  `agent-bus threads` print the same. Per-reviewer model/effort go in `peer_settings`.
+- A follow-up finds its thread by the previous head; a `change_id` you give picks reviews with
+  that label (or, failing those, unlabelled ones), and a fresh request only reuses a review with
+  the same label. It never guesses between several: that fails with `REVIEW_AMBIGUOUS`,
+  and passing `thread` (or a distinguishing `change_id`) picks one.
+
 If the repo doesn't have a pinned commit (base, head, or the previous head a follow-up diffs
 against), the reviewer isn't started. The thread goes to `needs_human` with a notice naming the
 missing commit, and the job is marked failed. Make the commit available in the repo, then request

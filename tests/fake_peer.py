@@ -18,6 +18,7 @@ Behaviour is driven by env vars so tests can script outcomes:
                   denied_blank: a whitespace-only response; unfinished: the tool never reaches an end
                   state; toolerror: ERROR, no denial
   FAKE_MCP_LIST   what `codex mcp list --json` prints
+  FAKE_APPROVE    comma-separated agents whose review verdicts approve (others request changes)
 Round-1 prompts get a proposal; later prompts agree with the lowest proposal id
 mentioned (or object, for `stubborn`).
 """
@@ -70,6 +71,9 @@ if log:
 repair = "Reply again with only" in prompt
 if behaviour == "nojson" and not repair:
     reply = "Thinking out loud, no JSON."
+elif (behaviour == "review" or "Diff from base to head" in prompt or "Interdiff" in prompt) \
+        and agent in os.environ.get("FAKE_APPROVE", "").split(","):
+    reply = 'All good.\n{"verdict": "approve", "summary": "fine", "findings": []}'
 elif behaviour == "review" or "Diff from base to head" in prompt or "Interdiff" in prompt:
     reply = 'Looks fine.\n{"verdict": "request_changes", "summary": "one bug", "findings": [{"file": "a.txt", "line": 1, "severity": "high", "comment": "typo"}]}'
 elif behaviour == "garbage":

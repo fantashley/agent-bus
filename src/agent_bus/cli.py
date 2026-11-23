@@ -14,6 +14,7 @@ from . import config as cfg
 from . import hooks, rex
 from .db import HUMAN, SYSTEM, Bus, BusError
 from .service import Service, present, thread_summary
+from .worker import format_review
 
 COLORS = {"claude": "\x1b[38;5;173m", "codex": "\x1b[38;5;75m", "antigravity": "\x1b[38;5;114m",
           HUMAN: "\x1b[1;38;5;220m", SYSTEM: "\x1b[2m"}
@@ -50,7 +51,13 @@ def thread_status(bus: Bus, thread: str) -> tuple[str, str | None, str]:
         return "blocked", "question", f"{thread}: needs human"
     if t["status"] == "cancelled":
         return "idle", None, f"{thread}: cancelled"
+    if not job and t["kind"] == "review" and (t["refs"] or {}).get("reviewers"):
+        st = bus.review_standings(thread)
+        if st["changes_requested"]:
+            return "idle", None, f"{thread}: changes requested by {', '.join(st['changes_requested'])}"
     if job:
+        if t["kind"] == "review":
+            return "working", None, f"{thread}: {(t['refs'] or {}).get('reviewer')} reviewing"
         return "working", None, f"{thread}: round {t['round']}/{t['max_rounds']}"
     # Waiting on an interactive session that has mail here: only the human can nudge it (#20).
     waiting = hooks.mail_waiting(bus, thread)
@@ -226,6 +233,10 @@ def _print_history(bus: Bus, thread: str, color: bool) -> None:
     t = h["thread"]
     print(_color(SYSTEM, f"{t['id']} [{t['status']}] {t['kind']} r{t['round']}/{t['max_rounds']}: {t['goal']}",
                  color))
+    if t["kind"] == "review" and (t["refs"] or {}).get("reviewers"):
+        st = bus.review_standings(thread)
+        print(_color(SYSTEM, f"required reviewers at head {str(st['head_commit_id'])[:12]}"
+                     + (" (complete)" if st["complete"] else "") + ":\n" + format_review(st), color))
     for m in h["messages"]:
         print(format_message(m, color))
 
@@ -430,7 +441,8 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
     if args.cmd == "threads":
         ts = bus.threads(include_closed=args.all)
         if args.json:
-            print(json.dumps([thread_summary(t) for t in ts], indent=2))
+            print(json.dumps([{**thread_summary(t), **({"review": bus.review_standings(t["id"])}
+                                                       if t["kind"] == "review" else {})} for t in ts], indent=2))
             return 0
         if not ts:
             print("no threads" if args.all else "no open threads (use --all to include closed ones)")
@@ -448,11 +460,17 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         for r in rows:
             print(line(r))
             print(indent + " ".join(r[6].split())[:100])
+            if r[2] == "review" and (bus.thread(r[0])["refs"] or {}).get("reviewers"):
+                st = bus.review_standings(r[0])
+                print(indent + "; ".join(f"{who} {v['state'].replace('_', ' ')}"
+                                         for who, v in st["reviewers"].items()))
         return 0
     if args.cmd == "history":
         if args.json:
             h = bus.history(args.thread)
             print(json.dumps({"thread": thread_summary(h["thread"]),
+                              **({"review": bus.review_standings(args.thread)}
+                                 if h["thread"]["kind"] == "review" else {}),
                               "messages": [present(m) for m in h["messages"]]}, indent=2))
         else:
             _print_history(bus, args.thread, color)
