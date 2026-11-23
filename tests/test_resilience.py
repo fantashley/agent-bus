@@ -467,6 +467,43 @@ def test_concurrent_callers_share_one_version_probe(env, monkeypatch):
     assert runs() == 2
 
 
+def test_timed_out_version_probe_kills_grandchild_holding_its_pipes(env, monkeypatch):
+    """#52: a wrapper whose grandchild inherits stdout (and ignores SIGTERM) must not hang
+    the probe, and the per-binary lock, past its timeout: the whole group is killed."""
+    import stat
+    from agent_bus import peers
+    monkeypatch.setattr(peers, "VERSION_PROBE_TIMEOUT_S", 0.5)
+    script, fifo = env["tmp"] / "shim-cli", env["tmp"] / "shim-cli.alive"
+    # The grandchild also holds a FIFO open: EOF on it means it is dead, even if its
+    # PID lingers as an unreaped zombie.
+    os.mkfifo(fifo)
+    alive = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        script.write_text("#!/bin/sh\n"
+                          f"(trap '' TERM; echo up >&3; exec sleep 60) 3>'{fifo}' &\n"
+                          "echo 'shim 1.0.0'\n")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+        started = time.monotonic()
+        assert cli_version(env["bus"], "codex", str(script)) == "unknown"
+        assert time.monotonic() - started < 10
+        seen, deadline = b"", time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                chunk = os.read(alive, 64)
+            except BlockingIOError:  # still held open: the grandchild lives
+                time.sleep(0.05)
+                continue
+            if not chunk:
+                break
+            seen += chunk
+        else:
+            pytest.fail("the probe's grandchild survived its timeout")
+    finally:
+        os.close(alive)
+    assert seen == b"up\n"  # it did start, and hold the pipes, before being killed
+
+
 def test_upgrade_drops_unknown_versions_cached_by_older_releases(env):
     """Codex review of PR #49: before #41 a timed-out probe was cached as "unknown" for
     good.  Opening such a database once makes those binaries eligible for a new probe."""

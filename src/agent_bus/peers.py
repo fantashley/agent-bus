@@ -328,19 +328,35 @@ def cli_version(bus, agent: str, command: str, cwd: str | None = None) -> str:
         version = "unknown"
         try:
             # errors="replace": a stray undecodable byte (say, a wrapper's diagnostic on
-            # stderr) must not stop the turn this probe runs ahead of.
-            out = subprocess.run([launch, "--version"], cwd=cwd, capture_output=True, text=True, errors="replace",
-                                 timeout=VERSION_PROBE_TIMEOUT_S, stdin=subprocess.DEVNULL,
-                                 env={**os.environ, "AGENT_BUS_PEER": "version-probe"})
-            text = out.stdout if (out.stdout or "").strip() else out.stderr
-            line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
-            if out.returncode == 0 and line:
-                version = "".join(ch for ch in line if ch.isprintable())[:80]
-        except subprocess.TimeoutExpired:
-            bus.set_cli_version_timeout(key, agent, launch, time.time() + VERSION_TIMEOUT_COOLDOWN_S)
-            return "unknown"
+            # stderr) must not stop the turn this probe runs ahead of.  Its own session, so
+            # a timeout kills the whole group: a grandchild still holding the pipes (a shim
+            # launching the real binary) can't keep this probe, and the lock, waiting (#52).
+            proc = subprocess.Popen([launch, "--version"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, errors="replace", stdin=subprocess.DEVNULL, start_new_session=True,
+                                    env={**os.environ, "AGENT_BUS_PEER": "version-probe"})
         except OSError:
-            pass
+            proc = None
+        if proc is not None:
+            with proc:
+                try:
+                    stdout, stderr = proc.communicate(timeout=VERSION_PROBE_TIMEOUT_S)
+                except BaseException as e:  # a timeout, a pipe error, or an interrupt
+                    # SIGKILL straight away: the wrapper may already be gone, so waiting on
+                    # it (as _killpg does) wouldn't escalate for a descendant ignoring SIGTERM.
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    if not isinstance(e, (subprocess.TimeoutExpired, OSError)):
+                        raise
+                    if isinstance(e, subprocess.TimeoutExpired):
+                        bus.set_cli_version_timeout(key, agent, launch, time.time() + VERSION_TIMEOUT_COOLDOWN_S)
+                        return "unknown"
+                    stdout = stderr = ""
+            text = stdout if (stdout or "").strip() else stderr
+            line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
+            if proc.returncode == 0 and line:
+                version = "".join(ch for ch in line if ch.isprintable())[:80]
         bus.set_cli_version(key, agent, launch, version)
         return version
 
