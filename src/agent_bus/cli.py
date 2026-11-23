@@ -283,6 +283,13 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--clear-quota", metavar="AGENT", choices=cfg.AGENTS,
                    help="forget that AGENT is out of usage (e.g. after upgrading a plan)")
 
+    s = sub.add_parser("usage", help="tokens headless turns used recently, per agent and per thread")
+    s.add_argument("--hours", type=float, default=24, help="how far back to look (default 24)")
+    s.add_argument("--thread", help="only this thread")
+    s.add_argument("--agent", choices=cfg.AGENTS, help="only this agent")
+    s.add_argument("--limit", type=int, default=20, help="most threads to list (default 20)")
+    s.add_argument("--json", action="store_true")
+
     s = sub.add_parser("threads", help="list threads")
     s.add_argument("--all", action="store_true", help="include resolved and cancelled threads")
     s.add_argument("--json", action="store_true")
@@ -437,6 +444,16 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
                 when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(b["until"]))
                 print(f"       out of usage{' for model ' + b['scope'] if b['scope'] else ''} until {when}"
                       f"{' (estimated)' if b['estimated'] else ''}: {b['reason'] or 'usage limit reached'}")
+        return 0
+    if args.cmd == "usage":
+        from . import usage
+        if not 0 < args.hours <= bus.USAGE_KEEP_S / 3600 or args.limit < 0:  # rejects nan too
+            raise ValueError(f"--hours must be more than 0 and at most {bus.USAGE_KEEP_S // 3600} (the history "
+                             "kept), and --limit not negative")
+        if args.thread:
+            bus.thread(args.thread)  # NO_SUCH_THREAD for a typo, not an empty report
+        rep = usage.report(bus, hours=args.hours, thread=args.thread, agent=args.agent, limit=args.limit)
+        print(json.dumps(rep, indent=2) if args.json else usage.format_report(rep))
         return 0
     if args.cmd == "threads":
         ts = bus.threads(include_closed=args.all)

@@ -26,7 +26,7 @@ from typing import Iterator
 from . import config as cfg
 from . import prompts, quota, unvotable
 from .db import HUMAN, SYSTEM, Bus, BusError
-from .peers import TurnResult, adapter, cli_version, extract_json, format_usage
+from .peers import Adapter, TurnResult, adapter, cli_version, extract_json, format_usage
 
 LEASE_S = 120
 
@@ -225,8 +225,10 @@ class Worker:
                    + f" · {version} · recipe {agent}/{ad.recipe}", agent)
         emit = lambda kind, text: self.event(kind, text, agent)  # noqa: E731
         tag = self.job["id"]
+        row = self.begin_usage(ad, model, resume_id)
         res = ad.run(prompt, cwd, timeout, emit, resume_id=resume_id, add_dirs=add_dirs,
                      cancelled=self.cancelled, peer_tag=tag)
+        self.account(ad, model, res, resumed=bool(resume_id), row=row)
         # A fresh session can't fix running out of usage; it would only spend more.  Check
         # again first: another worker may have found this agent out of usage meanwhile.
         # Nor can it fix a changed output format, or a turn the CLI stopped partway through
@@ -235,13 +237,15 @@ class Worker:
                 and not res.incomplete and not self.cancelled()):
             block = self.bus.quota_block(agent, quota.model_key(model))
             if block:
-                self.event("turn_end", f"failed: {res.error}" + format_usage(res.usage), agent)
+                self.event("turn_end", f"failed: {res.error}" + tokens(res), agent)
                 return self.blocked(agent, block)
             self.event("error", f"resume failed ({res.error}); starting a fresh session", agent)
             self.set_peer_session(agent, None)
+            row = self.begin_usage(ad, model, None)
             res = ad.run(fresh_prompt or prompt, cwd, timeout, emit, add_dirs=add_dirs,
                          cancelled=self.cancelled, peer_tag=tag)
-        self.event("turn_end", ("ok" if res.ok else f"failed: {res.error}") + format_usage(res.usage), agent)
+            self.account(ad, model, res, resumed=False, row=row)
+        self.event("turn_end", ("ok" if res.ok else f"failed: {res.error}") + tokens(res), agent)
         self.check()  # a worker that lost its lease records nothing
         if res.quota:
             self.record_quota(agent, model, res.quota)
@@ -273,6 +277,42 @@ class Worker:
         if res.external_id:
             self.set_peer_session(agent, res.external_id)
         return res
+
+    def begin_usage(self, ad: Adapter, model: str | None, resume_id: str | None) -> int | None:
+        """For a CLI that reports running totals, mark the turn as started (Bus.begin_usage)."""
+        if not ad.session_usage:
+            return None
+        try:
+            return self.bus.begin_usage(self.thread_id, ad.agent, job_id=self.job["id"], model=model,
+                                        session=resume_id)
+        except Exception as e:  # noqa: BLE001 - history must never fail a turn
+            self.event("error", f"could not record token usage: {e!r}", ad.agent)
+            return None
+
+    def account(self, ad: Adapter, model: str | None, res: TurnResult, resumed: bool, row: int | None) -> None:
+        """Record the tokens one CLI run used (issue #26), and leave ``res.usage`` as this
+        turn's own share (see Bus.record_usage).  Recorded even by a worker that has lost
+        its lease: the tokens were spent either way, and the history is not thread state."""
+        total = res.usage if ad.session_usage else None
+        if total is not None:
+            res.session_usage, res.usage = total, None
+        try:
+            if res.usage is None and total is None:
+                # Nothing reported (e.g. a cancelled turn): the started row stays as a gap.
+                if row is not None:
+                    self.bus.close_usage(row)
+                return
+            res.usage = self.bus.record_usage(
+                self.thread_id, ad.agent, res.usage, ok=res.ok, job_id=self.job["id"], model=model,
+                session=res.external_id, session_total=total, resumed=resumed, row=row,
+                partial=res.partial_usage)
+        except Exception as e:  # noqa: BLE001 - history must never fail a turn
+            self.event("error", f"could not record token usage: {e!r}", ad.agent)
+            if row is not None:
+                try:  # the CLI has exited: at least mark the turn as ended, as a gap
+                    self.bus.close_usage(row)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def blocked(self, agent: str, block: dict) -> TurnResult:
         """The result of a turn skipped because ``block`` (already read) stops ``agent``."""
@@ -882,6 +922,12 @@ class Worker:
                     or (tool == "git" and out.returncode != 1):
                 return True
         return False
+
+
+def tokens(res: TurnResult) -> str:
+    """The turn_end note on tokens: this turn's, else the session's running total."""
+    label = "tokens (partial: the turn stopped before its final report)" if res.partial_usage else "tokens"
+    return format_usage(res.usage, label) or format_usage(res.session_usage, "session tokens so far")
 
 
 def normalize_verdict(v: object) -> dict | None:

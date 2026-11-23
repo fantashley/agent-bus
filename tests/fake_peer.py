@@ -94,7 +94,20 @@ for flag in ("--session-id", "--resume", "--conversation"):
         sid = argv[argv.index(flag) + 1]
 if agent == "codex" and "resume" in argv:
     sid = argv[-2]
+resumed = sid is not None
 sid = sid or str(uuid.uuid4())
+
+
+def session_turns():
+    """This turn's number in its session (from the log), for CLIs that report running totals."""
+    if not resumed or not log:
+        return 1
+    n = 0
+    for line in open(log):
+        c = json.loads(line)
+        if c["agent"] == agent and sid in c["argv"]:
+            n += 1
+    return 1 + n  # the first turn ran without the id in its argv
 
 def out(obj):
     print(json.dumps(obj), flush=True)
@@ -182,12 +195,15 @@ elif agent == "codex":
     out({"type": "thread.started", "thread_id": sid})
     out({"type": "item.started", "item": {"type": "command_execution", "command": "ls"}})
     out({"type": "item.completed", "item": {"type": "agent_message", "text": reply}})
-    out({"type": "turn.completed", "usage": {"input_tokens": 20, "cached_input_tokens": 200, "output_tokens": 6,
-                                             "reasoning_output_tokens": 4}})
+    n = session_turns()  # like codex 0.171.0: the session's running total
+    out({"type": "turn.completed", "usage": {"input_tokens": 20 * n, "cached_input_tokens": 200 * n,
+                                             "output_tokens": 6 * n, "reasoning_output_tokens": 4 * n}})
 else:
     out({"event": "init", "conversation_id": sid})
     out({"event": "step_update", "step_update": {"conversation_id": sid, "state": "ACTIVE", "step_type": "agent_response", "text_delta": reply}})
-    out({"event": "step_update", "step_update": {"conversation_id": sid, "state": "DONE", "step_type": "agent_response"}})
+    step = {"input_tokens": 30, "output_tokens": 7, "thinking_tokens": 5, "cache_read_tokens": 0}
+    out({"event": "step_update", "step_update": {"conversation_id": sid, "state": "DONE", "step_type": "agent_response",
+                                                 "usage": step}})
+    n = session_turns()  # like agy 1.5.13: result.usage is the conversation's running total
     out({"event": "result", "result": {"conversation_id": sid, "status": "SUCCESS", "response": reply,
-                                       "usage": {"input_tokens": 30, "output_tokens": 7, "thinking_tokens": 5,
-                                                 "cache_read_tokens": 0}}})
+                                       "num_turns": n, "usage": {k: v * n for k, v in step.items()}}})
