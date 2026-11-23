@@ -145,7 +145,15 @@ class Adapter:
         material = {"harness": self.agent, "recipe": self.recipe, "executable": ident[1],
                     "args": self.extra, "web_search": self.web_search,
                     "allow_mcp": bool(launch.get("allow_mcp"))}
+        # Another Codex home is another config.toml (other MCP servers, profiles): only when
+        # set, so a participant without one keeps the evidence it had (#66).
+        if launch.get("codex_home"):
+            material["codex_home"] = self.config.codex_home(self.participant)
         return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+
+    def child_env(self) -> dict[str, str]:
+        """Environment variables the participant's launch settings give its CLI."""
+        return {}
 
     def setting_args(self) -> list[str]:
         """This CLI's flags for the configured model and effort (none: its defaults)."""
@@ -215,7 +223,7 @@ class Adapter:
             pass  # only the usage-limit reading depends on it
         # Any agent-bus MCP server the peer CLI launches sees this and refuses every tool,
         # so a headless peer can't post, start jobs, or read blind proposals.
-        env = {**os.environ, "AGENT_BUS_PEER": peer_tag}
+        env = {**os.environ, **self.child_env(), "AGENT_BUS_PEER": peer_tag}
         try:
             proc = subprocess.Popen(
                 inv.argv, cwd=cwd, stdin=subprocess.PIPE if inv.stdin is not None else subprocess.DEVNULL,
@@ -868,7 +876,9 @@ class CodexAdapter(Adapter):
         # Listed with the same config the turn runs with: every override and profile spelling.
         argv = [self.command, *_codex_config_args(self.extra_args()), "mcp", "list", "--json"]
         try:
-            out = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30)
+            # With the turn's CODEX_HOME too: another home has its own config.toml (#66).
+            out = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30,
+                                 env={**os.environ, **self.child_env()})
             if out.returncode != 0:
                 raise PeerSetupError(f"`codex mcp list` failed: {out.stderr.strip()[:300]}")
             data = json.loads(out.stdout)
@@ -899,6 +909,13 @@ class CodexAdapter(Adapter):
         modes = [_codex_value(o) for o in _codex_overrides(self.extra) if _config_key(o) == "web_search"]
         if modes and modes[-1] == "disabled":
             self.web_search = False
+        # The participant's own CODEX_HOME (#66): the turn runs with it, and its usage-limit
+        # readings come from that home's rollout files.  None: the worker's own.
+        home = config.codex_home(self.participant)
+        self.home = Path(home) if home else None
+
+    def child_env(self) -> dict[str, str]:
+        return {"CODEX_HOME": str(self.home)} if self.home else {}
 
     def setting_args(self) -> list[str]:
         args = []
@@ -997,7 +1014,7 @@ class CodexAdapter(Adapter):
         # it: each token_count event carries rate_limits.primary/secondary = {used_percent,
         # window_minutes, resets_at} (codex 0.171.0, live probe 2026-11-23;
         # tests/data/rollouts/codex-token-count.jsonl, scrubbed).
-        path = codex_rollout(st.external_id) if st.external_id else None
+        path = codex_rollout(st.external_id, self.home) if st.external_id else None
         if not path:
             return None
         # Only what this turn appended: a resumed session's file already holds earlier
@@ -1022,7 +1039,7 @@ class CodexAdapter(Adapter):
         return [{**w, "observed_at": seen} for w in out if w] or None
 
     def before_run(self, st, resume_id):
-        path = codex_rollout(resume_id) if resume_id else None
+        path = codex_rollout(resume_id, self.home) if resume_id else None
         if path:
             st.rollout = (path, path.stat().st_size)
 
