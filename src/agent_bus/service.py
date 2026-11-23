@@ -32,7 +32,7 @@ def present(m: dict) -> dict:
            "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(m["created_at"]))}
     if m["recipient"]:
         out["to"] = m["recipient"]
-    data = {k: v for k, v in m["data"].items() if k != "discussion"}
+    data = {k: v for k, v in m["data"].items() if k not in ("discussion", "session")}
     if data:
         out["data"] = data
     return out

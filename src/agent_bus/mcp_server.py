@@ -208,7 +208,7 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
 
         Pin full commit ids (`git rev-parse HEAD`, or `jj log --no-graph -r @ -T commit_id` in a jj
         repo); change_id is an optional label (jj change id, branch name, "PR #12"). For a follow-up
-        pass, pass the head last reviewed on the thread as prev_head_commit_id: the request
+        pass, pass the thread's current head as prev_head_commit_id: the request
         continues the same review thread and resumes the reviewer's own conversation, so it keeps
         its earlier findings and sees only the interdiff plus any replies you posted on the thread.
         model/effort optionally set the reviewer's model and reasoning effort for this review

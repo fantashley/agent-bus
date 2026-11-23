@@ -55,11 +55,13 @@ jj is optional: plain git repos never run it. The reviewer returns a structured 
 lands as a `review_verdict` in the requester's inbox. `change_id` is an optional label: a jj change
 id, a branch name or `PR #12`.
 
-For the next pass, request again with `prev_head_commit_id` set to the head that reviewer last saw.
+For the next pass, request again with `prev_head_commit_id` set to the thread's current head.
 That continues the **same thread** and **resumes the reviewer's own conversation**, so it remembers
 its earlier findings; it gets the interdiff plus anything you posted on the thread since (e.g. a
-`send` explaining how each finding was addressed). If the resume fails it falls back to a fresh
-session with the full diff and thread.
+`send` explaining how each finding was addressed). The interdiff starts at the head of that
+reviewer's own last verdict, which may be older than `prev_head_commit_id` if a pass never reached
+it. If that verdict was on another base, or came from a session that has since been replaced, or
+the resume fails, it gets a fresh session with the full diff, its earlier verdicts and the thread.
 
 ### Several required reviewers
 
