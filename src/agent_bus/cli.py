@@ -97,8 +97,10 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
     print(_color(SYSTEM, f"goal: {t['goal']}", color))
     if args.peer:
         print(_color(SYSTEM, f"viewing {args.peer} (output only; intervene with `agent-bus reply`)", color))
+    from . import worker
     try:
         while True:
+            worker.relaunch_stalled(bus)  # its job's worker may never have started (#64)
             for m in bus.history(args.thread, after_id=last_msg)["messages"]:
                 last_msg = m["id"]
                 if args.peer and m["sender"] not in (args.peer, HUMAN, SYSTEM):
@@ -107,7 +109,8 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
             if args.peer or args.events:
                 for e in bus.events(args.thread, after_id=last_ev, agent=args.peer):
                     last_ev = e["id"]
-                    if e["kind"] in ("text", "tool", "thinking", "turn_start", "turn_end", "error", "format"):
+                    if e["kind"] in ("text", "tool", "thinking", "turn_start", "turn_end", "error", "format",
+                                       "relaunch"):
                         who = e["agent"] or "worker"
                         print(_color(SYSTEM, f"  · {who} {e['kind']}: {e['text']}", color), flush=True)
             st = peer_status(bus, args.thread, args.peer) if args.peer else thread_status(bus, args.thread)
@@ -175,7 +178,11 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
         return bool(js) and js[-1]["status"] == "failed"
 
     try:
+        from . import autoresume
         while True:
+            # The lazy sweep runs here, after the snapshots above, not before this command:
+            # a job it fails (out of launch attempts, #64) is reported like any other.
+            autoresume.sweep_quietly(bus)
             bus.reap()
             drain()
             for t in bus.threads(include_closed=True, limit=200):
@@ -222,8 +229,10 @@ def cmd_ask(bus: Bus, args: argparse.Namespace) -> int:
         print(f"rex viewers: {json.dumps(res['watch'])}")
     print(f"follow with: agent-bus tail {tid}")
     if args.wait:
+        from . import worker
         while bus.thread(tid)["status"] == "open" and bus.active_job(tid):
             time.sleep(2)
+            worker.relaunch_stalled(bus)  # its worker may never have started (#64)
         _print_history(bus, tid, color=rex.stdout_is_tty())
     return 0
 
@@ -267,6 +276,10 @@ def parse_mcp_args(args: list[str]) -> argparse.Namespace | None:
         return p.parse_args(args)
     except _ArgError:
         return None
+
+
+# Commands that act on one thread: the lazy sweep runs after them for that thread.
+ACTING = ("cancel", "resume", "reply")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -430,6 +443,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"agent-bus: {e}", file=sys.stderr)
         return 2
     finally:
+        if args.cmd in ACTING:
+            # After a command acting on a thread (which _dispatch's sweep left out), sweep
+            # that thread too: resuming one whose job never started relaunches it (#64).
+            from . import autoresume
+            autoresume.sweep_quietly(bus)
         bus.close()
 
 
@@ -450,8 +468,9 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         return 0
     # A thread whose usage limit has reset resumes now, except one this command changes
     # (cancel, resume, reply): the explicit action goes first.
-    acting = args.cmd in ("cancel", "resume", "reply")
-    autoresume.sweep_quietly(bus, exclude=frozenset({args.thread} if acting else ()))
+    acting = args.cmd in ACTING
+    if args.cmd != "stream":  # which sweeps in its own loop
+        autoresume.sweep_quietly(bus, exclude=frozenset({args.thread} if acting else ()))
     svc = Service(bus, HUMAN)
     color = rex.stdout_is_tty()
     if args.cmd == "ask":

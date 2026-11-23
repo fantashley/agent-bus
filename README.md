@@ -16,7 +16,9 @@ directly, instead of a human relaying messages between windows. Designed in
 - **Safety in the server:** peer text (including an agent's discussion question) is returned as
   `trust: "peer_data"` inside visible fences; only the CLI posts `trust: "human"`. Round caps,
   message caps (`THREAD_LIMIT_REACHED` until the human runs `resume`), deadlines and job
-  de-duplication. Jobs whose worker died are reaped, so a crash never wedges a thread.
+  de-duplication. Jobs whose worker died are reaped, so a crash never wedges a thread; a job
+  whose worker never started (its launcher crashed first) is relaunched by the next MCP call or
+  CLI command, up to three launches in all, before it is failed.
 - **Headless peers can't use tools that act.** Claude runs with `--strict-mcp-config` and only
   Read/Grep/Glob/web tools; Codex has every live MCP server disabled (and the turn fails if they
   can't be listed) and its `apps` feature switched off; Antigravity gets session-only deny rules

@@ -44,6 +44,42 @@ def spawn(job_id: str) -> int:
     return proc.pid
 
 
+def launch(bus: Bus, job_id: str, attempt: int = 1) -> bool:
+    """Start the worker for launch attempt ``attempt`` of a queued job, once the job (or the
+    reservation of that attempt) has committed.  A job comes with its first attempt; a sweep
+    reserves each later one (relaunch_stalled).  If the worker can't be started, only this
+    attempt is written off (Bus.launch_failed).  Returns whether the worker started."""
+    try:
+        spawn(job_id)
+    except OSError as e:
+        bus.launch_failed(job_id, attempt, f"could not start its worker: {e}")
+        return False
+    return True
+
+
+def relaunch_stalled(bus: Bus, exclude: frozenset = frozenset()) -> list[str]:
+    """Relaunch queued jobs whose worker never claimed them: their launcher died before
+    starting it, or it exited first (#64).  Each gets Bus.MAX_LAUNCHES attempts in all;
+    one whose last attempt went unclaimed is failed here.  Runs with the automatic-resume
+    sweeps (on every MCP call and CLI command, and in the waiter) and in the CLI's polling
+    loops; skips jobs on the threads in ``exclude``.  Returns the ids of the jobs relaunched."""
+    # Only those out of attempts: a dead worker that had claimed its job is left to the
+    # caller's own reaping (`agent-bus stream` reports the failures it reaps itself).
+    bus.reap_unstarted(exclude)
+    out = []
+    for j in bus.stalled_jobs():
+        if j["thread_id"] in exclude:
+            continue
+        attempt = bus.reserve_relaunch(j["id"])
+        if attempt is None:
+            continue  # claimed, or relaunched by another sweep, meanwhile
+        bus.add_event(j["thread_id"], "relaunch", f"job {j['id']} never started; relaunching it "
+                      f"(attempt {attempt} of {bus.MAX_LAUNCHES})", job_id=j["id"])
+        if launch(bus, j["id"], attempt):
+            out.append(j["id"])
+    return out
+
+
 class Cancelled(Exception):
     pass
 
