@@ -51,6 +51,15 @@ class LeaseLost(Exception):
     pass
 
 
+class MissingRevision(Exception):
+    """A pinned review commit id is well formed but the repository doesn't have it."""
+
+    def __init__(self, repo: str, missing: list[tuple[str, str]]):
+        self.repo = repo
+        self.missing = missing  # (label, commit id), e.g. ("head", "0123...")
+        super().__init__(f"{repo} has no commit " + ", ".join(f"{sha} ({label})" for label, sha in missing))
+
+
 class Worker:
     def __init__(self, bus: Bus, job_id: str, config: cfg.Config | None = None):
         self.bus = bus
@@ -84,6 +93,8 @@ class Worker:
         except Cancelled:
             self.bus.finish_job(self.job["id"], "cancelled", self.owner)
             return 0
+        except MissingRevision:
+            return 1  # report_missing already failed the job and told the requester
         except Exception as e:  # record, then re-raise for the log
             if self.bus.finish_job(self.job["id"], "failed", self.owner, repr(e)):
                 self.bus.add_event(self.thread_id, "error", f"worker failed: {e!r}", job_id=self.job["id"])
@@ -579,13 +590,17 @@ class Worker:
         notes = lambda msgs: [m for m in msgs if m["sender"] not in (reviewer, SYSTEM)  # noqa: E731
                               and m["kind"] in ("message", "status")]
         earlier = [m for m in everything if m["sender"] == reviewer and m["kind"] == "review_verdict"]
-        full_diff, full_heading = self.review_diff(refs, interdiff=False)
+        try:
+            full_diff, full_heading = self.review_diff(refs, interdiff=False)
+            inter, inter_heading = self.review_diff(refs, interdiff=True) if resume else ("", "")
+        except MissingRevision as e:
+            self.report_missing(t, e, followup)
+            raise
         # The self-contained prompt (first pass, retry, or a follow-up whose session can't be
         # resumed) always has the full base..head diff, the reviewer's earlier verdicts and
         # every note on the thread, so a fresh session never reviews a partial view.
         fresh = self.review_prompt(t, refs, full_diff, full_heading, notes(everything), earlier)
         if resume:
-            inter, inter_heading = self.review_diff(refs, interdiff=True)
             prompt = prompts.REVIEW_FOLLOWUP.format(
                 head=refs["head_commit_id"], prev=refs["prev_head_commit_id"],
                 replies="\n\n".join(prompts.render_message(m) for m in notes([m for m in everything
@@ -630,6 +645,29 @@ class Worker:
                         "head_commit_id": refs["head_commit_id"], "request_id": t["id"]})
         self.finish_thread("resolved")
 
+    def report_missing(self, t: dict, e: MissingRevision, followup: bool) -> None:
+        """Tell the requester which pinned commit is missing, park the thread for them and fail
+        the job, all in one transaction: once the notice is visible, the retry it describes
+        (a new request, or `agent-bus resume`) can't trip over this job still running.
+        Failing the job (not "done") is what lets the same request be made again."""
+        what = "; ".join(f"the {label} commit {sha}" for label, sha in e.missing)
+        retry = (f"then ask the human user to run `agent-bus resume {t['id']}` to retry this pass. "
+                 "If a commit id is wrong, start a fresh review with the right ids and without "
+                 "prev_head_commit_id (this thread stays pinned to the ids above)"
+                 if followup else
+                 f"then request this review again, or run `agent-bus resume {t['id']}`. If a commit "
+                 "id is wrong, request a new review with the right one")
+        with self.fenced():
+            if self.bus.transition(self.thread_id, "needs_human"):
+                self.bus.post(self.thread_id, SYSTEM,
+                              f"Review not started: {e.repo} does not contain {what}. "
+                              f"{t['refs']['reviewer']} was not run and no verdict was posted. Make the "
+                              "commit available in that repository (push or fetch it; in a jj repo you may "
+                              f"also need `jj git import`), {retry}.",
+                              kind="status", recipient=t["initiator"])
+            self.bus.finish_job(self.job["id"], "failed", self.owner, str(e))
+            self.event("error", f"review not started: {e}")
+
     def review_prompt(self, t: dict, refs: dict, diff: str, heading: str, replies: list[dict],
                       earlier: list[dict] | None = None) -> str:
         focus = refs.get("focus")
@@ -656,7 +694,10 @@ class Worker:
             frm, heading = refs["base_commit_id"], "Diff from base to head:"
         kind = cfg.vcs(repo)
         jj_argv = ["jj", "diff", "--ignore-working-copy", "--git", "--from", frm, "--to", refs["head_commit_id"]]
-        git_argv = ["git", "diff", "--no-ext-diff", "--no-textconv", frm, refs["head_commit_id"]]
+        # ^{commit}: a tree or blob id is not a reviewable commit, even though git diff takes one.
+        # The trailing "--" keeps an unresolvable id from being read as a path.
+        git_argv = ["git", "diff", "--no-ext-diff", "--no-textconv", f"{frm}^{{commit}}",
+                    f"{refs['head_commit_id']}^{{commit}}", "--"]
         if kind == "jj":
             # In a colocated repo, --ignore-working-copy skips importing plain git commits,
             # so fall back to git diff if jj cannot resolve the pinned commit ids.
@@ -680,6 +721,12 @@ class Worker:
                 break
             last_err = f"{tool}: {out.stderr[:500]}"
         if out is None or out.returncode != 0:
+            if out is not None:
+                missing = [(label, sha) for label, sha in
+                           (("previous head" if interdiff else "base", frm), ("head", refs["head_commit_id"]))
+                           if not self.has_commit(repo, [tool for tool, _ in attempts], sha)]
+                if missing:
+                    raise MissingRevision(repo, missing)
             raise RuntimeError(f"could not compute diff with {last_err}")
         diff = out.stdout
         limit = self.config.max_diff_bytes
@@ -687,6 +734,25 @@ class Worker:
             diff = diff.encode()[:limit].decode(errors="ignore") + \
                 "\n[... diff truncated; read the changed files for the rest ...]"
         return diff or "(empty diff)", heading
+
+    @staticmethod
+    def has_commit(repo: str, tools: list[str], sha: str) -> bool:
+        """Whether any of ``tools`` resolves ``sha`` to a commit in ``repo``.  Only a definite
+        "no such commit" counts as missing (jj's "doesn't exist", or `git rev-parse --verify
+        --quiet` exiting 1 rather than 128 for a fatal error such as bad config); any other
+        failure is treated as found, so the caller reports the original diff error instead
+        of a wrong diagnosis."""
+        for tool in tools:
+            argv = (["jj", "log", "--ignore-working-copy", "--no-graph", "-r", sha, "-T", "commit_id"]
+                    if tool == "jj" else ["git", "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])
+            try:
+                out = subprocess.run(argv, cwd=repo, capture_output=True, text=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired):
+                return True
+            if out.returncode == 0 or (tool == "jj" and "doesn't exist" not in out.stderr) \
+                    or (tool == "git" and out.returncode != 1):
+                return True
+        return False
 
 
 def normalize_verdict(v: object) -> dict | None:

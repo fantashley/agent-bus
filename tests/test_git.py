@@ -159,3 +159,135 @@ def test_change_labels(env, no_spawn, label, ok):
     else:
         with pytest.raises(ValueError, match="label"):
             call()
+
+
+# #42: a well-formed commit id the repository doesn't have is reported on the thread.
+
+MISSING = "0123456789abcdef0123456789abcdef01234567"
+
+
+def missing_report(env, tid):
+    bus = env["bus"]
+    t = bus.thread(tid)
+    msgs = bus.history(tid)["messages"]
+    assert t["status"] == "needs_human"
+    head = t["refs"]["head_commit_id"]
+    assert not [m for m in msgs if m["kind"] == "review_verdict" and m["data"]["head_commit_id"] == head]
+    assert bus.jobs(tid)[-1]["status"] == "failed"
+    assert not env["log"].exists() or len(env["log"].read_text().splitlines()) == env.get("calls", 0)
+    report = [m for m in msgs if m["sender"] == "system" and "Review not started" in m["body"]]
+    assert len(report) == 1 and report[0]["recipient"] == "claude"
+    assert f"agent-bus resume {tid}" in report[0]["body"]
+    return report[0]["body"]
+
+
+@pytest.mark.parametrize("which", ["base", "head"])
+def test_missing_commit_in_plain_git_needs_human(env, no_spawn, no_jj, which):
+    sh = git_repo(env["repo"])
+    real = sh("git", "rev-parse", "HEAD")
+    base, head = (MISSING, real) if which == "base" else (real, MISSING)
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), base, head)["thread"]["id"]
+    assert Worker(bus, bus.jobs(tid)[-1]["id"]).run() == 1
+    body = missing_report(env, tid)
+    assert f"the {which} commit {MISSING}" in body and real not in body
+    assert "request this review again" in body
+    # The failed job doesn't block requesting the same review again.
+    again = claude.request_review("codex", str(env["repo"]), base, head)
+    assert not again["job"].get("deduplicated")
+
+
+def test_missing_commit_in_jj_repo_needs_human(env, no_spawn):
+    if shutil.which("jj") is None:
+        pytest.skip("jj not installed")
+    repo = env["repo"]
+    sh = git_repo(repo)
+    sh("jj", "git", "init", "--colocate")
+    base = sh("git", "rev-parse", "HEAD")
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(repo), base, MISSING)["thread"]["id"]
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    assert f"the head commit {MISSING}" in missing_report(env, tid)
+
+
+def test_missing_previous_head_on_followup_needs_human(env, no_spawn, no_jj):
+    repo = env["repo"]
+    sh = git_repo(repo)
+    base = sh("git", "rev-parse", "HEAD")
+    (repo / "a.txt").write_text("helo\n")
+    sh("git", "commit", "-qam", "typo")
+    head1 = sh("git", "rev-parse", "HEAD")
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(repo), base, head1)["thread"]["id"]
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    assert bus.thread(tid)["status"] == "resolved"
+    env["calls"] = len(env["log"].read_text().splitlines())
+    # Rewrite the reviewed head away entirely, as after an amend plus gc.
+    (repo / "a.txt").write_text("hi\n")
+    sh("git", "commit", "-q", "--amend", "-am", "fixed")
+    head2 = sh("git", "rev-parse", "HEAD")
+    sh("git", "reflog", "expire", "--expire=now", "--all")
+    sh("git", "gc", "-q", "--prune=now")
+    claude.request_review("codex", str(repo), base, head2, prev_head_commit_id=head1)
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    body = missing_report(env, tid)
+    assert f"the previous head commit {head1}" in body and head2 not in body
+    # A follow-up's refs already moved to head2, so only `resume` retries this pass.
+    assert "ask the human user to run `agent-bus resume" in body and "request this review again" not in body
+    assert "without prev_head_commit_id" in body
+
+
+def test_missing_head_is_not_read_as_a_path(env, no_spawn, no_jj):
+    repo = env["repo"]
+    sh = git_repo(repo)
+    base = sh("git", "rev-parse", "HEAD")
+    (repo / f"{MISSING}^{{commit}}").write_text("decoy\n")
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(repo), base, MISSING)["thread"]["id"]
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    assert f"the head commit {MISSING}" in missing_report(env, tid)
+
+
+def test_tree_id_is_not_reviewed_as_a_commit(env, no_spawn, no_jj):
+    sh = git_repo(env["repo"])
+    base = sh("git", "rev-parse", "HEAD")
+    tree = sh("git", "rev-parse", "HEAD^{tree}")
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), base, tree)["thread"]["id"]
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    assert f"the head commit {tree}" in missing_report(env, tid)
+
+
+def test_git_probe_error_is_not_reported_as_missing(env, no_spawn, no_jj, monkeypatch):
+    sh = git_repo(env["repo"])
+    real = sh("git", "rev-parse", "HEAD")
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), real, MISSING)["thread"]["id"]
+    real_run = subprocess.run
+    # A fatal git error (exit 128, e.g. bad config) is not proof the commit is missing.
+    monkeypatch.setattr("agent_bus.worker.subprocess.run", lambda argv, **kw: real_run(
+        ["git", "-c", "=x", *argv[1:]] if argv[:2] == ["git", "rev-parse"] else argv, **kw))
+    with pytest.raises(RuntimeError, match="could not compute diff"):
+        Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    assert bus.thread(tid)["status"] == "open"
+
+
+def test_unrelated_diff_failure_is_not_reported_as_missing(env, no_spawn, no_jj, monkeypatch):
+    sh = git_repo(env["repo"])
+    real = sh("git", "rev-parse", "HEAD")
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), real, real)["thread"]["id"]
+    real_run = subprocess.run
+    monkeypatch.setattr("agent_bus.worker.subprocess.run", lambda argv, **kw: real_run(
+        ["git", "diff", "--no-such-flag"] if argv[:2] == ["git", "diff"] else argv, **kw))
+    with pytest.raises(RuntimeError, match="could not compute diff"):
+        Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    assert bus.thread(tid)["status"] == "open"
+    assert not [m for m in bus.history(tid)["messages"] if "Review not started" in m["body"]]
