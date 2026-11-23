@@ -166,8 +166,9 @@ def test_peer_out_of_usage_from_the_start_ends_needs_human_after_round_one(env, 
     assert t["status"] == "needs_human" and t["round"] == 1  # no rounds spent chasing it
     assert len(calls(env, "codex")) == 1
     assert t["participants"] == ["claude", "codex"]  # never silently dropped
-    body = bus.history(tid)["messages"][-1]["body"]
-    assert "No consensus is possible" in body
+    msgs = bus.history(tid)["messages"]
+    assert "No consensus is possible" in msgs[-2]["body"]
+    assert "will resume this automatically once codex has usage again" in msgs[-1]["body"]
     assert not bus.quota_block("codex")["estimated"]  # "try again in 2 hours 5 minutes"
 
 

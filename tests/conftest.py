@@ -42,8 +42,12 @@ def env(tmp_path, monkeypatch):
     conf.write_text(json.dumps({"peers": peers, "repos": [str(repo)], "initiator_grace_s": 3,
                                 "turn_timeout_s": 60}))
     monkeypatch.setenv("FAKE_LOG", str(tmp_path / "fake.log"))
+    # The detached auto-resume waiter: recorded, never started by tests.
+    from agent_bus import autoresume
+    waiters = []
+    monkeypatch.setattr(autoresume, "spawn_waiter", lambda: waiters.append(1))
     bus = Bus()
-    yield {"tmp": tmp_path, "bus": bus, "repo": repo, "log": tmp_path / "fake.log"}
+    yield {"waiters": waiters, "tmp": tmp_path, "bus": bus, "repo": repo, "log": tmp_path / "fake.log"}
     bus.close()
 
 

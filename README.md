@@ -239,7 +239,27 @@ turns on it and tells you when it should be back. This was agreed on agent-bus t
   `near_limit` with `--json`), in agents' `whoami` (`near_limit`), and on the agent's
   `turn_start` progress line. It's only a warning: the agent still takes part.
 
-Not yet: automatic retries after a reset, and lowering effort automatically.
+- **Resuming after the reset:** a review or discussion that went to `needs_human` only because
+  of usage limits resumes by itself once every block it waited on has expired, as
+  `agent-bus resume` would. A discussion stalled by format drift, or by drift and a limit
+  together, still waits for you. The thread says when it will resume, and says so again when it
+  does.
+  - **Who does it:** a detached `agent-bus auto-resume --wait` process, started when the thread
+    is parked, sleeps until the reset. Every agent-bus MCP call and CLI command also checks, which
+    covers a waiter lost to a reboot. One waiter runs at a time. Clearing a block early (say,
+    with `--clear-quota`) makes the threads waiting on it due at once. `agent-bus auto-resume`
+    lists what's planned.
+  - **Exactly once:** the planned resume is claimed in the same transaction that reopens the
+    thread, and its job's dedupe key is unique to that park. Concurrent checks can't resume it
+    twice, and a block that was extended meanwhile is waited out.
+  - **Limits:** `auto_resume_max` (default 3) automatic resumes per thread, counted again from
+    zero when you resume it yourself. Cancelling or resuming the thread drops the plan.
+  - **Turning it off:** set `auto_resume_after_quota` to `false`. It's on by default: the thread
+    stopped only because a provider said "not until T", work you or an agent asked for is
+    otherwise left waiting on a manual `resume`, and the retry runs only after the provider's own
+    reset, bounded by `auto_resume_max`.
+
+Not yet: lowering effort automatically.
 
 ## When a CLI changes
 
