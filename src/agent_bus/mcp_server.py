@@ -1,7 +1,10 @@
-"""``agent-bus mcp --agent <type>``: the stdio MCP server each client launches.
+"""``agent-bus mcp --agent <harness> [--participant <name>]``: the stdio MCP server each
+client launches.
 
-The agent type comes from the launch command, never from tool arguments, so
-an agent cannot post as another.  Each server process registers its own
+The identity comes from the launch command, never from tool arguments, so an agent
+cannot post as another.  ``--agent`` names the client's harness; the session speaks as
+that harness's default participant (the same name), or as ``--participant``, a
+configured participant on that harness (#43).  Each server process registers its own
 session, which is what read cursors and presence hang off.
 """
 
@@ -38,9 +41,27 @@ Codex and Antigravity are available; `whoami` lists them) and to the human user'
 ACTING_TOOLS = frozenset({"send", "reply", "request_review", "start_discussion", "advance_discussion"})
 
 
-def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPServer:
-    if agent not in cfg.AGENTS:
-        raise SystemExit(f"--agent must be one of {', '.join(cfg.AGENTS)}")
+def resolve(harness: str, participant: str | None, config: cfg.Config) -> str:
+    """The participant an interactive session of ``harness`` speaks as: ``participant``
+    when pinned (it must run on that harness), else the harness's default participant."""
+    if harness not in cfg.HARNESSES:
+        raise SystemExit(f"--agent must be one of {', '.join(cfg.HARNESSES)}")
+    if participant is None:
+        return harness
+    try:
+        found = config.participant(participant)
+    except ValueError as e:
+        raise SystemExit(f"--participant: {e}") from None
+    if found.harness != harness:
+        raise SystemExit(f"--participant {participant} runs on the {found.harness} harness, not {harness}")
+    return participant
+
+
+def build(agent: str, role: str | None = None, bus: Bus | None = None, participant: str | None = None,
+          config: cfg.Config | None = None) -> MCPServer:
+    config = config or cfg.Config.load()
+    harness = agent
+    agent = resolve(harness, participant, config)
     bus = bus or Bus()
     cwd = os.getcwd()
     # Set by the worker on headless peers: they contribute only through their reply,
@@ -50,12 +71,13 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
     if not peer_job:
         # Under Codex's shared app-server daemon, REX_* are the daemon's, not this window's (#6).
         rex_reason = (procinfo.CODEX_SHARED_DAEMON
-                      if agent == "codex" and procinfo.shared_codex_daemon(os.getpid()) is not None else None)
+                      if harness == "codex" and procinfo.shared_codex_daemon(os.getpid()) is not None else None)
         # The client that started this server, so its hooks can find this session (and only it).
         client = os.getppid()
         session_id = bus.register_session(agent, cwd=cwd, repo=cfg.repo_root(cwd), role=role, rex_reason=rex_reason,
-                                          client_pid=client, client_start=procinfo.start_time(client))
-    svc = service.Service(bus, agent=agent, session_id=session_id)
+                                          client_pid=client, client_start=procinfo.start_time(client),
+                                          harness=harness)
+    svc = service.Service(bus, agent=agent, session_id=session_id, config=config)
     mcp = MCPServer(name="agent-bus", instructions=INSTRUCTIONS)
 
     def call(fn, *args, **kwargs) -> dict[str, Any]:
@@ -82,21 +104,25 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
 
     @mcp.tool()
     def whoami() -> dict[str, Any]:
-        """Your agent-bus identity (agent type and session id), and which other agents are
-        available on this machine to message, discuss with or ask for a review."""
+        """Your agent-bus identity (participant name, harness and session id), and which other
+        agents are available on this machine to message, discuss with or ask for a review."""
         def me() -> dict[str, Any]:
-            avail = svc.config.availability()
-            return {"agent": agent, "session_id": session_id, "cwd": cwd,
-                    "available_agents": [a for a, v in avail.items() if v["available"] and a != agent],
+            conf = svc.config
+            avail = conf.availability()
+            others = [a for a, v in avail.items() if v["available"] and a != agent]
+            blocks = quota.by_participant(conf, bus.quota_blocks())
+            limits = quota.by_participant(conf, bus.usage_limits())
+            return {"agent": agent, "harness": harness, "session_id": session_id, "cwd": cwd,
+                    "available_agents": others,
                     "unavailable_agents": {a: v["reason"] for a, v in avail.items() if not v["available"]},
-                    "versions": {a: cli_version(bus, a, svc.config.peer_command(a))
-                                 for a, v in avail.items() if v["available"] and a != agent},
-                    "out_of_usage": [{"agent": b["agent"], **quota.summary(b)}
-                                     for b in bus.quota_blocks() if b["agent"] != agent],
+                    # Each other participant's harness, where it isn't the participant's own name.
+                    "harnesses": {a: conf.harness_of(a) for a in others if conf.harness_of(a) != a},
+                    "versions": {a: cli_version(bus, conf.harness_of(a), conf.peer_command(a)) for a in others},
+                    "out_of_usage": [{"agent": a, **quota.summary(b)}
+                                     for a in others for b in blocks.get(a, [])],
                     # Usage-limit windows at or above usage_warn_at, by the last reading.
-                    "near_limit": [{"agent": w["agent"], **quota.limits_summary(w, svc.config.usage_warn_at)}
-                                   for w in bus.usage_limits() if w["agent"] != agent
-                                   and w["used"] >= svc.config.usage_warn_at]}
+                    "near_limit": [{"agent": a, **quota.limits_summary(w, conf.usage_warn_at)}
+                                   for a in others for w in limits.get(a, []) if w["used"] >= conf.usage_warn_at]}
         return call(me)
 
     @mcp.tool()
@@ -157,7 +183,7 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
                          peer_settings: dict | None = None) -> dict[str, Any]:
         """Start a discussion with other agents that ends in agreement or documented dissent.
 
-        peers: agent types to include (default: every other agent). repo: an allow-listed repo the
+        peers: participant names to include (default: every other available agent). repo: an allow-listed repo the
         peers may read. Peers run headless and read-only. You take part too: post your initial
         view with send(kind="proposal") right away, then loop wait(thread). watch=True opens Rex
         viewer panes when you're running inside Rex. peer_settings optionally sets a peer's model
@@ -207,5 +233,5 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
     return mcp
 
 
-def main(agent: str, role: str | None = None) -> None:
-    build(agent, role).run("stdio")
+def main(agent: str, role: str | None = None, participant: str | None = None) -> None:
+    build(agent, role, participant=participant).run("stdio")

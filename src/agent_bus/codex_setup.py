@@ -38,8 +38,33 @@ def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
 
-def wanted(bin_path: str) -> dict:
-    return {"command": bin_path, "args": ["mcp", "--agent", "codex"], "env_vars": ENV_VARS}
+# A participant pin a user added to the entry (`--participant NAME`, #43): kept as it is.
+_PIN = re.compile(r"[a-z][a-z0-9-]{0,31}")  # config.PARTICIPANT_NAME
+
+
+# Names that can never be a participant on the codex harness.
+_NOT_CODEX = frozenset({"human", "system", "claude", "antigravity"})
+
+
+def pin(have: dict | None) -> list[str]:
+    """The existing entry's args when they register Codex pinned to a participant (#43),
+    as `agent-bus mcp` itself parses them (abbreviations, ``=`` forms, any order); []
+    otherwise."""
+    from .cli import parse_mcp_args  # cli imports this module lazily
+    args = list((have or {}).get("args") or [])
+    if not args or args[0] != "mcp" or not all(isinstance(a, str) for a in args):
+        return []
+    ns = parse_mcp_args(args[1:])
+    if ns is None or ns.agent != "codex" or ns.participant is None:
+        return []
+    if not _PIN.fullmatch(ns.participant) or ns.participant in _NOT_CODEX:
+        return []
+    return args
+
+
+def wanted(bin_path: str, have: dict | None = None) -> dict:
+    """The entry agent-bus wants, keeping a participant pin ``have`` already carries."""
+    return {"command": bin_path, "args": pin(have) or ["mcp", "--agent", "codex"], "env_vars": ENV_VARS}
 
 
 def current(codex: str, run: Runner = subprocess.run) -> dict | None:
@@ -131,8 +156,8 @@ def ensure(bin_path: str, codex: str | None = None, run: Runner = subprocess.run
     codex = codex or shutil.which("codex")
     if not codex:
         raise SetupError("codex is not on PATH")
-    want = wanted(bin_path)
     have = current(codex, run)
+    want = wanted(bin_path, have)
     if _matches(have, want):
         return "unchanged"
     keep = [v for v in (have or {}).get("env_vars", []) if v not in ENV_VARS]
@@ -143,7 +168,7 @@ def ensure(bin_path: str, codex: str | None = None, run: Runner = subprocess.run
         if have is None or have["command"] != want["command"] or have["args"] != want["args"]:
             if have is not None:
                 _check(run([codex, "mcp", "remove", NAME], capture_output=True, text=True, timeout=30), "remove")
-            _check(run([codex, "mcp", "add", NAME, "--", bin_path, "mcp", "--agent", "codex"],
+            _check(run([codex, "mcp", "add", NAME, "--", bin_path, *want["args"]],
                        capture_output=True, text=True, timeout=30), "add")
         _write_atomic(path, add_env_vars(path.read_text(encoding="utf-8"), names))
         if not _matches(current(codex, run), want):

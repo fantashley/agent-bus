@@ -36,7 +36,8 @@ PRESENCE_S = 90
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
-    agent_type TEXT NOT NULL,
+    agent_type TEXT NOT NULL,           -- the participant this session speaks as (#43)
+    harness TEXT,                       -- the CLI running it (NULL in older rows: agent_type)
     cwd TEXT, repo TEXT, role TEXT,
     rex_session TEXT, rex_block TEXT, rex_server TEXT,
     rex_reason TEXT,                    -- why no Rex location was recorded, e.g. codex_shared_daemon
@@ -215,6 +216,14 @@ class BusError(Exception):
         self.message = message
 
 
+def session_row(row: sqlite3.Row) -> dict:
+    """A sessions row, with ``harness`` filled in for rows from before #43 (when the
+    agent type was both the identity and the CLI)."""
+    out = dict(row)
+    out["harness"] = out.get("harness") or out["agent_type"]
+    return out
+
+
 def _now() -> float:
     return time.time()
 
@@ -289,7 +298,8 @@ class Bus:
         self.conn.executescript(SCHEMA)
         self._migrate()
 
-    SESSION_COLUMNS = (("rex_reason", "TEXT"), ("client_pid", "INTEGER"), ("client_start", "TEXT"))
+    SESSION_COLUMNS = (("rex_reason", "TEXT"), ("client_pid", "INTEGER"), ("client_start", "TEXT"),
+                       ("harness", "TEXT"))
 
     def _needs_migration(self) -> bool:
         scols = {r["name"] for r in self._all("PRAGMA table_info(sessions)")}
@@ -411,18 +421,21 @@ class Bus:
 
     def register_session(self, agent_type: str, cwd: str | None = None, repo: str | None = None,
                          role: str | None = None, env: dict | None = None, rex_reason: str | None = None,
-                         client_pid: int | None = None, client_start: str | None = None) -> str:
-        """Record a session.  With ``rex_reason`` set, the inherited REX_* variables are
-        known not to describe this session's window, so no Rex location is stored."""
+                         client_pid: int | None = None, client_start: str | None = None,
+                         harness: str | None = None) -> str:
+        """Record a session speaking as participant ``agent_type``, run by ``harness``
+        (default: the participant's own name, as for the built-in participants).  With
+        ``rex_reason`` set, the inherited REX_* variables are known not to describe this
+        session's window, so no Rex location is stored."""
         env = os.environ if env is None else env
         loc = {} if rex_reason else env
         sid = "s-" + secrets.token_hex(4)
         now = _now()
         self.conn.execute(
-            "INSERT INTO sessions (id, agent_type, cwd, repo, role, rex_session, rex_block, rex_server,"
+            "INSERT INTO sessions (id, agent_type, harness, cwd, repo, role, rex_session, rex_block, rex_server,"
             " rex_reason, client_pid, client_start, pid, started_at, last_seen)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (sid, agent_type, cwd, repo, role, loc.get("REX_SESSION"), loc.get("REX_BLOCK"),
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sid, agent_type, harness or agent_type, cwd, repo, role, loc.get("REX_SESSION"), loc.get("REX_BLOCK"),
              loc.get("REX_SERVER"), rex_reason, client_pid, client_start, os.getpid(), now, now),
         )
         return sid
@@ -432,7 +445,7 @@ class Bus:
 
     def session(self, sid: str) -> dict | None:
         row = self._one("SELECT * FROM sessions WHERE id=?", sid)
-        return dict(row) if row else None
+        return session_row(row) if row else None
 
     def agent_present(self, agent_type: str, session_id: str | None = None) -> bool:
         cutoff = _now() - PRESENCE_S
@@ -919,20 +932,24 @@ class Bus:
             self.conn.execute("DELETE FROM quota_blocks WHERE until<=?", (now,))
         return [dict(r) for r in self._all("SELECT * FROM quota_blocks ORDER BY agent, scope")]
 
-    def clear_quota(self, agent: str, model: str | None = None) -> int:
-        """Lift ``agent``'s account-wide block, and its block for ``model`` if given."""
+    def clear_quota(self, agent: str, model: str | None = None, waiting: list[str] | None = None) -> int:
+        """Lift ``agent``'s account-wide block, and its block for ``model`` if given.
+        ``agent`` is the block's subject (see quota.subject); ``waiting`` names the
+        participants whose parked threads it may free (default: ``agent`` itself)."""
         with self.tx():
             cur = self.conn.execute("DELETE FROM quota_blocks WHERE agent=? AND scope IN ('', ?)",
                                     (agent, model or ""))
             if cur.rowcount:
-                self.due_now(agent)
+                self.due_now(waiting if waiting is not None else [agent])
         return cur.rowcount if cur.rowcount is not None else 0
 
-    def due_now(self, agent: str) -> None:
-        """A block of ``agent`` was lifted early: threads waiting on it (auto_resumes) are
-        due now, and the next sweep checks whether anything else still stops them."""
-        self.conn.execute("UPDATE auto_resumes SET due=MIN(due, ?) WHERE agents LIKE ?",
-                          (_now(), f'%"{agent}"%'))
+    def due_now(self, agents: list[str] | str) -> None:
+        """A block on ``agents`` (participants) was lifted early: threads waiting on any of
+        them (auto_resumes) are due now, and the next sweep checks whether anything else
+        still stops them."""
+        for agent in [agents] if isinstance(agents, str) else agents:
+            self.conn.execute("UPDATE auto_resumes SET due=MIN(due, ?) WHERE agents LIKE ?",
+                              (_now(), f'%"{agent}"%'))
 
     # How long a usage-limit reading with no reset time is shown.
     LIMIT_FRESH_S = 6 * 3600

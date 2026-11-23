@@ -70,8 +70,8 @@ class Service:
         if not body or not body.strip():
             raise ValueError("body is empty")
         if to is not None:
-            if to not in cfg.AGENTS:
-                raise ValueError(f"`to` must be one of {', '.join(cfg.AGENTS)}")
+            if not self.config.is_participant(to):
+                raise ValueError(f"`to` must be one of {', '.join(self.config.participant_map())}")
             self.config.require_available(to, "recipient")
         if kind not in ("message", "proposal", "vote", "status"):
             raise ValueError("kind must be message, proposal, vote or status")
@@ -97,7 +97,12 @@ class Service:
 
     def reply(self, message_id: int, body: str) -> dict:
         orig = self.bus.message(message_id)
-        to = orig["sender"] if orig["sender"] in cfg.AGENTS and orig["sender"] != self.agent else None
+        sender = orig["sender"]
+        if sender not in (HUMAN, SYSTEM, self.agent) and not self.config.is_participant(sender):
+            # A participant since removed from the config: a reply to it must not become a
+            # message to the whole thread.
+            raise ValueError(f"can't reply to {sender}: it is no longer a configured participant")
+        to = sender if sender not in (HUMAN, SYSTEM, self.agent) else None
         return self.send(body, thread=orig["thread_id"], to=to)
 
     def inbox(self, thread: str | None = None, limit: int = 50) -> dict:
@@ -139,8 +144,7 @@ class Service:
     # ------------------------------------------------------------- coordination
 
     def _quota_block(self, agent: str, override: dict | None = None) -> dict | None:
-        model = quota.effective_model(self.config, agent, self.config.peer_settings(agent, override))
-        return self.bus.quota_block(agent, quota.model_key(model))
+        return quota.block_for(self.bus, self.config, agent, self.config.peer_settings(agent, override))
 
     def _quota_check(self, agent: str, role: str, override: dict | None = None) -> None:
         """Fail fast, before any job is queued, when ``agent`` is known to be out of usage."""
@@ -160,8 +164,7 @@ class Service:
         if defaulted:
             peers = [a for a in self.config.available_agents() if a != self.agent]
         for p in peers:
-            if p not in cfg.AGENTS:
-                raise ValueError(f"unknown peer {p!r}; expected one of {', '.join(cfg.AGENTS)}")
+            self.config.participant(p, "peer")  # unknown names fail here
             if p == self.agent:
                 raise ValueError("you are already a participant; list only the other agents as peers")
             self.config.require_available(p, "peer")
@@ -169,7 +172,7 @@ class Service:
         for agent, value in (peer_settings or {}).items():
             if agent not in peers:
                 raise ValueError(f"peer_settings names {agent!r}, which isn't a peer in this discussion")
-            settings[agent] = cfg.check_peer_settings(agent, value)
+            settings[agent] = self.config.check_settings(agent, value)
         # Out of usage: left out of a default roster (and reported), refused when named.
         skipped: dict[str, dict] = {}
         for p in list(peers):
@@ -281,8 +284,8 @@ class Service:
                 extra = set(peer_settings or {}) - {reviewer}
                 if extra:
                     raise ValueError(f"peer_settings names {sorted(extra)[0]!r}, which isn't a reviewer here")
-                if reviewer in cfg.AGENTS:  # unknown agents are refused just below
-                    given = cfg.check_peer_settings(reviewer, (peer_settings or {}).get(reviewer, {}))
+                if self.config.is_participant(reviewer):  # unknown agents are refused just below
+                    given = self.config.check_settings(reviewer, (peer_settings or {}).get(reviewer, {}))
                     model, effort = given.get("model"), given.get("effort")
             else:
                 return self._request_reviews(reviewers, repo, base_commit_id, head_commit_id, change_id,
@@ -291,9 +294,9 @@ class Service:
             raise ValueError("peer_settings goes with `reviewers`; use model/effort with a single `reviewer`")
         if thread is not None:
             raise ValueError("`thread` goes with `reviewers`; a single reviewer's review is found by its heads")
-        if reviewer not in cfg.AGENTS or reviewer == self.agent:
+        if not self.config.is_participant(reviewer) or reviewer == self.agent:
             raise ValueError("reviewer must be one of the other agents")
-        override = cfg.check_peer_settings(reviewer, {"model": model, "effort": effort})
+        override = self.config.check_settings(reviewer, {"model": model, "effort": effort})
         self.config.require_available(reviewer, "reviewer")
         self._check_review_ids(base_commit_id, head_commit_id, prev_head_commit_id, change_id)
         repo_path = self._allowed_repo(repo)
@@ -394,7 +397,7 @@ class Service:
         Every decision, write and the reply's snapshot happen in one IMMEDIATE transaction."""
         order: list[str] = []
         for r in reviewers:
-            if r not in cfg.AGENTS or r == self.agent:
+            if not self.config.is_participant(r) or r == self.agent:
                 raise ValueError(f"each reviewer must be one of the other agents (got {r!r})")
             if r in order:
                 raise ValueError(f"{r} is listed twice in reviewers")
@@ -403,7 +406,7 @@ class Service:
         for agent, value in (peer_settings or {}).items():
             if agent not in order:
                 raise ValueError(f"peer_settings names {agent!r}, which isn't one of the reviewers")
-            settings[agent] = cfg.check_peer_settings(agent, value)
+            settings[agent] = self.config.check_settings(agent, value)
         for r in order:
             self.config.require_available(r, "reviewer")
         self._check_review_ids(base_commit_id, head_commit_id, prev_head_commit_id, change_id)
@@ -655,8 +658,8 @@ class Service:
         peers = self._resume_peers(t)
         # The human is retrying now: forget cached out-of-usage blocks for these peers, so
         # a stale or wrong one doesn't stop the retry.  A real limit is found again.
-        cleared = [p for p in peers if self.bus.clear_quota(p, quota.model_key(quota.effective_model(
-            self.config, p, self.config.peer_settings(p, overrides.get(p)))))]
+        cleared = [p for p in peers if quota.clear_for(self.bus, self.config, p, quota.effective_model(
+            self.config, p, self.config.peer_settings(p, overrides.get(p))))]
         # And the format drift that kept peers out of this discussion's rounds: the human
         # resumes once the adapter handles the new format, and a real drift is found again.
         drifted = self.bus.clear_peer_drift(thread)

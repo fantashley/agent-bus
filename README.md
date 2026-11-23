@@ -488,7 +488,8 @@ Add [`docs/AGENTS-section.md`](docs/AGENTS-section.md) to the shared global agen
 
 You don't need all three agents. agent-bus works with whichever of them a machine has:
 - **Configured:** set `local.agentBus.agents = [ "claude" "codex" ];` (or `"agents"` in
-  `config.json`). The list is authoritative.
+  `config.json`). The list is authoritative, and can name [participants](#named-participants)
+  too.
 - **Detected:** with no list, an agent counts as available when its CLI is found: its
   `peers.<agent>.command`, or `claude`/`codex`/`agy` on PATH.
 - **Effect:** discussions and `ask` default to the available agents, and naming an unavailable
@@ -496,6 +497,52 @@ You don't need all three agents. agent-bus works with whichever of them a machin
   with listed clients.
 - **Checking:** `agent-bus agents` shows what's available and why. Agents see it through the
   `whoami` tool.
+
+### Named participants
+
+A participant is an identity on the bus: a sender name, a mailbox, a discussion peer, a
+reviewer. A harness is the CLI that runs it (Claude Code, Codex, Antigravity). By default
+each harness runs one participant with its own name, so `claude`, `codex` and `antigravity`
+work as they always have. You can add more participants on the same harness, each with its
+own model and launch settings:
+
+```nix
+local.agentBus.participants = {
+  codex-mini = { harness = "codex"; model = "gpt-5-mini"; effort = "low"; };
+  claude-work = { harness = "claude"; command = "claude-work"; account = "work"; };
+};
+```
+
+In `config.json` that's `"participants": {"codex-mini": {"harness": "codex", ...}}`. The
+rules:
+
+- **Names** are 1–32 lowercase letters, digits and hyphens, starting with a letter. `human`
+  and `system` are reserved, and a built-in name must keep its own harness.
+- **Settings** a participant leaves out come from its harness's `peers.<harness>` entry
+  (`command`, `args`, `model`, `effort`, `web_search`, and `allow_mcp` for antigravity).
+- **Everywhere a name is used**, a participant name works: `ask --with codex,codex-mini`,
+  `send(to=...)`, `start_discussion(peers=...)`, `request_review(reviewer=...)` and
+  `reviewers=[...]`, `peer_settings` and `agents`. Each participant keeps its own
+  conversation in a thread, and mail to it goes only to it.
+- **Availability:** a participant is available when its CLI is found, or when it's listed in
+  `agents` if that list is set.
+- **Interactive sessions** speak as their harness's own participant. To speak as another
+  one on that harness, start the MCP server with `agent-bus mcp --agent codex --participant
+  codex-mini`. The pair is checked: the participant must run on that harness.
+- **Usage limits** belong to what runs out: the harness and the account. Participants on one
+  harness share its out-of-usage blocks and usage readings unless one sets `account`, which
+  gets its own. Antigravity's per-model blocks are scoped by account and model.
+  `agent-bus agents --clear-quota codex-mini` clears the block for everyone sharing it.
+- **Isolation evidence** stays with the harness. Two participants share it only when the
+  executable, the adapter recipe and the launch settings that affect isolation (args, MCP
+  and web settings) all match. Model and effort don't count.
+- **Antigravity's MCP check** reads the default config directory. An antigravity participant
+  with its own `command` or `args` might load another one, so its turns are refused unless it
+  sets `allow_mcp = true`.
+
+Existing configs and databases need no changes. Stored threads, messages and blocks use
+the built-in names, which are still participants. Threads that name a participant you
+later remove keep their history, but can't be resumed until it's configured again.
 
 ## Releases
 

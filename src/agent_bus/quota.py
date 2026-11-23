@@ -3,6 +3,13 @@
 Shared by the service (admission) and the worker (turns).  Blocks live in the
 ``quota_blocks`` table; see Bus.set_quota_block / quota_block.
 
+Blocks and usage-limit readings belong to what actually runs out (#43): the harness and
+the account it signs in with, which is the ``subject`` stored in their ``agent`` column
+(the harness name alone for its default account, so rows from before named participants
+keep their meaning).  A model-specific limit adds the model as the block's scope.
+Participants sharing a harness and account share its blocks; one with its own
+``account`` doesn't.
+
 Thread notices and error messages use fixed wording only.  A block's ``reason``
 is chosen by agent-bus, never copied from a CLI's error output, because these
 texts are posted outside any peer_data fence; the raw error stays in the
@@ -31,12 +38,12 @@ MODEL_FLAGS = {"codex": ("-m", "--model")}
 
 
 def effective_model(config: cfg.Config, agent: str, settings: dict) -> str | None:
-    """The model a peer turn runs: the per-thread or config setting (which replaces any
-    model flag in the extra args), else the last model flag the configured extra args
-    pass, else None (the CLI's default)."""
+    """The model participant ``agent``'s turn runs: the per-thread or config setting (which
+    replaces any model flag in the extra args), else the last model flag the configured
+    extra args pass, else None (the CLI's default)."""
     if settings.get("model"):
         return settings["model"]
-    flags = MODEL_FLAGS.get(agent, ("--model",))
+    flags = MODEL_FLAGS.get(config.harness_of(agent), ("--model",))
     args, found = config.peer_args(agent), None
     for i, a in enumerate(args):
         if a == "--":
@@ -54,9 +61,34 @@ def model_key(model: str | None) -> str:
     return model or DEFAULT_MODEL
 
 
-def scope_for(agent: str, model: str | None) -> str:
+def subject(config: cfg.Config, agent: str) -> str:
+    """Whose usage participant ``agent`` spends: its harness, plus ``@account`` when the
+    participant names an account other than the harness's default."""
+    account = config.account(agent)
+    harness = config.harness_of(agent)
+    return f"{harness}@{account}" if account else harness
+
+
+def sharing(config: cfg.Config, subj: str) -> list[str]:
+    """The participants whose usage counts against ``subj``."""
+    return [p for p in config.participant_map() if subject(config, p) == subj]
+
+
+def scope_for(config: cfg.Config, agent: str, model: str | None) -> str:
     """Claude and Codex limits are account-wide; an Antigravity quota may be per model."""
-    return model_key(model) if agent == "antigravity" else ""
+    return model_key(model) if config.harness_of(agent) == "antigravity" else ""
+
+
+def block_for(bus, config: cfg.Config, agent: str, settings: dict) -> dict | None:
+    """The active block that stops participant ``agent`` running with ``settings``."""
+    return bus.quota_block(subject(config, agent), model_key(effective_model(config, agent, settings)))
+
+
+def clear_for(bus, config: cfg.Config, agent: str, model: str | None) -> int:
+    """Lift the block on ``agent``'s account (and on its model): newer evidence of usage,
+    or the human retrying.  Threads waiting on any participant sharing it are due now."""
+    subj = subject(config, agent)
+    return bus.clear_quota(subj, model_key(model), waiting=sharing(config, subj))
 
 
 def reason(agent: str, source: str) -> str:
@@ -83,9 +115,21 @@ def message(agent: str, role: str, block: dict) -> str:
             f"it with `agent-bus agents --clear-quota {agent}`.")
 
 
-def peer_model(config: cfg.Config, t: dict, agent: str) -> str | None:
+def thread_settings(config: cfg.Config, t: dict, agent: str) -> dict:
     overrides = (t["refs"] or {}).get("peer_settings") or {}
-    return effective_model(config, agent, config.peer_settings(agent, overrides.get(agent)))
+    return config.peer_settings(agent, overrides.get(agent))
+
+
+def peer_model(config: cfg.Config, t: dict, agent: str) -> str | None:
+    return effective_model(config, agent, thread_settings(config, t, agent))
+
+
+def thread_block(bus, config: cfg.Config, t: dict, agent: str) -> dict | None:
+    """The block that stops ``agent`` on thread ``t`` (with its model settings), if any.
+    A participant no longer configured has no known account: nothing to report."""
+    if not config.is_participant(agent):
+        return None
+    return block_for(bus, config, agent, thread_settings(config, t, agent))
 
 
 def blocked_peers(bus, config: cfg.Config, t: dict) -> dict[str, dict]:
@@ -94,10 +138,17 @@ def blocked_peers(bus, config: cfg.Config, t: dict) -> dict[str, dict]:
     for p in t["participants"]:
         if p == t["initiator"]:
             continue
-        b = bus.quota_block(p, model_key(peer_model(config, t, p)))
+        b = thread_block(bus, config, t, p)
         if b:
             out[p] = b
     return out
+
+
+def by_participant(config: cfg.Config, rows: list[dict]) -> dict[str, list[dict]]:
+    """Blocks or usage-limit readings (keyed by subject) listed under each participant
+    whose usage they describe."""
+    subjects = {p: subject(config, p) for p in config.participant_map()}
+    return {p: found for p, subj in subjects.items() if (found := [r for r in rows if r["agent"] == subj])}
 
 
 # ------------------------------------------------------------ near the limit
@@ -118,9 +169,9 @@ def describe_window(w: dict) -> str:
 
 
 def near_limit(bus, config: cfg.Config, agent: str) -> list[dict]:
-    """The usage-limit windows of ``agent`` at or above ``usage_warn_at``, from the last
-    readings its CLI gave (Claude and Codex; Antigravity reports none)."""
-    return [w for w in bus.usage_limits(agent) if w["used"] >= config.usage_warn_at]
+    """The usage-limit windows of ``agent``'s account at or above ``usage_warn_at``, from
+    the last readings its CLI gave (Claude and Codex; Antigravity reports none)."""
+    return [w for w in bus.usage_limits(subject(config, agent)) if w["used"] >= config.usage_warn_at]
 
 
 def limits_summary(w: dict, warn_at: float) -> dict:

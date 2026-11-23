@@ -99,7 +99,12 @@ let
   hasDotfilesClaude = options ? local && options.local ? claude
     && options.local.claude ? enabledPlugins
     && options.local.claude ? extraKnownMarketplaces;
-  listed = agent: cfg.agents == null || lib.elem agent cfg.agents;
+  # Whether a harness's client is in use: listed itself, or running a listed participant.
+  listed = harness: cfg.agents == null || lib.elem harness cfg.agents
+    || lib.any (name: lib.elem name cfg.agents)
+      (lib.attrNames (lib.filterAttrs (_: p: p.harness == harness) cfg.participants));
+  # Only the keys that are set, so the harness's defaults apply otherwise.
+  participants = lib.mapAttrs (_: v: lib.filterAttrs (_: x: x != null) v) cfg.participants;
   # Only the keys that are set, so the CLI's defaults apply otherwise.
   peerSettings = lib.filterAttrs (_: v: v != { })
     (lib.mapAttrs (_: v: lib.filterAttrs (_: x: x != null) v) cfg.peerSettings);
@@ -140,13 +145,78 @@ in
     };
 
     agents = lib.mkOption {
-      type = lib.types.nullOr (lib.types.listOf (lib.types.enum [ "claude" "codex" "antigravity" ]));
+      type = lib.types.nullOr (lib.types.listOf lib.types.str);
       default = null;
-      example = [ "claude" "codex" ];
+      example = [ "claude" "codex" "codex-mini" ];
       description = ''
-        The agents available on this machine. Discussions and reviews default to
-        these, naming any other agent fails up front, and registration is only done
-        for these clients. Null detects them at runtime (a CLI found on PATH counts).
+        The participants available on this machine: the built-in claude, codex and
+        antigravity, and any names from `participants`. Discussions and reviews default to
+        these, naming any other fails up front, and registration is only done for the
+        clients they run on. Null detects them at runtime (a CLI found on PATH counts).
+      '';
+    };
+
+    participants = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          harness = lib.mkOption {
+            type = lib.types.enum [ "claude" "codex" "antigravity" ];
+            description = "The CLI harness that runs this participant.";
+          };
+          model = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "Model for its headless turns (null: the harness's peerSettings, else the CLI's default).";
+          };
+          effort = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "Reasoning effort for its headless turns (null: as for model).";
+          };
+          web_search = lib.mkOption {
+            type = lib.types.nullOr lib.types.bool;
+            default = null;
+            description = "Whether its headless turns may search the web (null: as for its harness).";
+          };
+          allow_mcp = lib.mkOption {
+            type = lib.types.nullOr lib.types.bool;
+            default = null;
+            description = ''
+              Antigravity only: run its headless turns even though agent-bus can't check its MCP
+              servers (needed for a participant with its own `command`; null: as for its harness).
+            '';
+          };
+          account = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "work";
+            description = ''
+              A label for the account it signs in with, when that isn't its harness's default
+              (say, a `command` wrapper that uses another login). Usage limits are tracked per
+              harness and account, so one account running out doesn't stop the other.
+            '';
+          };
+          command = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "The CLI to run (null: the harness's `peers.<harness>.command`, else its default).";
+          };
+          args = lib.mkOption {
+            type = lib.types.nullOr (lib.types.listOf lib.types.str);
+            default = null;
+            description = "Extra CLI arguments (null: the harness's `peers.<harness>.args`).";
+          };
+        };
+      });
+      default = { };
+      example = lib.literalExpression ''{ codex-mini = { harness = "codex"; model = "gpt-5-mini"; effort = "low"; }; }'';
+      description = ''
+        Named participants: separately addressable agents (a sender name, a mailbox, a
+        discussion peer or reviewer) run by one of the harnesses with their own settings.
+        Settings left null come from the harness's `peerSettings` and `peers.<harness>`
+        config. The built-in claude, codex and antigravity are always participants too. An
+        interactive client speaks as one with `agent-bus mcp --agent <harness> --participant
+        <name>`.
       '';
     };
 
@@ -205,7 +275,7 @@ in
     claude.enable = lib.mkOption {
       type = lib.types.bool;
       default = listed "claude";
-      defaultText = lib.literalExpression ''agents == null || elem "claude" agents'';
+      defaultText = lib.literalExpression ''agents == null || elem "claude" agents || a listed participant runs on claude'';
       description = "Register agent-bus with Claude Code (as a local plugin).";
     };
     claude.hooks.enable = lib.mkOption {
@@ -223,7 +293,7 @@ in
     codex.enable = lib.mkOption {
       type = lib.types.bool;
       default = listed "codex";
-      defaultText = lib.literalExpression ''agents == null || elem "codex" agents'';
+      defaultText = lib.literalExpression ''agents == null || elem "codex" agents || a listed participant runs on codex'';
       description = "Register agent-bus with Codex (`agent-bus setup-codex`) when codex is on PATH.";
     };
     codex.hooks.enable = lib.mkOption {
@@ -241,8 +311,8 @@ in
     };
     antigravity.enable = lib.mkOption {
       type = lib.types.bool;
-      default = if cfg.agents == null then defaultAntigravity else lib.elem "antigravity" cfg.agents;
-      defaultText = lib.literalExpression ''if agents == null then (config.local.antigravity.enable or false) else elem "antigravity" agents'';
+      default = if cfg.agents == null then defaultAntigravity else listed "antigravity";
+      defaultText = lib.literalExpression ''if agents == null then (config.local.antigravity.enable or false) else (elem "antigravity" agents || a listed participant runs on antigravity)'';
       description = "Link the agent-bus plugin into ~/.gemini/config/plugins.";
     };
     antigravity.hooks.enable = lib.mkOption {
@@ -274,7 +344,8 @@ in
         json.generate "agent-bus-config.json" (lib.recursiveUpdate
           ({ inherit (cfg) repos; }
             // lib.optionalAttrs (cfg.agents != null) { inherit (cfg) agents; }
-            // lib.optionalAttrs (peerSettings != { }) { peers = peerSettings; })
+            // lib.optionalAttrs (peerSettings != { }) { peers = peerSettings; }
+            // lib.optionalAttrs (participants != { }) { inherit participants; })
           cfg.settings);
     }
 

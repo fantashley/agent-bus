@@ -28,7 +28,7 @@ from . import procinfo
 from .db import Bus
 
 # OSC 7501 app names each client reports (measured on Rex with all three).
-APPS = {a: info["app"] for a, info in cfg.AGENT_INFO.items()}
+APPS = {a: info["app"] for a, info in cfg.HARNESS_INFO.items()}
 
 PASS, FAIL, INFO, UNAVAILABLE = "pass", "fail", "info", "unavailable"
 
@@ -115,16 +115,19 @@ def check(bus: Bus, session_id: str | None = None, block: str | None = None, age
         session = bus.session(session_id)
         if not session:
             raise ValueError(f"no session {session_id}")
-        if agent and agent != session["agent_type"]:
+        if agent and agent not in (session["agent_type"], session["harness"]):
             raise ValueError(f"session {session_id} is a {session['agent_type']} session, not {agent}")
         agent = session["agent_type"]
+    # Rex sees the client (the harness), whichever participant the session speaks as.
+    harness = session["harness"] if session else agent
+    if session:
         block = block or session["rex_block"]
         server = session["rex_server"]
         alive = _alive(session["pid"])
         client_pids = _ancestors(session["pid"]) if alive else []
         # Rows registered before agent-bus recorded the reason are diagnosed live.
         daemon = session.get("rex_reason") == procinfo.CODEX_SHARED_DAEMON or (
-            agent == "codex" and alive and not session.get("rex_reason")
+            harness == "codex" and alive and not session.get("rex_reason")
             and procinfo.shared_codex_daemon(session["pid"], ancestors_of=lambda _pid: client_pids) is not None)
         if daemon:
             add("rex_env", FAIL, "no usable Rex location: this Codex session's MCP server was started by "
@@ -134,10 +137,10 @@ def check(bus: Bus, session_id: str | None = None, block: str | None = None, age
             add("rex_env", PASS, "REX_SESSION and REX_BLOCK were recorded when the session registered")
         else:
             hint = (" (Codex needs env_vars on its agent-bus entry: run `agent-bus setup-codex`, then restart codex)"
-                    if agent == "codex" else "")
+                    if harness == "codex" else "")
             add("rex_env", FAIL, "the session registered without REX_SESSION/REX_BLOCK: not started inside Rex, "
                 "or its client didn't pass them to the MCP server" + hint)
-    if agent not in APPS:
+    if harness not in APPS:
         raise ValueError("pass --agent (claude, codex or antigravity) with --block")
     report = {"session": session_id, "agent": agent, "block": block, "checks": checks}
 
@@ -163,7 +166,7 @@ def check(bus: Bus, session_id: str | None = None, block: str | None = None, age
         add("block", FAIL, f"can't inspect block: {e}")
         return _finish(report)
 
-    app = APPS[agent]
+    app = APPS[harness]
     try:
         rec = _pick_record(_rex(run, server, "block", "call", "program_status", "--block", block).get("records"), app)
         proc = _rex(run, server, "block", "call", "process", "--block", block)
@@ -212,12 +215,14 @@ def _finish(report: dict) -> dict:
 
 
 def latest_sessions(bus: Bus, agent: str | None = None) -> list[str]:
-    """The most recent live session of each agent type (or the most recent one, if none is live)."""
-    rows = bus._all("SELECT id, agent_type, pid FROM sessions ORDER BY last_seen DESC, rowid DESC")
+    """The most recent live session of each participant (or the most recent one, if none
+    is live); ``agent`` narrows them to that participant, or to those its harness runs."""
+    rows = bus._all("SELECT id, agent_type, COALESCE(harness, agent_type) AS harness, pid FROM sessions"
+                    " ORDER BY last_seen DESC, rowid DESC")
     live: dict[str, str] = {}
     latest: dict[str, str] = {}
     for r in rows:
-        if agent and r["agent_type"] != agent:
+        if agent and agent not in (r["agent_type"], r["harness"]):
             continue
         latest.setdefault(r["agent_type"], r["id"])
         if r["agent_type"] not in live and _alive(r["pid"]):

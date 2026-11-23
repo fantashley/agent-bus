@@ -16,10 +16,11 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# The agents agent-bus knows how to drive, as data: the CLI each one runs as, and
-# the app name it reports in Rex's OSC 7501 program status.  Which of them a
+# The CLI harnesses agent-bus knows how to drive, as data: the CLI each one runs as,
+# and the app name it reports in Rex's OSC 7501 program status.  Adapters, CLI discovery
+# and versioning, hooks and isolation recipes belong to a harness.  Which of them a
 # machine actually has is decided per machine (see Config.availability).
-AGENT_INFO = {
+HARNESS_INFO = {
     "claude": {"cli": "claude", "app": "claude-code", "name": "Claude Code",
                "efforts": ("low", "medium", "high", "xhigh", "max")},
     "codex": {"cli": "codex", "app": "codex", "name": "Codex",
@@ -27,34 +28,82 @@ AGENT_INFO = {
     "antigravity": {"cli": "agy", "app": "antigravity", "name": "Antigravity",
                     "efforts": ("low", "medium", "high", "xhigh", "max")},
 }
+HARNESSES = tuple(HARNESS_INFO)
+# Before named participants (#43) a harness was also the only identity; kept as aliases.
+AGENT_INFO = HARNESS_INFO
+# The default participants: one per harness, with the harness's own name.  Configured
+# participants (``participants`` in config.json) come on top; see Config.participants.
+AGENTS = HARNESSES
+
+# A participant's name is its identity: sender, mailbox, roster entry, reviewer.
+PARTICIPANT_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
+RESERVED_NAMES = frozenset({"human", "system"})
+# What a participant entry may set.  Launch settings (everything but ``harness``) default
+# to the harness's own ``peers.<harness>`` entry.
+PARTICIPANT_KEYS = frozenset({"harness", "model", "effort", "command", "args", "web_search", "allow_mcp", "account"})
+# The account a participant's usage counts against, when it isn't the harness's default
+# one (a wrapper command or args that sign in elsewhere).  Scopes usage blocks (#26, #43).
+_ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}")
 
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,99}")
 
 
-def check_peer_settings(agent: str, settings: dict | None) -> dict:
-    """Validate a {model, effort} mapping for ``agent``; returns only the keys that are set.
+@dataclass(frozen=True)
+class Participant:
+    """A named, separately addressable agent: an identity on the bus, run by a harness
+    with its own launch settings (#43)."""
+    name: str
+    harness: str
+    # Launch settings: the harness's ``peers`` entry with the participant's own on top.
+    settings: dict = field(default_factory=dict, compare=False, hash=False)
+
+    @property
+    def default(self) -> bool:
+        """One of the built-in participants named after their harness."""
+        return self.name == self.harness
+
+
+def check_peer_settings(harness: str, settings: dict | None, who: str | None = None) -> dict:
+    """Validate a {model, effort} mapping for a participant run by ``harness`` (named
+    ``who`` in errors; the harness by default); returns only the keys that are set.
     Model names are restricted to a safe character set, and effort to the values that
-    agent's CLI accepts."""
+    harness's CLI accepts."""
+    who = who or harness
     if settings is None:
         return {}
     if not isinstance(settings, dict):
-        raise ValueError(f"settings for {agent} must be an object with model and/or effort")
+        raise ValueError(f"settings for {who} must be an object with model and/or effort")
     extra = set(settings) - {"model", "effort"}
     if extra:
-        raise ValueError(f"unknown setting(s) for {agent}: {', '.join(sorted(extra))} (expected model, effort)")
+        raise ValueError(f"unknown setting(s) for {who}: {', '.join(sorted(extra))} (expected model, effort)")
     out = {}
     model, effort = settings.get("model"), settings.get("effort")
     if model is not None:
         if not isinstance(model, str) or not _MODEL.fullmatch(model):
-            raise ValueError(f"invalid model name for {agent}: {model!r}")
+            raise ValueError(f"invalid model name for {who}: {model!r}")
         out["model"] = model
     if effort is not None:
-        allowed = AGENT_INFO[agent]["efforts"]
+        allowed = HARNESS_INFO[harness]["efforts"]
         if effort not in allowed:
-            raise ValueError(f"invalid effort for {agent}: {effort!r}; expected one of {', '.join(allowed)}")
+            raise ValueError(f"invalid effort for {who}: {effort!r}; expected one of {', '.join(allowed)}")
         out["effort"] = effort
     return out
-AGENTS = tuple(AGENT_INFO)
+
+
+def _check_launch(where: str, harness: str, entry: dict, who: str) -> None:
+    """Reject a bad launch setting in a ``peers`` or ``participants`` entry when loading."""
+    check_peer_settings(harness, {k: entry.get(k) for k in ("model", "effort")}, who)
+    for key in ("web_search", "allow_mcp"):
+        if not isinstance(entry.get(key, True), bool):
+            raise ValueError(f"{where}.{key} must be true or false")
+    if "command" in entry and not (isinstance(entry["command"], str) and entry["command"]):
+        raise ValueError(f"{where}.command must be a non-empty string")
+    if "args" in entry and not (isinstance(entry["args"], list) and all(isinstance(a, str) for a in entry["args"])):
+        raise ValueError(f"{where}.args must be a list of strings")
+    account = entry.get("account")
+    if account is not None and not (isinstance(account, str) and _ACCOUNT.fullmatch(account)):
+        raise ValueError(f"{where}.account must be a short label (letters, digits and ._@+-), got {account!r}")
+
 
 DEFAULTS = {
     "repos": [],
@@ -69,6 +118,7 @@ DEFAULTS = {
     "max_messages": 60,
     "max_diff_bytes": 200_000,
     "peers": {},
+    "participants": {},
     "agents": None,
 }
 
@@ -112,7 +162,10 @@ class Config:
     max_diff_bytes: int = 200_000
     # Per-agent overrides: {"claude": {"command": "/path/claude", "args": [...]}}
     peers: dict = field(default_factory=dict)
-    # Agents available on this machine.  None means detect them (see availability).
+    # Named participants (#43): {"codex-mini": {"harness": "codex", "model": "...", ...}}.
+    # The built-in names (claude, codex, antigravity) are always participants too.
+    participants: dict = field(default_factory=dict)
+    # Participants available on this machine.  None means detect them (see availability).
     agents: list | None = None
 
     @classmethod
@@ -131,37 +184,105 @@ class Config:
         if isinstance(conf.auto_resume_max, bool) or not isinstance(conf.auto_resume_max, int) \
                 or conf.auto_resume_max < 0:
             raise ValueError("auto_resume_max must be a whole number, 0 or more")
-        for agent, entry in (conf.peers or {}).items():  # reject a bad model/effort when loading
-            if agent in AGENT_INFO and isinstance(entry, dict):
-                check_peer_settings(agent, {k: entry.get(k) for k in ("model", "effort")})
-                if not isinstance(entry.get("web_search", True), bool):
-                    raise ValueError(f"peers.{agent}.web_search must be true or false")
+        if not isinstance(conf.peers, dict):
+            raise ValueError("config `peers` must be an object keyed by harness")
+        for agent, entry in conf.peers.items():  # reject a bad model/effort when loading
+            if agent in HARNESS_INFO and isinstance(entry, dict):
+                _check_launch(f"peers.{agent}", agent, entry, agent)
+        named = conf._resolve_participants()
+        for key in conf.peers:
+            if key not in HARNESS_INFO and key in named:
+                raise ValueError(f"peers.{key}: `peers` is keyed by harness; set {key}'s launch settings "
+                                 f"under participants.{key}")
         return conf
 
+    def _resolve_participants(self) -> dict[str, Participant]:
+        """Every participant: the built-in one per harness, then the configured ones
+        (sorted by name).  Validated as a whole, so a bad entry fails when loading."""
+        raw = self.participants if self.participants is not None else {}
+        if not isinstance(raw, dict):
+            raise ValueError("config `participants` must be an object keyed by participant name")
+        out: dict[str, Participant] = {}
+        for h in HARNESSES:
+            entry = raw[h] if h in raw else {}
+            out[h] = self._participant(h, entry)
+        for name in sorted(raw):
+            if name not in out:
+                out[name] = self._participant(name, raw[name])
+        return out
+
+    def _participant(self, name: object, entry: object) -> Participant:
+        where = f"participants.{name}"
+        if not isinstance(name, str) or not PARTICIPANT_NAME.fullmatch(name) or name in RESERVED_NAMES:
+            raise ValueError(f"invalid participant name {name!r}: use 1-32 lowercase letters, digits and "
+                             "hyphens, starting with a letter (not human or system)")
+        if not isinstance(entry, dict):
+            raise ValueError(f"{where} must be an object")
+        extra = set(entry) - PARTICIPANT_KEYS
+        if extra:
+            raise ValueError(f"unknown key(s) in {where}: {', '.join(sorted(extra))} "
+                             f"(expected {', '.join(sorted(PARTICIPANT_KEYS))})")
+        harness = entry.get("harness", name if name in HARNESS_INFO else None)
+        if not isinstance(harness, str) or harness not in HARNESS_INFO:
+            raise ValueError(f"{where}.harness must be one of {', '.join(HARNESSES)}, got {harness!r}")
+        if name in HARNESS_INFO and harness != name:
+            raise ValueError(f"participant {name!r} is the {name} harness's own name, so its harness must be {name}")
+        if "allow_mcp" in entry and harness != "antigravity":
+            raise ValueError(f"{where}.allow_mcp applies only to the antigravity harness")
+        _check_launch(where, harness, entry, name)
+        base = self.peers.get(harness) if isinstance(self.peers.get(harness), dict) else {}
+        own = {k: v for k, v in entry.items() if k != "harness"}
+        return Participant(name, harness, {**base, **own})
+
+    def participant_map(self) -> dict[str, Participant]:
+        # Resolved on every call (it's a handful of entries): tests and callers may change
+        # ``peers`` after loading.
+        return self._resolve_participants()
+
+    def participant(self, name: str, role: str = "participant") -> Participant:
+        """The participant called ``name``; ValueError for a name nobody configured."""
+        found = self.participant_map().get(name) if isinstance(name, str) else None
+        if found is None:
+            raise ValueError(f"unknown {role} {name!r}; expected one of {', '.join(self.participant_map())}")
+        return found
+
+    def is_participant(self, name: object) -> bool:
+        return isinstance(name, str) and name in self.participant_map()
+
+    def harness_of(self, name: str) -> str:
+        return self.participant(name).harness
+
+    def launch(self, name: str) -> dict:
+        """``name``'s launch settings (command, args, model, effort, web_search, ...)."""
+        return self.participant(name).settings
+
     def peer_command(self, agent: str, default: str | None = None) -> str:
-        return os.path.expanduser(self.peers.get(agent, {}).get("command", default or AGENT_INFO[agent]["cli"]))
+        p = self.participant(agent)
+        return os.path.expanduser(p.settings.get("command", default or HARNESS_INFO[p.harness]["cli"]))
 
     def availability(self) -> dict[str, dict]:
-        """For each known agent: whether this machine has it, and why.
+        """For each participant: whether this machine has it, and why.
 
-        With ``agents`` set in the config, that list is authoritative.  Otherwise an
-        agent is available when its CLI (``peers.<agent>.command``, or the default
-        name on PATH) can be found.  Being signed in isn't checked.
+        With ``agents`` set in the config, that list of participant names is
+        authoritative.  Otherwise a participant is available when its harness's CLI
+        (its ``command``, the harness's ``peers.<harness>.command``, or the default name
+        on PATH) can be found.  Being signed in isn't checked.
         """
         out = {}
+        names = self.participant_map()
         if self.agents is not None:
             if not isinstance(self.agents, list):
-                raise ValueError(f"config `agents` must be a list of agent names, got {type(self.agents).__name__}")
-            unknown = [a for a in self.agents if not isinstance(a, str) or a not in AGENT_INFO]
+                raise ValueError(f"config `agents` must be a list of participant names, got {type(self.agents).__name__}")
+            unknown = [a for a in self.agents if not isinstance(a, str) or a not in names]
             if unknown:
-                raise ValueError(f"unknown agent(s) in config `agents`: {', '.join(map(str, unknown))}; "
-                                 f"known: {', '.join(AGENTS)}")
-            for a in AGENTS:
+                raise ValueError(f"unknown participant(s) in config `agents`: {', '.join(map(str, unknown))}; "
+                                 f"known: {', '.join(names)}")
+            for a in names:
                 on = a in self.agents
                 out[a] = {"available": on, "reason": "listed in config `agents`" if on
                           else "not listed in config `agents`"}
             return out
-        for a in AGENTS:
+        for a in names:
             cmd = self.peer_command(a)
             found = shutil.which(cmd)
             out[a] = {"available": bool(found),
@@ -172,29 +293,38 @@ class Config:
         return [a for a, v in self.availability().items() if v["available"]]
 
     def require_available(self, agent: str, role: str = "agent") -> None:
-        info = self.availability().get(agent)
+        info = self.availability().get(agent) if isinstance(agent, str) else None
         if info is None:
-            raise ValueError(f"unknown {role} {agent!r}; expected one of {', '.join(AGENTS)}")
+            raise ValueError(f"unknown {role} {agent!r}; expected one of {', '.join(self.participant_map())}")
         if not info["available"]:
             from .db import BusError
             raise BusError("AGENT_UNAVAILABLE", f"{agent} isn't available on this machine ({info['reason']}); "
                            f"available: {', '.join(self.available_agents()) or 'none'}")
 
+    def check_settings(self, agent: str, settings: dict | None) -> dict:
+        """check_peer_settings for participant ``agent`` (by its harness's rules)."""
+        return check_peer_settings(self.harness_of(agent), settings, agent)
+
     def peer_settings(self, agent: str, override: dict | None = None) -> dict:
-        """Model and effort for ``agent``'s headless turns: config ``peers.<agent>``,
-        then a per-thread override on top.  Empty means the CLI's own defaults."""
-        base = self.peers.get(agent, {})
+        """Model and effort for ``agent``'s headless turns: its participant entry (on top of
+        config ``peers.<harness>``), then a per-thread override on top.  Empty means the
+        CLI's own defaults."""
+        base = self.launch(agent)
         merged = {k: base[k] for k in ("model", "effort") if base.get(k) is not None}
-        merged.update(check_peer_settings(agent, override))
-        return check_peer_settings(agent, merged)
+        merged.update(self.check_settings(agent, override))
+        return self.check_settings(agent, merged)
 
     def web_search(self, agent: str) -> bool:
         """Whether ``agent``'s headless turns may search the web (issue #46): on unless
-        config sets ``peers.<agent>.web_search = false``."""
-        return self.peers.get(agent, {}).get("web_search", True) is not False
+        config sets ``web_search = false`` for it (or for its harness in ``peers``)."""
+        return self.launch(agent).get("web_search", True) is not False
 
     def peer_args(self, agent: str) -> list[str]:
-        return list(self.peers.get(agent, {}).get("args", []))
+        return list(self.launch(agent).get("args", []))
+
+    def account(self, agent: str) -> str | None:
+        """The account label ``agent``'s usage counts against, if configured."""
+        return self.launch(agent).get("account") or None
 
     def repo_allowed(self, repo: str | os.PathLike) -> bool:
         real = os.path.realpath(repo)
