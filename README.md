@@ -112,7 +112,8 @@ turns on it and tells you when it should be back. This was agreed on agent-bus t
   - **Discussions** keep every participant and vote. If the blocked peer already agrees with a
     proposal, the others can still converge on it. If it backs nothing, or blocked peers back
     different proposals, the discussion goes to `needs_human` straight away instead of using up
-    rounds.
+    rounds. When no headless peer can move but they all back one proposal, no round is spent
+    (advancing fails with `USAGE_EXHAUSTED`), and the initiator is asked to vote on it.
 - **You:** `agent-bus agents` (and agents' `whoami`) show who's out of usage until when.
   - `agent-bus resume <thread>` clears the cached block for that thread's peers before retrying;
   - `agent-bus agents --clear-quota <agent>` clears it everywhere, e.g. after a plan upgrade.
@@ -133,7 +134,12 @@ agreed on agent-bus thread t-35d692 (issue #32). Stage 1 is in place:
 - **Format drift:** a turn that exits normally but has no reply or no session id fails as
   `PEER_FORMAT_CHANGED`. There's no fresh-session retry or repair turn, nothing is posted, the
   pinned session is kept, and one thread notice names the agent and its version. A review goes to
-  `needs_human`.
+  `needs_human`. In a discussion the peer is skipped in later rounds, and its recorded votes are
+  handled like an out-of-usage peer's (see above; issue #40): with no usable agreement, or with
+  such peers backing different proposals, the discussion goes to `needs_human`. Advancing a
+  discussion that no peer can move fails with `PEER_FORMAT_CHANGED` (`PEERS_CANNOT_VOTE` when
+  some peers are out of usage instead). `agent-bus resume` clears it. A turn the CLI stopped
+  partway through (`PEER_TURN_INCOMPLETE`) isn't drift, and the peer is asked again.
 - **New event types:** event types an adapter doesn't know are counted and reported as one
   `format` progress line (`unrecognised codex stream events: x×2`). They aren't fatal on their
   own, since CLIs add event types all the time.

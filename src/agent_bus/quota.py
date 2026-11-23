@@ -98,25 +98,3 @@ def blocked_peers(bus, config: cfg.Config, t: dict) -> dict[str, dict]:
         if b:
             out[p] = b
     return out
-
-
-def stalemate_blocks(bus, config: cfg.Config, t: dict) -> dict[str, dict]:
-    """The blocks that leave no path to unanimity ({} if there is still one), from one
-    read of the cache, so a caller can decide and explain from the same snapshot.
-
-    Stalemate: an out-of-usage peer backs nothing, or blocked peers back different
-    proposals.  A blocked peer that already agrees with something the others can still
-    converge on doesn't stop the discussion."""
-    if t["status"] != "open":
-        return {}
-    blocked = blocked_peers(bus, config, t)
-    if not blocked:
-        return {}
-    st = bus.standings(t["id"])
-    backed = {st.get(p, {}).get("proposal_id") if st.get(p, {}).get("stance") == "agree" else None
-              for p in blocked}
-    return blocked if (None in backed or len(backed) > 1) else {}
-
-
-def stalemate(bus, config: cfg.Config, t: dict) -> bool:
-    return bool(stalemate_blocks(bus, config, t))

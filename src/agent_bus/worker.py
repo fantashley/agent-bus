@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from . import config as cfg
-from . import prompts, quota
+from . import prompts, quota, unvotable
 from .db import HUMAN, SYSTEM, Bus, BusError
 from .peers import ADAPTERS, TurnResult, adapter, cli_version, extract_json, format_usage
 
@@ -210,6 +210,10 @@ class Worker:
         block = self.bus.quota_block(agent, quota.model_key(model))
         if block:
             return self.blocked(agent, block)
+        # Nor on a discussion peer whose output this discussion already found unusable.
+        drift = self.bus.peer_drift(self.thread_id).get(agent)
+        if drift:
+            return self.drifted(agent, drift)
         ad = adapter(agent, self.config, settings)
         resume_id = self.bus.peer_session(self.thread_id, agent) if resume else None
         timeout = max(30.0, min(self.config.turn_timeout_s, self.deadline_left()))
@@ -246,7 +250,13 @@ class Worker:
                 self.set_peer_session(agent, resume_id)
             return res
         if res.format_changed:
-            self.format_notice(agent, version, res.error or "")
+            reason = drift_reason(res.error or "")
+            if t["kind"] == "discussion":
+                # Later rounds skip it until `agent-bus resume` (issue #40).  A review goes
+                # to needs_human instead, and its next pass tries again.
+                with self.fenced():
+                    self.bus.set_peer_drift(self.thread_id, agent, version, reason)
+            self.format_notice(agent, version, reason)
             if resume_id:
                 self.set_peer_session(agent, resume_id)
             return res
@@ -282,14 +292,17 @@ class Worker:
         found.update(resets_at=until)
         self.quota_notice(agent, block)
 
-    def format_notice(self, agent: str, version: str, error: str) -> None:
+    def drifted(self, agent: str, drift: dict) -> TurnResult:
+        """The result of a turn skipped because ``agent``'s format drift is on record here."""
+        self.format_notice(agent, drift["version"], drift["reason"])
+        return TurnResult(ok=False, format_changed=True,
+                          error=f"PEER_FORMAT_CHANGED: {agent} exited normally {drift['reason']} earlier in "
+                                "this discussion")
+
+    def format_notice(self, agent: str, version: str, reason: str) -> None:
         """One notice per agent per job when its output no longer matches what agent-bus
-        parses.  Fixed wording plus the CLI's version; the raw output stays in events."""
-        reason = "without a reply or a session id"
-        for what in ("without a reply or a session id", "without a reply", "without a session id"):
-            if what in error:
-                reason = what
-                break
+        parses (``reason``, from drift_reason).  Fixed wording plus the CLI's version; the
+        raw output stays in events."""
         with self._quota_lock:
             if ("format", agent) in self.quota_noticed:
                 return
@@ -297,6 +310,13 @@ class Worker:
         self.system(f"PEER_FORMAT_CHANGED: {agent} ({version}) exited normally {reason}, so its output "
                     "format has probably changed. The progress events have the details; `agent-bus agents` "
                     f"shows the installed version. Run `agent-bus resume {self.thread_id}` once it's fixed.")
+
+    def unvotable_notice(self, agent: str, reason: dict) -> None:
+        """The notice for a peer that can't vote again (see unvotable.peers)."""
+        if reason["why"] == "quota":
+            self.quota_notice(agent, reason["block"])
+        else:
+            self.format_notice(agent, reason["version"], reason["reason"])
 
     def quota_notice(self, agent: str, block: dict) -> None:
         """One thread notice per agent per job, in fixed wording: who is out of usage,
@@ -342,60 +362,67 @@ class Worker:
         if mode in ("start", "start_later"):
             if mode == "start":
                 self.round_one(t)
-                if not self.quota_stalemate():
+                if not self.stalemate():
                     self.wait_for_initiator(round_no=1)
             # Round 1 is over, even if the worker stops here (e.g. waiting on an absent
             # initiator): lift blindness so the initiator can read what it must vote on.
             self.set_thread(blind=0)
+            # An explicit resume gets at least one peer round: the peers it let back in
+            # (quota or format drift cleared) may move to the absent initiator's proposal.
+            retry = mode == "start_later"
             while not self.done():
                 t = self.thread()
                 if t["round"] >= t["max_rounds"] or self.deadline_left() <= 0:
                     break
-                if self.only_absent_initiator_missing():
+                if not retry and self.only_absent_initiator_missing():
                     break  # more peer rounds can't help; the initiator has to vote
-                if self.quota_stalemate() or self.all_peers_blocked():
+                retry = False
+                if not self.later_round():
                     break  # no peer can move; wrap_up hands over to the initiator or the human
-                self.later_round()
         elif not self.done() and self.thread()["round"] < self.thread()["max_rounds"]:
             self.set_thread(blind=0)
-            self.later_round()  # advance: exactly one more round
+            if not self.later_round():  # advance: at most one more round
+                # It spent no round, so the same advance must be able to run once the
+                # peers can move again.
+                with self.fenced():
+                    self.bus.release_dedupe(self.job["id"])
         if self.close_on_stalemate():
             return
         self.wrap_up()
 
-    def quota_stalemate(self) -> bool:
-        snapshot = quota.stalemate_blocks(self.bus, self.config, self.thread())
-        # The blocks may have come from other jobs: say which peers and until when, from
-        # the same read that made the decision.
-        for p, b in snapshot.items():
-            self.quota_notice(p, b)
-        return bool(snapshot)
+    def standstill(self) -> unvotable.Standing:
+        """Which peers can't vote again and what that leaves possible.  Their reasons may
+        come from other jobs (a shared quota block): say which peers and why, from the same
+        read that made the decision, whenever it stops anything."""
+        s = unvotable.assess(self.bus, self.config, self.thread())
+        if s.stalemate or s.everyone:
+            for p, r in s.stuck.items():
+                self.unvotable_notice(p, r)
+        return s
+
+    def stalemate(self) -> bool:
+        return self.standstill().stalemate
 
     def close_on_stalemate(self) -> bool:
-        """End the discussion as needs_human if out-of-usage peers leave no path to
-        unanimity.  Decided again inside the transaction that changes the status, so a
+        """End the discussion as needs_human if peers that can't vote again leave no path
+        to unanimity.  Decided again inside the transaction that changes the status, so a
         block cleared meanwhile leaves the discussion open."""
-        if not quota.stalemate(self.bus, self.config, self.thread()):
+        if not unvotable.stalemate(self.bus, self.config, self.thread()):
             return False
         with self.fenced():
             t = self.thread()
-            snapshot = quota.stalemate_blocks(self.bus, self.config, t)
+            snapshot = unvotable.stalemate(self.bus, self.config, t)
             if not snapshot:
                 return False
             if not self.bus.transition(self.thread_id, "needs_human"):
                 return True  # something else closed it first
-            for p, b in snapshot.items():
-                self.quota_notice(p, b)
+            for p, r in snapshot.items():
+                self.unvotable_notice(p, r)
             init = t["initiator"]
-            self.system("No consensus is possible while out-of-usage peers can't vote again. Needs the "
+            self.system(f"No consensus is possible while {', '.join(snapshot)} can't vote again. Needs the "
                         f"human user.\n{format_dissent(self.bus.dissent(self.thread_id))}",
                         recipient=None if init == HUMAN else init)
         return True
-
-    def all_peers_blocked(self) -> bool:
-        t = self.thread()
-        blocked = quota.blocked_peers(self.bus, self.config, t)
-        return bool(blocked) and len(blocked) == len(self.peers(t))
 
     def done(self) -> bool:
         return self.thread()["status"] != "open"
@@ -425,9 +452,26 @@ class Worker:
     def preamble_and_question(self, t: dict) -> dict[str, str]:
         return {a: self.preamble(a, t) + "\n" + self.question(t) for a in t["participants"]}
 
-    def later_round(self) -> None:
-        t = self.thread()
-        self.set_thread(round=t["round"] + 1, blind=0)
+    def later_round(self) -> bool:
+        """Run one more round; False, without using it up, when no headless peer can move
+        (checked here so a block or drift recorded after an advance was queued counts too)."""
+        s = self.standstill()
+        if s.stalemate or s.everyone:
+            return False
+        with self.fenced():
+            # Decided again where the round is taken, so a shared block recorded meanwhile
+            # by another worker, or a vote that closed the thread, can't leave a round
+            # with no peer turn.
+            t = self.thread()
+            if t["status"] != "open" or t["round"] >= t["max_rounds"]:
+                return False
+            s = unvotable.assess(self.bus, self.config, t)
+            if not (s.stalemate or s.everyone):
+                self.bus.set_thread(self.thread_id, round=t["round"] + 1, blind=0)
+        if s.stalemate or s.everyone:
+            for p, r in s.stuck.items():  # from the snapshot that decided
+                self.unvotable_notice(p, r)
+            return False
         t = self.thread()
         self.system(f"Round {t['round']} of {t['max_rounds']}: vote on a proposal or revise one.")
         peers = self.peers(t)
@@ -435,12 +479,13 @@ class Worker:
         start = (t["round"] - 2) % max(1, len(peers))
         for agent in peers[start:] + peers[:start]:
             self.check()
-            if self.done() or self.deadline_left() <= 0 or self.quota_stalemate():
-                return
+            if self.done() or self.deadline_left() <= 0 or self.stalemate():
+                return True
             prompt, fresh, upto = self.later_prompt(agent)
             self.contribute(agent, prompt, fresh_prompt=fresh, delivered_upto=upto)
-        if not self.quota_stalemate():  # the initiator's vote can't resolve a stalemate
+        if not self.stalemate():  # the initiator's vote can't resolve a stalemate
             self.wait_for_initiator(round_no=t["round"])
+        return True
 
     def later_prompt(self, agent: str) -> tuple[str, str, int]:
         """(resumed prompt, self-contained fresh prompt, highest message id included).
@@ -562,10 +607,17 @@ class Worker:
         out_of_budget = t["round"] >= t["max_rounds"] or self.deadline_left() <= 0
         init = t["initiator"]
         to = None if init == HUMAN else init
-        if init != HUMAN and d["leading_proposal"] and d["not_backing_leader"] == [init]:
+        leader = d["leading_proposal"] if d["not_backing_leader"] == [init] else None
+        s = unvotable.assess(self.bus, self.config, t)
+        if s.everyone and not s.stalemate:
+            # No peer can move again, and they all back one proposal: only the initiator's
+            # vote can settle it (with one peer, dissent may count the initiator's own
+            # proposal as the leader).
+            leader = s.backs
+        if init != HUMAN and leader:
             self.system(
-                f"All peers agree on {d['leading_proposal']}. Waiting for {init} (initiator) to vote on it: "
-                f"send kind=vote, on={d['leading_proposal']}, stance=agree|object.",
+                f"All peers agree on {leader}. Waiting for {init} (initiator) to vote on it: "
+                f"send kind=vote, on={leader}, stance=agree|object.",
                 kind="status", recipient=init)
             return
         if not out_of_budget:
@@ -772,6 +824,14 @@ def normalize_verdict(v: object) -> dict | None:
                       "severity": f.get("severity") if f.get("severity") in ("high", "medium", "low") else "?",
                       "comment": str(f.get("comment") or "")[:4000]})
     return {"verdict": v["verdict"], "summary": str(v.get("summary") or "").strip()[:8000], "findings": clean}
+
+
+def drift_reason(error: str) -> str:
+    """What a PEER_FORMAT_CHANGED turn lacked, in fixed wording (never the CLI's output)."""
+    for what in ("without a reply or a session id", "without a reply", "without a session id"):
+        if what in error:
+            return what
+    return "without a reply or a session id"
 
 
 def strip_trailing_json(text: str) -> str:

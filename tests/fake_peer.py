@@ -10,7 +10,8 @@ Behaviour is driven by env vars so tests can script outcomes:
   FAKE_BEHAVIOUR=nojson  reply without any JSON, to every prompt but a repair
   FAKE_BEHAVIOUR=silent  exit 0 after the session start, with no reply (format drift);
                   FAKE_SILENT_REPAIR=agents does the same only on a repair turn, and
-                  FAKE_STRAY adds a non-JSON stdout line
+                  FAKE_STRAY adds a non-JSON stdout line; FAKE_SILENT=agents is silent for just
+                  those agents, and FAKE_SILENT_LATER=agents only after round 1
   FAKE_BEHAVIOUR=newevents  also emit event types no adapter knows
   FAKE_BEHAVIOUR=denied  (antigravity) agy's headless auto-denial of run_command: exit 0, no
                   reply, denied_actions in the result.  denied_reply: the same, then a reply;
@@ -120,7 +121,8 @@ if (listed("FAKE_EXHAUSTED") or (listed("FAKE_EXHAUSTED_LATER") and "round 1, wh
                                                     "to increase your limits. Resets in 2h26m14s."}})
     sys.exit(1)
 
-if behaviour == "silent" or (repair and listed("FAKE_SILENT_REPAIR")):
+if (behaviour == "silent" or (repair and listed("FAKE_SILENT_REPAIR")) or listed("FAKE_SILENT")
+        or (listed("FAKE_SILENT_LATER") and "round 1, which is blind" not in prompt)):
     if agent == "claude":
         out({"type": "system", "subtype": "init", "session_id": sid})
     elif agent == "codex":

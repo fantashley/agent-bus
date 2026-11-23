@@ -130,6 +130,14 @@ CREATE TABLE IF NOT EXISTS quota_blocks (  -- an agent out of usage (issue #26)
     observed_at REAL NOT NULL,
     PRIMARY KEY (agent, scope)
 );
+CREATE TABLE IF NOT EXISTS peer_drift (  -- a discussion peer whose CLI output can't be used (issue #40)
+    thread_id TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    version TEXT NOT NULL,              -- the CLI version that ran the drifted turn
+    reason TEXT NOT NULL,               -- fixed wording, e.g. "without a reply"
+    observed_at REAL NOT NULL,
+    PRIMARY KEY (thread_id, agent)
+);
 CREATE TABLE IF NOT EXISTS peer_sessions (
     thread_id TEXT NOT NULL,
     agent TEXT NOT NULL,
@@ -732,6 +740,11 @@ class Bus:
                 (jid, thread_id, kind, json.dumps(params), dedupe_key, now, now))
         return self.job(jid), True
 
+    def release_dedupe(self, jid: str) -> None:
+        """Let a later request with this job's dedupe key run again, e.g. an advance
+        that ended without spending its round."""
+        self.conn.execute("UPDATE jobs SET dedupe_key=NULL, updated_at=? WHERE id=?", (_now(), jid))
+
     @staticmethod
     def _job(row: sqlite3.Row) -> dict:
         j = dict(row)
@@ -857,6 +870,26 @@ class Bus:
         cur = self.conn.execute("DELETE FROM quota_blocks WHERE agent=? AND scope IN ('', ?)",
                                 (agent, model or ""))
         return cur.rowcount if cur.rowcount is not None else 0
+
+    def set_peer_drift(self, thread_id: str, agent: str, version: str, reason: str) -> dict:
+        """Record that ``agent``'s output in this discussion no longer matches what
+        agent-bus parses, so later rounds skip it until `agent-bus resume` clears it."""
+        now = _now()
+        self.conn.execute(
+            "INSERT INTO peer_drift VALUES (?,?,?,?,?) ON CONFLICT(thread_id, agent) DO UPDATE SET"
+            " version=excluded.version, reason=excluded.reason, observed_at=excluded.observed_at",
+            (thread_id, agent, version, reason, now))
+        return {"thread_id": thread_id, "agent": agent, "version": version, "reason": reason, "observed_at": now}
+
+    def peer_drift(self, thread_id: str) -> dict[str, dict]:
+        """{agent: drift row} for this thread's peers with format drift."""
+        return {r["agent"]: dict(r) for r in self._all("SELECT * FROM peer_drift WHERE thread_id=?", thread_id)}
+
+    def clear_peer_drift(self, thread_id: str) -> list[str]:
+        """Forget this thread's format drift; returns the agents it applied to."""
+        with self.tx():  # the lock and the write stay held until RETURNING is read
+            rows = self._all("DELETE FROM peer_drift WHERE thread_id=? RETURNING agent", thread_id)
+        return sorted(r["agent"] for r in rows)
 
     def peer_session(self, thread_id: str, agent: str) -> str | None:
         row = self._one("SELECT external_id FROM peer_sessions WHERE thread_id=? AND agent=?", thread_id, agent)
