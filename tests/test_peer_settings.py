@@ -35,8 +35,11 @@ def test_each_cli_gets_its_own_flags(env):
     assert adapter("codex", conf).setting_args() == []
 
 
-def test_config_settings_reach_first_and_resumed_turns(env, no_spawn):
+def test_config_settings_reach_first_and_resumed_turns(env, no_spawn, monkeypatch):
     set_peers(env, codex={"effort": "xhigh"}, claude={"model": "sonnet"})
+    # Round 1 runs in parallel, so codex's proposal may be P1; claude agreeing with it
+    # first in round 2 would then end the thread before codex's resumed turn (#58).
+    monkeypatch.setenv("FAKE_BEHAVIOUR", "stubborn")
     bus = env["bus"]
     tid = Service(bus, HUMAN).start_discussion("Q?", peers=["claude", "codex"], max_rounds=2)["thread"]["id"]
     run_job(bus, tid)
