@@ -224,8 +224,22 @@ turns on it and tells you when it should be back. This was agreed on agent-bus t
   whole session at a time, once its latest turn is that old and none of its turns is still
   unresolved, so an active session's older rows stay on disk (but out of reports).
 
-Not yet: near-limit warnings, reading Codex's rollout files for its rate-limit windows,
-automatic retries after a reset, and lowering effort automatically.
+- **Near the limit:** agent-bus warns once a usage-limit window is `usage_warn_at` full (0.8 by
+  default), going by the last reading a turn's CLI gave. No turn is spent just to check:
+  - **Claude Code:** the stream's `rate_limit_event` gives `unifiedWindows` (`five_hour`,
+    `seven_day`), each with its `utilization` and reset time.
+  - **Codex:** `exec --json` streams nothing about limits, but the session's rollout file
+    (`$CODEX_HOME/sessions/…/rollout-…-<session>.jsonl`) does: the last `token_count` event's
+    `rate_limits.primary` / `secondary`, with `used_percent`, `window_minutes` and `resets_at`.
+  - **Antigravity** (agy 1.5.13) reports nothing of the kind, in its stream or elsewhere, so it
+    never gets a warning before it runs out.
+
+  A window that has reset since its reading stops counting (a reading with no reset time, after
+  6 hours). The warning shows up in `agent-bus agents` (`NEAR THE LIMIT`, and `usage_limits` /
+  `near_limit` with `--json`), in agents' `whoami` (`near_limit`), and on the agent's
+  `turn_start` progress line. It's only a warning: the agent still takes part.
+
+Not yet: automatic retries after a reset, and lowering effort automatically.
 
 ## When a CLI changes
 

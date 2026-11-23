@@ -98,3 +98,31 @@ def blocked_peers(bus, config: cfg.Config, t: dict) -> dict[str, dict]:
         if b:
             out[p] = b
     return out
+
+
+# ------------------------------------------------------------ near the limit
+
+
+def window_name(w: dict) -> str:
+    """A usage-limit window as people say it: "five_hour", or "primary (7d)"."""
+    m = w.get("minutes")
+    if not m:
+        return w["window"]
+    span = f"{m // 1440}d" if m % 1440 == 0 else f"{m // 60}h" if m % 60 == 0 else f"{m}m"
+    return f"{w['window']} ({span})"
+
+
+def describe_window(w: dict) -> str:
+    resets = f", resets {when(w['resets_at'])}" if w.get("resets_at") else ""
+    return f"{window_name(w)} {w['used']:.0%} used{resets}"
+
+
+def near_limit(bus, config: cfg.Config, agent: str) -> list[dict]:
+    """The usage-limit windows of ``agent`` at or above ``usage_warn_at``, from the last
+    readings its CLI gave (Claude and Codex; Antigravity reports none)."""
+    return [w for w in bus.usage_limits(agent) if w["used"] >= config.usage_warn_at]
+
+
+def limits_summary(w: dict, warn_at: float) -> dict:
+    return {"window": w["window"], "used": round(w["used"], 4), "minutes": w["minutes"],
+            "resets_at": w["resets_at"], "observed_at": w["observed_at"], "near_limit": w["used"] >= warn_at}

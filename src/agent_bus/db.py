@@ -132,6 +132,15 @@ CREATE TABLE IF NOT EXISTS quota_blocks (  -- an agent out of usage (issue #26)
     observed_at REAL NOT NULL,
     PRIMARY KEY (agent, scope)
 );
+CREATE TABLE IF NOT EXISTS usage_limits (  -- how full each usage-limit window was, last seen (issue #26)
+    agent TEXT NOT NULL,
+    window TEXT NOT NULL,               -- the CLI's own name, e.g. five_hour, primary
+    used REAL NOT NULL,                 -- fraction of the window used
+    minutes INTEGER,                    -- the window's length, if the CLI gives it
+    resets_at REAL,
+    observed_at REAL NOT NULL,
+    PRIMARY KEY (agent, window)
+);
 CREATE TABLE IF NOT EXISTS peer_drift (  -- a discussion peer whose CLI output can't be used (issue #40)
     thread_id TEXT NOT NULL,
     agent TEXT NOT NULL,
@@ -899,6 +908,31 @@ class Bus:
         cur = self.conn.execute("DELETE FROM quota_blocks WHERE agent=? AND scope IN ('', ?)",
                                 (agent, model or ""))
         return cur.rowcount if cur.rowcount is not None else 0
+
+    # How long a usage-limit reading with no reset time is shown.
+    LIMIT_FRESH_S = 6 * 3600
+
+    def set_usage_limits(self, agent: str, windows: list[dict]) -> None:
+        """Record the usage-limit windows a turn of ``agent`` reported.  The reading taken
+        last (``observed_at``, else now) wins, whichever turn records it first."""
+        now = _now()
+        with self.tx():
+            for w in windows:
+                self.conn.execute(
+                    "INSERT INTO usage_limits VALUES (?,?,?,?,?,?) ON CONFLICT(agent, window) DO UPDATE SET"
+                    " used=excluded.used, minutes=excluded.minutes, resets_at=excluded.resets_at,"
+                    " observed_at=excluded.observed_at WHERE excluded.observed_at>=usage_limits.observed_at",
+                    (agent, w["window"], w["used"], w.get("minutes"), w.get("resets_at"),
+                     min(w.get("observed_at") or now, now)))
+
+    def usage_limits(self, agent: str | None = None) -> list[dict]:
+        """Current readings: a window that has reset since (or, with no reset time, a reading
+        older than LIMIT_FRESH_S) says nothing about now and is left out."""
+        now = _now()
+        rows = self._all("SELECT * FROM usage_limits WHERE (agent=? OR ? IS NULL) AND"
+                         " (resets_at>? OR (resets_at IS NULL AND observed_at>?)) ORDER BY agent, window",
+                         agent, agent, now, now - self.LIMIT_FRESH_S)
+        return [dict(r) for r in rows]
 
     def set_peer_drift(self, thread_id: str, agent: str, version: str, reason: str) -> dict:
         """Record that ``agent``'s output in this discussion no longer matches what

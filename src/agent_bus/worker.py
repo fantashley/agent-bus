@@ -221,8 +221,13 @@ class Worker:
         shown = "".join(f" · {k} {v}" for k, v in settings.items())
         # Which CLI build and adapter recipe ran this turn, so drift can be tied to an upgrade (#32).
         version = cli_version(self.bus, agent, ad.command, cwd=cwd)
+        # Close to its usage limit, by the last reading its CLI gave: worth knowing before
+        # the turn spends more (issue #26).
+        near = quota.near_limit(self.bus, self.config, agent)
         self.event("turn_start", f"round {t['round']}" + (" (resumed)" if resume_id else "") + shown
-                   + f" · {version} · recipe {agent}/{ad.recipe}", agent)
+                   + f" · {version} · recipe {agent}/{ad.recipe}"
+                   + (" · near its usage limit: " + "; ".join(map(quota.describe_window, near)) if near else ""),
+                   agent)
         emit = lambda kind, text: self.event(kind, text, agent)  # noqa: E731
         tag = self.job["id"]
         row = self.begin_usage(ad, model, resume_id)
@@ -293,6 +298,11 @@ class Worker:
         """Record the tokens one CLI run used (issue #26), and leave ``res.usage`` as this
         turn's own share (see Bus.record_usage).  Recorded even by a worker that has lost
         its lease: the tokens were spent either way, and the history is not thread state."""
+        if res.limits:
+            try:
+                self.bus.set_usage_limits(ad.agent, res.limits)
+            except Exception as e:  # noqa: BLE001 - history must never fail a turn
+                self.event("error", f"could not record usage limits: {e!r}", ad.agent)
         total = res.usage if ad.session_usage else None
         if total is not None:
             res.session_usage, res.usage = total, None
