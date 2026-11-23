@@ -301,8 +301,9 @@ class Worker:
         # again first: another worker may have found this agent out of usage meanwhile.
         # Nor can it fix a changed output format, or a turn the CLI stopped partway through
         # (it would stop the same way, and the working conversation would be dropped).
+        # Nor a model or region the provider refuses (#36).
         if (not res.ok and resume_id and not res.timed_out and not res.quota and not res.format_changed
-                and not res.incomplete and not self.cancelled()):
+                and not res.incomplete and not res.config_error and not self.cancelled()):
             block = quota.block_for(self.bus, self.config, agent, settings)
             if block:
                 self.event("turn_end", f"failed: {res.error}" + tokens(res), agent)
@@ -330,6 +331,16 @@ class Worker:
                 with self.fenced():
                     self.bus.set_peer_drift(self.thread_id, agent, version, reason)
             self.format_notice(agent, version, reason)
+            if resume_id:
+                self.set_peer_session(agent, resume_id)
+            return res
+        if res.config_error:
+            if t["kind"] == "discussion":
+                # Like format drift: later rounds skip it, and the standstill rules see it,
+                # until `agent-bus resume` (#36).  Not cached beyond this discussion.
+                with self.fenced():
+                    self.bus.set_peer_drift(self.thread_id, agent, unvotable.CONFIG_MARK, "refused its model")
+            self.config_notice(agent, model)
             if resume_id:
                 self.set_peer_session(agent, resume_id)
             return res
@@ -397,18 +408,49 @@ class Worker:
     def record_quota(self, agent: str, model: str | None, found: dict) -> None:
         now = time.time()
         reset = found.get("resets_at")
-        estimated = not (isinstance(reset, (int, float)) and reset > now)
-        until = now + self.config.quota_cooldown_s if estimated else min(max(reset, now + 60), now + 7 * 86400)
         source = found.get("source") if found.get("source") in quota.REASONS else "heuristic"
+        estimated = not (isinstance(reset, (int, float)) and reset > now)
+        if source == "auth":
+            # Credentials don't come back by themselves: until the human clears it (#36).
+            until, estimated = now + quota.AUTH_BLOCK_S, True
+        elif estimated:
+            until = now + (quota.THROTTLE_COOLDOWN_S if source == "throttle" else self.config.quota_cooldown_s)
+        else:
+            until = min(max(reset, now + 60), now + 7 * 86400)
         with self.fenced():  # the cache is shared: only a worker that still holds its lease writes it
             subj = quota.subject(self.config, agent)  # shared by every participant on it
             block = self.bus.set_quota_block(subj, until, source, quota.reason(subj, source),
-                                             scope=quota.scope_for(self.config, agent, model), estimated=estimated)
+                                             scope=quota.scope_for(self.config, agent, model, source),
+                                             estimated=estimated)
         found.update(resets_at=until)
         self.quota_notice(agent, block)
 
+    def config_notice(self, agent: str, model: str | None) -> None:
+        """One notice per agent per job when its provider refused the model or region it
+        asked for (#36).  Fixed wording plus the configured model and region; the CLI's own
+        error stays in the progress events."""
+        with self._quota_lock:
+            if ("config", agent) in self.quota_noticed:
+                return
+            self.quota_noticed.add(("config", agent))
+        where = ""
+        if self.config.bedrock(agent):
+            where = f" in AWS region {self.config.aws_region(agent) or '(the CLI default)'}"
+        self.system(f"PEER_MISCONFIGURED: {agent}'s model provider refused model {quota.model_key(model)}{where}. "
+                    "The model id or inference profile may be wrong, the region may not offer it, or the account "
+                    "may have no access to it (the provider answers these alike). Fix the participant's model or "
+                    f"env, then run `agent-bus resume {self.thread_id}`. A model set for this thread only stays "
+                    f"with it: for that, `agent-bus cancel {self.thread_id}` and make a new request with a "
+                    "corrected model (without this thread's id or a previous head).")
+
     def drifted(self, agent: str, drift: dict) -> TurnResult:
-        """The result of a turn skipped because ``agent``'s format drift is on record here."""
+        """The result of a turn skipped because ``agent``'s format drift (or a refused model)
+        is on record here."""
+        if drift["version"] == unvotable.CONFIG_MARK:
+            self.config_notice(agent, quota.peer_model(self.config, self.thread(), agent))
+            return TurnResult(ok=False, config_error=True,
+                              error=f"PEER_MISCONFIGURED: {agent}'s model provider refused its model earlier in "
+                                    "this discussion")
         self.format_notice(agent, drift["version"], drift["reason"])
         return TurnResult(ok=False, format_changed=True,
                           error=f"PEER_FORMAT_CHANGED: {agent} exited normally {drift['reason']} earlier in "
@@ -428,8 +470,10 @@ class Worker:
 
     def unvotable_notice(self, agent: str, reason: dict) -> None:
         """The notice for a peer that can't vote again (see unvotable.peers)."""
-        if reason["why"] == "quota":
+        if reason["why"] in ("quota", "auth"):
             self.quota_notice(agent, reason["block"])
+        elif reason["why"] == "config":
+            self.config_notice(agent, quota.peer_model(self.config, self.thread(), agent))
         else:
             self.format_notice(agent, reason["version"], reason["reason"])
 
@@ -440,6 +484,10 @@ class Worker:
             if agent in self.quota_noticed:
                 return
             self.quota_noticed.add(agent)
+        if quota.is_auth(block):
+            self.system(f"AUTH_REQUIRED: {quota.describe(agent, block)}. To fix it, "
+                        f"{quota.auth_hint(self.config, agent)}, then run `agent-bus resume {self.thread_id}`.")
+            return
         self.system(f"{quota.describe(agent, block)}. After that, run `agent-bus resume {self.thread_id}` "
                     "to retry.")
 
@@ -639,7 +687,7 @@ class Worker:
                    fresh_prompt: str | None = None, delivered_upto: int | None = None) -> None:
         """Run one turn for ``agent`` and post its proposal or vote."""
         res = self.turn(agent, prompt, resume=resume, fresh_prompt=fresh_prompt)
-        if res.quota or res.format_changed:
+        if res.quota or res.format_changed or res.config_error:
             return  # noticed in turn(); no cursor move, no repair, no partial vote
         if res.incomplete:
             # Stopped partway with no reply: report it, and never repair or post a move.
@@ -656,7 +704,7 @@ class Worker:
             # blind-safe prompt it already had, never the others' proposals.
             repair = prompts.REPAIR_BLIND if blind else prompts.REPAIR
             res2 = self.turn(agent, repair, fresh_prompt=(fresh_prompt or prompt) + "\n\n" + repair)
-            if res2.quota or res2.format_changed:
+            if res2.quota or res2.format_changed or res2.config_error:
                 return  # out of usage or format drift mid-repair: post nothing from either attempt
             if res2.incomplete:
                 self.system(f"{agent} could not repair its reply: {res2.error}")
@@ -865,7 +913,7 @@ class Worker:
         self.system(f"Review {'follow-up ' if followup else ''}{'(retry) ' if mode == 'retry' else ''}"
                     f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.{fallback}")
         res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh)
-        if res.quota or res.format_changed:
+        if res.quota or res.format_changed or res.config_error:
             # Head, reviewer and session stay pinned for `agent-bus resume` after the reset
             # (or once the adapter handles the new format).  A reset can resume it by itself.
             if res.quota:
@@ -880,7 +928,7 @@ class Worker:
         if verdict is None and res.ok:
             res2 = self.turn(reviewer, "Reply again with only the JSON verdict object described above.",
                              fresh_prompt=fresh + "\n\nReply with only the JSON verdict object.")
-            if res2.quota or res2.format_changed:
+            if res2.quota or res2.format_changed or res2.config_error:
                 if res2.quota:
                     self.park_on_quota(reviewer)
                 else:

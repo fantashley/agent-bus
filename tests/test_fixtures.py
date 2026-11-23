@@ -64,7 +64,7 @@ LEAKS = [
     # The scrubber leaves a bare /tmp/scratch; anything glued on means a fragment of a
     # streamed path was scrubbed alone and the rest of it survived.
     (r"/tmp/scratch(?=[^\s\"'`)\]/]|/)", "a partly scrubbed path"),
-    (r"\b(?:msg|toolu|req|call)_(?!fixture)[A-Za-z0-9]{6,}", "an unscrubbed message or tool id"),
+    (r"\b(?:msg|toolu|req|call)_(?:bdrk_)?(?!fixture)[A-Za-z0-9]{6,}", "an unscrubbed message or tool id"),
     (r"\b(?!00000000-0000-4000-8000-)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
      "an unscrubbed UUID"),
 ]
@@ -116,3 +116,16 @@ def test_the_leak_guard_catches_a_path_split_across_frames(tmp_path):
                            for t in ("see file:///ho", "me/alice/src/notes.txt")) + "\n")
     joined = texts(f)
     assert any(re.search(LEAKS[0][0], t) for t in joined)
+
+
+def test_claude_init_events_list_only_placeholder_tooling():
+    """A capture's init event lists the machine's own commands, skills and plugins: only the
+    scrubber's fixed placeholders may be committed."""
+    sys.path.insert(0, str(DATA))
+    from scrub import INIT_PLACEHOLDERS
+    for path in [*DATA.glob("claude-*.jsonl"), *(DATA.parent / "bedrock").glob("claude-*.jsonl")]:
+        for line in path.read_text().splitlines():
+            obj = json.loads(line)
+            if obj.get("type") == "system" and obj.get("subtype") == "init":
+                for key, value in INIT_PLACEHOLDERS.items():
+                    assert obj.get(key, value) == value, (path.name, key)

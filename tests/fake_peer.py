@@ -21,6 +21,9 @@ Behaviour is driven by env vars so tests can script outcomes:
   FAKE_APPROVE    comma-separated agents whose review verdicts approve (others request changes)
   FAKE_CLAUDE_USED / FAKE_CODEX_USED  how full the five_hour / primary usage-limit window is
                   (a fraction for claude's stream, a percentage in codex's rollout file)
+  FAKE_REPLAY     a captured stream (tests/data/bedrock) that FAKE_REPLAY_AGENTS print instead,
+                  exiting with FAKE_REPLAY_EXIT (default 1); FAKE_LOG also records the env vars
+                  named in FAKE_LOG_ENV
 Round-1 prompts get a proposal; later prompts agree with the lowest proposal id
 mentioned (or object, for `stubborn`).
 """
@@ -74,7 +77,13 @@ if log:
     with open(log, "a") as f:
         f.write(json.dumps({"agent": agent, "argv": argv, "prompt": prompt,
                             "peer_env": os.environ.get("AGENT_BUS_PEER"),
-                            "codex_home": os.environ.get("CODEX_HOME")}) + "\n")
+                            "codex_home": os.environ.get("CODEX_HOME"),
+                            "env": {k: os.environ.get(k) for k in os.environ.get("FAKE_LOG_ENV", "").split(",") if k}})
+                + "\n")
+
+if os.environ.get("FAKE_REPLAY") and agent in os.environ.get("FAKE_REPLAY_AGENTS", "").split(","):
+    sys.stdout.write(open(os.environ["FAKE_REPLAY"]).read())
+    sys.exit(int(os.environ.get("FAKE_REPLAY_EXIT", "1")))
 
 repair = "Reply again with only" in prompt
 if behaviour == "nojson" and not repair:

@@ -50,6 +50,8 @@ def schedule(bus: Bus, config: cfg.Config, t: dict, agents: list[str]) -> dict |
     if done >= config.auto_resume_max:
         return None
     blocks = blocks_for(bus, config, t, agents)
+    if any(quota.is_auth(b) for b in blocks.values()):
+        return None  # expired credentials don't reset by themselves (#36)
     due = max([b["until"] for b in blocks.values()] or [time.time()])
     with bus.tx():
         bus.conn.execute(
@@ -145,6 +147,9 @@ def resume_one(bus: Bus, config: cfg.Config, thread_id: str, now: float) -> dict
             forget(bus, thread_id)  # moved on, turned off, or out of attempts (the cap may have dropped)
             return None
         still = blocks_for(bus, config, t, json.loads(row["agents"]))
+        if any(quota.is_auth(b) for b in still.values()):
+            forget(bus, thread_id)  # now waiting on a sign-in, which only the human can do (#36)
+            return None
         if still or bus.active_job(thread_id):
             # Blocked again meanwhile, or for longer; or the job that parked it hasn't
             # finished yet: wait for that.

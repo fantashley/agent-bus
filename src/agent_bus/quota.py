@@ -18,6 +18,7 @@ originating job's progress events.
 
 from __future__ import annotations
 
+import shlex
 import time
 
 from . import config as cfg
@@ -29,7 +30,18 @@ DEFAULT_MODEL = "(default)"
 REASONS = {
     "structured": "{agent}'s CLI reported its usage limit was reached",
     "heuristic": "{agent}'s CLI reported a usage limit in its error",
+    # Amazon Bedrock (#36): a request rate limit that outlasted the CLI's own retries, and
+    # credentials the CLI couldn't load or that have expired.
+    "throttle": "{agent}'s model provider throttled its requests",
+    "auth": "{agent}'s CLI could not load or refresh its credentials",
 }
+
+# How long a throttled model is left alone when the provider gave no retry time: the CLI
+# has already retried with backoff, so this only spaces out turns (#36).
+THROTTLE_COOLDOWN_S = 60
+# Expired or missing credentials don't come back by themselves: blocked until the human
+# clears it (`agent-bus resume`, --clear-quota) or a turn succeeds.  Capped like any block.
+AUTH_BLOCK_S = 7 * 86400
 
 
 # The flags each adapter treats as choosing a model (and strips from extra args when a
@@ -40,7 +52,8 @@ MODEL_FLAGS = {"codex": ("-m", "--model")}
 def effective_model(config: cfg.Config, agent: str, settings: dict) -> str | None:
     """The model participant ``agent``'s turn runs: the per-thread or config setting (which
     replaces any model flag in the extra args), else the last model flag the configured
-    extra args pass, else None (the CLI's default)."""
+    extra args pass, else (Claude) ANTHROPIC_MODEL in its configured env, else None (the
+    CLI's default)."""
     if settings.get("model"):
         return settings["model"]
     flags = MODEL_FLAGS.get(config.harness_of(agent), ("--model",))
@@ -54,6 +67,9 @@ def effective_model(config: cfg.Config, agent: str, settings: dict) -> str | Non
             found = a.split("=", 1)[1]
         elif any(len(f) == 2 and a.startswith(f) and len(a) > 2 for f in flags):
             found = a[2:]
+    if found is None and config.harness_of(agent) == "claude":
+        # Claude Code's model variable, when agent-bus sets it for the participant (#36).
+        found = config.peer_env(agent).get("ANTHROPIC_MODEL") or None
     return found
 
 
@@ -74,21 +90,62 @@ def sharing(config: cfg.Config, subj: str) -> list[str]:
     return [p for p in config.participant_map() if subject(config, p) == subj]
 
 
-def scope_for(config: cfg.Config, agent: str, model: str | None) -> str:
-    """Claude and Codex limits are account-wide; an Antigravity quota may be per model."""
-    return model_key(model) if config.harness_of(agent) == "antigravity" else ""
+def model_scope(config: cfg.Config, agent: str, model: str | None) -> str:
+    """The key of a model-specific block for ``agent`` running ``model``.  On Amazon Bedrock
+    limits are per model and region (#36): ``<model>@<region>``."""
+    if config.bedrock(agent):
+        # An alias names whatever the participant's ANTHROPIC_DEFAULT_<ALIAS>_MODEL says.
+        alias = (model or "").split("[", 1)[0].lower()
+        if alias in ("haiku", "sonnet", "opus"):
+            model = config.peer_env(agent).get(f"ANTHROPIC_DEFAULT_{alias.upper()}_MODEL") or model
+        return f"{model_key(model)}@{config.aws_region(agent) or DEFAULT_MODEL}"
+    return model_key(model)
+
+
+def scope_for(config: cfg.Config, agent: str, model: str | None, source: str = "heuristic") -> str:
+    """Claude and Codex limits are account-wide; an Antigravity quota may be per model, and
+    a Bedrock throttle or quota is per model and region.  Credentials are account-wide."""
+    if source == "auth":
+        return ""
+    if config.harness_of(agent) == "antigravity" or config.bedrock(agent):
+        return model_scope(config, agent, model)
+    return ""
 
 
 def block_for(bus, config: cfg.Config, agent: str, settings: dict) -> dict | None:
     """The active block that stops participant ``agent`` running with ``settings``."""
-    return bus.quota_block(subject(config, agent), model_key(effective_model(config, agent, settings)))
+    return bus.quota_block(subject(config, agent), model_scope(config, agent, effective_model(config, agent, settings)))
 
 
 def clear_for(bus, config: cfg.Config, agent: str, model: str | None) -> int:
     """Lift the block on ``agent``'s account (and on its model): newer evidence of usage,
     or the human retrying.  Threads waiting on any participant sharing it are due now."""
     subj = subject(config, agent)
-    return bus.clear_quota(subj, model_key(model), waiting=sharing(config, subj))
+    return bus.clear_quota(subj, model_scope(config, agent, model), waiting=sharing(config, subj))
+
+
+def is_auth(block: dict | None) -> bool:
+    return bool(block) and block.get("source") == "auth"
+
+
+def code(block: dict) -> str:
+    """The error code for refusing a request because of ``block``."""
+    return "AUTH_REQUIRED" if is_auth(block) else "USAGE_EXHAUSTED"
+
+
+def auth_hint(config: cfg.Config, agent: str) -> str:
+    """What the human runs to sign ``agent`` in again: fixed wording, plus the AWS profile
+    from configuration (never anything from the CLI's output)."""
+    if config.is_participant(agent) and config.bedrock(agent):
+        profile = config.aws_profile(agent)
+        if profile and cfg.ENV_SAFE.fullmatch(profile):
+            # With the peer's own HOME and AWS config file, if it has them: that's where the
+            # profile is defined and where the SSO token is cached.
+            env = config.peer_env(agent)
+            prefix = "".join(f"{k}={shlex.quote(env[k])} " for k in ("HOME", "AWS_CONFIG_FILE") if env.get(k))
+            return f"run `{prefix}aws sso login --profile {profile}` on this machine"
+        return "refresh its AWS credentials on this machine (e.g. `aws sso login --profile <profile>`)"
+    return "sign its CLI in again on this machine"
 
 
 def reason(agent: str, source: str) -> str:
@@ -105,12 +162,20 @@ def when(until: float) -> str:
 
 
 def describe(agent: str, block: dict) -> str:
+    if is_auth(block):
+        return f"{agent} can't authenticate: its CLI could not load or refresh its credentials"
     model = f" for model {block['scope']}" if block["scope"] else ""
+    if block.get("source") == "throttle":
+        return f"{agent} is throttled by its model provider{model} until about {when(block['until'])}"
     est = " (an estimate: no reset time was given)" if block["estimated"] else ""
     return f"{agent} is out of usage{model} until about {when(block['until'])}{est}"
 
 
-def message(agent: str, role: str, block: dict) -> str:
+def message(agent: str, role: str, block: dict, config: cfg.Config | None = None) -> str:
+    if is_auth(block):
+        hint = auth_hint(config, agent) if config is not None else "sign its CLI in again on this machine"
+        return (f"{role} {describe(agent, block)}. To fix it, {hint}; then retry, or clear it with "
+                f"`agent-bus agents --clear-quota {agent}`.")
     return (f"{role} {describe(agent, block)}. Pick another agent, or retry after that; the human can clear "
             f"it with `agent-bus agents --clear-quota {agent}`.")
 

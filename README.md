@@ -287,6 +287,83 @@ turns on it and tells you when it should be back. This was agreed on agent-bus t
 
 Not yet: lowering effort automatically.
 
+## Running peers on Amazon Bedrock
+
+Claude Code peers can run on Amazon Bedrock instead of a Claude subscription (issue #36,
+agreed on agent-bus thread t-e33f25). Headless peers inherit the environment of whichever
+agent-bus server queued the job, so don't rely on your shell's variables: give the peer its own
+`env`, which agent-bus applies to every turn.
+
+```nix
+local.agentBus.peerSettings.claude = {
+  model = "us.anthropic.claude-opus-5-5";  # an inference-profile id or ARN, not a base model id
+  env = { CLAUDE_CODE_USE_BEDROCK = "1"; AWS_PROFILE = "bedrock"; AWS_REGION = "us-east-2"; };
+};
+```
+
+In `config.json` that's `"peers": {"claude": {"model": "...", "env": {...}}}`; a participant can
+have an `env` too, which adds to (or overrides) its harness's variable by variable.
+
+- **What to set.** `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_PROFILE` (an SSO or `credential_process`
+  profile) and `AWS_REGION`. Optionally `ANTHROPIC_DEFAULT_HAIKU_MODEL` and the like for the
+  models Claude Code picks by itself. Model ids are inference-profile ids
+  (`us.anthropic.…`, `global.anthropic.…`) or ARNs, up to 256 characters; a base model id
+  such as `anthropic.claude-haiku-4-5-…` is refused by Bedrock ("on-demand throughput isn't
+  supported"). `aws bedrock list-inference-profiles` lists them.
+- **No secrets.** `env` is for settings, never credentials: `config.json` lives in the Nix store.
+  agent-bus refuses names like `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+  `AWS_BEARER_TOKEN_BEDROCK`, anything with `TOKEN`, `SECRET`, `PASSWORD` or `API_KEY` in it, and
+  values that look like keys. That catches common mistakes; it isn't a guarantee. Point at a
+  profile instead. `PATH` can't be set either (set `command` to the CLI's path), nor
+  `CODEX_HOME` (use `codex_home`).
+- **Claude Code's own settings win over the environment.** An `env` block in
+  `~/.claude/settings.json` (where Bedrock setups often put `AWS_REGION`) beats the process
+  environment, so agent-bus also passes the configured `env` with `--settings`, which beats it in
+  turn. Variables you don't configure still come from Claude Code's settings, which agent-bus
+  doesn't read: its notices then can't name the profile or region.
+- **No interactive sign-in.** Claude Code runs its `awsAuthRefresh` setting (typically
+  `aws sso login`) even in print mode when credentials have expired, which would open a browser
+  or wait for a device code inside a headless peer. agent-bus turns it off with
+  `--settings '{"awsAuthRefresh": ""}'` on every Claude turn, and drops any `--settings` from
+  `peers.claude.args`. Managed (enterprise) settings outrank `--settings`. Peers also run with no
+  terminal and stdin closed. For refreshes that need no human, use an AWS `credential_process`
+  or Claude Code's `awsCredentialExport`.
+- **Another profile is another account.** Blocks are kept per harness and account, so a Claude
+  participant whose `CLAUDE_CODE_USE_BEDROCK`, `AWS_PROFILE`, `AWS_CONFIG_FILE`,
+  `AWS_SHARED_CREDENTIALS_FILE`, `CLAUDE_CONFIG_DIR` or `HOME` differs from `peers.claude`'s needs an `account` of its own (`agent-bus agents` shows each one's profile and region).
+
+How failures are handled:
+
+- **Expired or missing credentials** (`AUTH_REQUIRED`): Claude Code's `cloud_credential_error`, or
+  AWS's own wording (`ExpiredToken`, an invalid security token, an SSO session that's expired
+  or missing). The account is blocked until you clear it: no fresh-session retry or repair turn,
+  and no automatic resume. One notice says what to run, e.g.
+  `aws sso login --profile bedrock`, then `agent-bus resume <thread>`. The resume clears the
+  block and its turn is the re-check; `agent-bus agents --clear-quota claude` clears it too, and
+  any successful turn lifts it.
+- **A refused model or region** (`PEER_MISCONFIGURED`): Bedrock answers a wrong model id, a base
+  model id, a region that doesn't offer the inference profile, another account's profile and no
+  access to the model (`AccessDeniedException`) much alike, so the notice names the model and
+  region and lists all of these. No retry or repair turn. A discussion remembers it like format
+  drift: the peer isn't asked again, and if that leaves no path to consensus the discussion goes
+  to `needs_human`. Nothing is cached beyond the thread: fix the config and `agent-bus resume`. A
+  model set for one thread stays with it: cancel the thread and make a new request with a
+  corrected model (without the old thread id or previous head).
+- **Throttling** (`ThrottlingException`, HTTP 429): Claude Code already retries with backoff; when
+  its retries are spent agent-bus doesn't retry within the turn, it skips that model in that
+  region for a minute. **Quotas** (`ServiceQuotaExceededException`, "Too many tokens per day"): an
+  out-of-usage block for that model and region for `quota_cooldown_s`. Both work like
+  [Out of usage](#out-of-usage), scoped to `<model>@<region>`; other models and regions on the
+  same account keep working. With no `model` set, a configured `ANTHROPIC_MODEL` names the
+  model. These two were not captured live (it would take load on a billed
+  account): they follow AWS's documented wording.
+- **A region that doesn't resolve** retries until the turn times out; the retries show in
+  `agent-bus tail --events` as `api retry n/10`.
+
+Bedrock sends no subscription usage windows, so there are no near-limit warnings; token
+counts are still recorded. Cost reporting, Codex through a Bedrock model provider and pi are
+not covered yet.
+
 ## When a CLI changes
 
 agent-bus depends on each CLI's stream format, flags and hooks, and they change often. This was
@@ -547,7 +624,8 @@ rules:
   and `system` are reserved, and a built-in name must keep its own harness.
 - **Settings** a participant leaves out come from its harness's `peers.<harness>` entry
   (`command`, `args`, `model`, `effort`, `web_search`, `allow_mcp` for antigravity and
-  `codex_home` for codex).
+  `codex_home` for codex). `env` is merged variable by variable (see
+  [Running peers on Amazon Bedrock](#running-peers-on-amazon-bedrock)).
 - **Everywhere a name is used**, a participant name works: `ask --with codex,codex-mini`,
   `send(to=...)`, `start_discussion(peers=...)`, `request_review(reviewer=...)` and
   `reviewers=[...]`, `peer_settings` and `agents`. Each participant keeps its own
@@ -572,9 +650,9 @@ rules:
   `CODEX_HOME`.
 - **Isolation evidence** stays with the harness. Two participants share it only when the
   executable, the adapter recipe and the launch settings that affect isolation (args, MCP
-  and web settings, and `codex_home`) all match. Model and effort don't count.
+  and web settings, `codex_home` and `env`) all match. Model and effort don't count.
 - **Antigravity's MCP check** reads the default config directory. An antigravity participant
-  with its own `command` or `args` might load another one, so its turns are refused unless it
+  with its own `command`, `args` or `env` might load another one, so its turns are refused unless it
   sets `allow_mcp = true`.
 
 Existing configs and databases need no changes. Stored threads, messages and blocks use
