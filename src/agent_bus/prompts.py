@@ -113,7 +113,7 @@ Rules:
 Repository: {repo}
 Change: {change_id}
 Base commit: {base}
-Head commit: {head}{prev}
+Head commit: {head}{prev}{team}
 {focus}
 {diff_heading}
 ```diff
@@ -134,6 +134,8 @@ def render_message(m: dict) -> str:
         head += f" {m['data']['proposal_id']}"
     if m["kind"] == "vote":
         head += f" {m['data'].get('stance')} on {m['data'].get('on')}"
+    if m["kind"] == "review_verdict" and m["data"].get("head_commit_id"):
+        head += f" on head {str(m['data']['head_commit_id'])[:12]}"
     head += f"] round {m.get('round') or '-'}"
     if who == HUMAN:
         return f"{head} from the human user:\n{m['body']}"
