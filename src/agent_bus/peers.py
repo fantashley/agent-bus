@@ -40,6 +40,8 @@ class TurnResult:
     error: str | None = None
     timed_out: bool = False
     # Token counts from the CLI's own terminal usage report; a counter it didn't give is absent.
+    # For an adapter with ``session_usage`` they are the session's running total, not this
+    # turn's (the worker works out the turn's share).
     usage: dict | None = None
     # The CLI exited normally but its output lacked what agent-bus needs (a reply, a
     # session id): its format probably changed (issue #32, PEER_FORMAT_CHANGED).
@@ -50,6 +52,11 @@ class TurnResult:
     quota: dict | None = None
     # The CLI's stream explains why a normally exited turn produced no reply.
     incomplete: bool = False
+    # Set by the worker for a ``session_usage`` CLI: the session's running total, while
+    # ``usage`` becomes this turn's share of it (None when that isn't known).
+    session_usage: dict | None = None
+    # ``usage`` counts only the steps reported before the turn stopped without its final report.
+    partial_usage: bool = False
 
 
 @dataclass
@@ -67,6 +74,8 @@ class StreamState:
     error: str | None = None
     step_text: dict = field(default_factory=dict)  # per-step text, for clients that stream deltas
     usage: dict | None = None
+    step_usage: dict | None = None  # Antigravity: this run's steps' token counts, summed
+    resumed: bool = False  # this run resumed an existing session
     rate_limit: dict | None = None  # Claude's latest rate_limit_event info
     unknown: dict = field(default_factory=dict)  # event type -> count, for types the adapter doesn't know
     stray: int = 0  # non-JSON stdout lines (diagnostics), counted only
@@ -92,6 +101,9 @@ class Adapter:
     # of the model.  Searches run on the vendor's side, not from this machine.
     web_tools: str = "search and fetch pages"
     web_off_enforced: bool = True
+    # The CLI's usage report is the whole session's running total, so a resumed turn's own
+    # share is the difference from the session's previous report (issue #26).
+    session_usage: bool = False
 
     def event_type(self, obj: dict) -> str | None:
         t = obj.get("type")
@@ -153,7 +165,7 @@ class Adapter:
             inv = self.invocation(prompt, resume_id, cwd, add_dirs or [])
         except PeerSetupError as e:
             return TurnResult(ok=False, error=str(e))
-        st = StreamState(external_id=inv.external_id)
+        st = StreamState(external_id=inv.external_id, resumed=bool(resume_id))
         # Any agent-bus MCP server the peer CLI launches sees this and refuses every tool,
         # so a headless peer can't post, start jobs, or read blind proposals.
         env = {**os.environ, "AGENT_BUS_PEER": peer_tag}
@@ -233,9 +245,13 @@ class Adapter:
             emit("format", f"unrecognised {self.agent} stream events: "
                  + ", ".join(f"{k}×{n}" for k, n in sorted(st.unknown.items())[:10]))
         text = st.final if st.final is not None else "".join(st.text_parts)
+        # Steps that finished before a turn failed, timed out or ended without its result
+        # still used their tokens: kept, marked as a partial count.
+        partial = st.usage is None and st.step_usage is not None
+        st.usage = st.usage or st.step_usage
         if timed_out:
             return TurnResult(ok=False, text=text, external_id=st.external_id, error="turn timed out",
-                              timed_out=True)
+                              timed_out=True, usage=st.usage, partial_usage=partial)
         if rc != 0 or st.error:
             err = st.error or f"exit {rc}: {''.join(stderr_tail)[-800:]}"
             try:
@@ -244,7 +260,7 @@ class Adapter:
             except Exception:  # noqa: BLE001 - classification is best-effort
                 quota = None
             return TurnResult(ok=False, text=text, external_id=st.external_id, error=err, usage=st.usage,
-                              quota=quota)
+                              partial_usage=partial, quota=quota)
         # Exited normally: the reply and a session id to resume are both required.
         missing = [what for what, ok in (("a reply", text.strip()), ("a session id", st.external_id)) if not ok]
         # Only the reply missing: the stream itself may show why the turn stopped early.  A
@@ -252,13 +268,13 @@ class Adapter:
         why = self.incomplete(st) if missing == ["a reply"] else None
         if why:
             # No reply text at all: a whitespace-only response must not reach JSON repair.
-            return TurnResult(ok=False, text="", external_id=st.external_id, usage=st.usage, incomplete=True,
-                              error=f"PEER_TURN_INCOMPLETE: {self.agent} {why}")
+            return TurnResult(ok=False, text="", external_id=st.external_id, usage=st.usage,
+                              partial_usage=partial, incomplete=True, error=f"PEER_TURN_INCOMPLETE: {self.agent} {why}")
         if missing:
-            return TurnResult(ok=False, text=text, external_id=st.external_id, usage=st.usage, format_changed=True,
-                              error=f"PEER_FORMAT_CHANGED: {self.agent} exited normally without "
+            return TurnResult(ok=False, text=text, external_id=st.external_id, usage=st.usage,
+                              partial_usage=partial, format_changed=True, error=f"PEER_FORMAT_CHANGED: {self.agent} exited normally without "
                                     + " or ".join(missing))
-        return TurnResult(ok=True, text=text, external_id=st.external_id, usage=st.usage)
+        return TurnResult(ok=True, text=text, external_id=st.external_id, usage=st.usage, partial_usage=partial)
 
 
 def cli_identity(command: str, cwd: str | None = None) -> tuple[str, str] | None:
@@ -420,11 +436,11 @@ def usage_from(raw: object, keys: dict[str, str]) -> dict | None:
     return out or None
 
 
-def format_usage(u: dict | None) -> str:
+def format_usage(u: dict | None, label: str = "tokens") -> str:
     if not u:
         return ""
     names = (("input", "in"), ("output", "out"), ("cache_read", "cache"), ("thinking", "thinking"))
-    return " · tokens " + " ".join(f"{label} {u[k]}" for k, label in names if k in u)
+    return f" · {label} " + " ".join(f"{name} {u[k]}" for k, name in names if k in u)
 
 
 def _short(text: str, n: int = 240) -> str:
@@ -631,7 +647,7 @@ class ClaudeAdapter(Adapter):
 CLAUDE_USAGE = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cache_read_input_tokens",
                 "cache_write": "cache_creation_input_tokens"}
 CODEX_USAGE = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cached_input_tokens",
-               "thinking": "reasoning_output_tokens"}
+               "cache_write": "cache_write_input_tokens", "thinking": "reasoning_output_tokens"}
 AGY_USAGE = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cache_read_tokens",
              "thinking": "thinking_tokens"}
 
@@ -650,6 +666,9 @@ class CodexAdapter(Adapter):
     known_events = frozenset({"thread.started", "turn.started", "item.started", "item.updated", "item.completed",
                               "turn.completed", "turn.failed", "error"})
     default_command = cfg.AGENT_INFO["codex"]["cli"]
+    # `turn.completed.usage` after `exec resume` counts every turn of the session so far
+    # (codex 0.171.0, live probe 2026-11-23; tests/data/streams/codex-resume.jsonl too).
+    session_usage = True
 
     def mcp_servers(self, cwd: str) -> list[str]:
         """Live MCP servers as codex would load them in ``cwd`` (project config included).
@@ -886,6 +905,10 @@ class AntigravityAdapter(Adapter):
                     # agy reports how much it thought, not what: say that much, before the
                     # text it led to.
                     usage = su.get("usage") if isinstance(su.get("usage"), dict) else {}
+                    step = usage_from(usage, AGY_USAGE)
+                    if step:
+                        st.step_usage = {k: (st.step_usage or {}).get(k, 0) + step.get(k, 0)
+                                         for k in {*(st.step_usage or {}), *step}}
                     if usage.get("thinking_tokens"):
                         secs = su.get("duration_seconds")
                         emit("thinking", f"{usage['thinking_tokens']} thinking tokens"
@@ -908,7 +931,15 @@ class AntigravityAdapter(Adapter):
         elif ev == "result":
             res = obj.get("result") or {}
             st.external_id = res.get("conversation_id") or st.external_id
-            st.usage = usage_from(res.get("usage"), AGY_USAGE)
+            # result.usage counts every turn of the conversation (num_turns says how many;
+            # agy 1.5.13, live probe 2026-11-23), so this turn's share is the sum of its own
+            # model steps.  Without step counts the total is this turn's only on a first turn
+            # (num_turns may be missing, e.g. from an error result, so resuming decides).
+            # A failed result's steps may not all have reported: leave it to run() to keep
+            # the step sum as a partial count.
+            whole = (usage_from(res.get("usage"), AGY_USAGE)
+                     if not st.resumed and res.get("num_turns") in (None, 1) else None)
+            st.usage = (st.step_usage or whole) if res.get("status") in (None, "SUCCESS") else whole
             if res.get("status") not in (None, "SUCCESS"):
                 st.error = _short(f"status {res.get('status')}: {res.get('error') or ''}", 800)
             if isinstance(res.get("response"), str):

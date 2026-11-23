@@ -199,10 +199,33 @@ turns on it and tells you when it should be back. This was agreed on agent-bus t
   - `agent-bus resume <thread>` clears the cached block for that thread's peers before retrying;
   - `agent-bus agents --clear-quota <agent>` clears it everywhere, e.g. after a plan upgrade.
 - **Token use:** each `turn_end` progress line shows the turn's tokens (in, out, cache, thinking),
-  as far as the CLI reports them.
+  as far as the CLI reports them. The bus records them per agent and thread, and
+  `agent-bus usage` reports up to the last 90 days:
 
-Not yet: near-limit warnings, a usage history report, reading Codex's rollout files for its
-rate-limit windows, automatic retries after a reset, and lowering effort automatically.
+  ```sh
+  agent-bus usage                    # the last 24 hours, per agent and per thread
+  agent-bus usage --hours 168 --agent codex --json
+  agent-bus usage --thread t-1a2b3c
+  ```
+
+  Claude reports each turn's own tokens. Codex (`exec resume`) and Antigravity (a resumed
+  `--conversation`) report the whole session's running total instead, checked live on codex
+  0.171.0 and agy 1.5.13. So a Codex turn's share is the difference from the total its session
+  reported last time, and an Antigravity turn's is the sum of its own model steps. A Codex
+  session whose earlier total wasn't recorded gets only that total, shown as `session tokens so
+  far` and counted in the report as a turn with no count of its own. So does any turn whose
+  place in the session's order is in doubt: one after a turn that reported nothing, or that
+  overlapped another worker's turn (after a lease loss), and every later turn of a session
+  with a turn that never ended (its worker died before recording anything; that turn itself
+  isn't in the report). An Antigravity turn that stopped before its final report keeps what
+  its finished steps reported, counted as partial.
+
+  Rows older than 90 days are deleted as new turns are recorded. Rows with a CLI session go a
+  whole session at a time, once its latest turn is that old and none of its turns is still
+  unresolved, so an active session's older rows stay on disk (but out of reports).
+
+Not yet: near-limit warnings, reading Codex's rollout files for its rate-limit windows,
+automatic retries after a reset, and lowering effort automatically.
 
 ## When a CLI changes
 
