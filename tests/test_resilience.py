@@ -179,6 +179,185 @@ def test_non_string_session_id_is_not_pinned(env):
     assert res.format_changed and "without a session id" in res.error and res.external_id is None
 
 
+# --------------------- agy's headless denials are incomplete turns, not drift (t-606fcd)
+
+
+def agy_run(env, monkeypatch, behaviour, seen=None):
+    monkeypatch.setenv("FAKE_BEHAVIOUR", behaviour)
+    return adapter("antigravity", cfg.Config.load()).run(
+        "hi", str(env["repo"]), 30, (lambda k, t: seen.append((k, t))) if seen is not None else (lambda k, t: None))
+
+
+def test_agy_denied_command_is_an_incomplete_turn_not_drift(env, monkeypatch):
+    seen = []
+    res = agy_run(env, monkeypatch, "denied", seen)
+    assert not res.ok and not res.format_changed and res.incomplete
+    assert res.error.startswith("PEER_TURN_INCOMPLETE: antigravity")
+    assert "auto-denied 1 action(s)" in res.error and "give: command;" in res.error and "Bash" not in res.error
+    assert "failed tool(s): run_command" in res.error
+    assert "jj log" not in res.error  # names only, never arguments
+    assert res.external_id and res.usage == {"input": 12732, "output": 652, "cache_read": 0, "thinking": 366}
+    assert not [t for k, t in seen if k == "format"]  # every event was understood
+
+
+def test_agy_tool_left_without_an_end_state_is_incomplete(env, monkeypatch):
+    res = agy_run(env, monkeypatch, "unfinished")
+    assert res.incomplete and not res.format_changed
+    assert "unfinished: run_command" in res.error and "denied" not in res.error
+
+
+def test_agy_unexplained_missing_reply_is_still_drift(env, monkeypatch):
+    from agent_bus.peers import StreamState
+    for behaviour in ("silent", "toolerror"):  # no tools at all; a tool ERROR with no denial
+        res = agy_run(env, monkeypatch, behaviour)
+        assert res.format_changed and not res.incomplete and res.error.startswith("PEER_FORMAT_CHANGED"), behaviour
+    # A tool that looks unfinished among events we don't understand may just be unparsed.
+    ad = adapter("antigravity", cfg.Config.load())
+    st = StreamState(pending={2: "run_command"}, unknown={"brand_new_event": 1}, final="")
+    assert ad.incomplete(st) is None
+    # Without a recognised result carrying an explicitly blank response, nothing explains it:
+    # a missing result, or a response field whose type changed, may hide a new schema.
+    for final in (None, "answer"):
+        assert ad.incomplete(StreamState(pending={2: "run_command"}, final=final)) is None
+        assert ad.incomplete(StreamState(denied=["command"], final=final)) is None
+    assert ad.incomplete(StreamState(pending={2: "run_command"}, final=" \n"))
+
+
+def test_agy_denial_notice_carries_plain_names_only(env):
+    from agent_bus.peers import StreamState
+    ad = adapter("antigravity", cfg.Config.load())
+    st = StreamState()
+    ad.parse_line({"event": "step_update", "step_update": {
+        "step_type": "tool", "step_index": 1, "state": "ERROR", "tool_name": "run_command --rm"}}, st, lambda k, t: None)
+    ad.parse_line({"event": "result", "result": {"status": "SUCCESS", "response": "", "denied_actions": [
+        {"action": {"cmd": "rm -rf secret"}, "display_name": "Bash"},  # not a name: dropped
+        {"action": "command", "display_name": "db-prod.key"},          # free-form label: never shown
+        {"action": "rm -rf secret"},                                   # not a plain name: "?"
+    ]}}, st, lambda k, t: None)
+    why = ad.incomplete(st)
+    assert "rm" not in why and "secret" not in why and "db-prod" not in why
+    assert "auto-denied 2 action(s)" in why and "give: command, ?;" in why
+    assert "failed tool(s): ?" in why
+
+
+def test_agy_tool_state_tracking_tolerates_partial_frames(env):
+    from agent_bus.peers import StreamState
+    ad = adapter("antigravity", cfg.Config.load())
+    st = StreamState()
+    step = lambda **kw: ad.parse_line({"event": "step_update", "step_update": {  # noqa: E731
+        "step_type": "tool", "step_index": 2, **kw}}, st, lambda k, t: None)
+    step(state="ACTIVE", tool_name="run_command")
+    step()  # a frame with no state leaves the tool pending
+    assert st.pending == {2: "run_command"}
+    step(state="ERROR")  # the end frame omits the name: the ACTIVE frame's name is kept
+    assert st.pending == {} and st.failed_tools == {"run_command"}
+
+
+def test_agy_whitespace_only_denial_reaches_no_repair(env, no_spawn, monkeypatch):
+    bus = env["bus"]
+    res = agy_run(env, monkeypatch, "denied_blank")
+    assert res.incomplete and res.text == ""
+    tid = Service(bus, HUMAN).start_discussion("q", peers=["codex", "antigravity"], max_rounds=2)["thread"]["id"]
+    run_job(bus, tid)
+    msgs = bus.history(tid)["messages"]
+    assert not [m for m in msgs if m["sender"] == "antigravity"]  # no repaired proposal or vote
+    assert [m for m in msgs if m["sender"] == SYSTEM
+            and m["body"].startswith("antigravity could not take its turn: PEER_TURN_INCOMPLETE")]
+    agy = calls(env, "antigravity")
+    assert agy and not any("did not end with the JSON object" in c["prompt"] for c in agy)
+
+
+def test_preamble_offers_web_search_only_where_it_works(env, no_spawn):
+    t = {"id": "t-x", "participants": ["codex", "antigravity"], "initiator": HUMAN, "repo": "/r"}
+    w = Worker.__new__(Worker)
+    assert "search the web" in w.preamble("codex", t) and "search the web" in w.preamble("claude", t)
+    agy = w.preamble("antigravity", t)
+    assert "search the web" not in agy and "You may read files in /r if that helps you answer." in agy
+
+
+def test_agy_reply_after_a_denial_is_a_normal_turn(env, monkeypatch):
+    res = agy_run(env, monkeypatch, "denied_reply")
+    assert res.ok and not res.incomplete and not res.format_changed and res.error is None
+    assert '"action"' in res.text  # it answered from context after the denial
+
+
+def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
+    from agent_bus.prompts import AGY_HEADLESS
+    ad = adapter("antigravity", cfg.Config.load())
+    assert ad.recipe == "2" and "run_command" in AGY_HEADLESS and "web search" in AGY_HEADLESS
+    for resume_id in (None, "conv-1"):
+        argv = ad.invocation("PROMPT-BODY", resume_id, str(env["repo"]), []).argv
+        assert argv[-1] == AGY_HEADLESS + "PROMPT-BODY"
+        assert argv[argv.index("--mode") + 1] == "plan" and "--sandbox" in argv  # unchanged isolation
+    # Long prompts still go through a file, and both the file and the pointer carry the guidance.
+    scratch = env["tmp"] / "scratch"
+    scratch.mkdir()
+    big = "x" * 200_000
+    argv = ad.invocation(big, "conv-1", str(env["repo"]), [str(scratch)]).argv
+    assert argv[-1].startswith(AGY_HEADLESS) and "read_file" in argv[-1] and big not in argv[-1]
+    (written,) = scratch.glob("prompt-*.md")
+    assert written.read_text() == AGY_HEADLESS + big
+
+    # Through the worker: first and resumed turns are guided and recorded as recipe 2; other peers aren't.
+    monkeypatch.setenv("FAKE_BEHAVIOUR", "stubborn")  # every peer takes a round-2 turn
+    tid = Service(env["bus"], HUMAN).start_discussion("q", peers=["codex", "antigravity"], max_rounds=2)["thread"]["id"]
+    run_job(env["bus"], tid)
+    agy = calls(env, "antigravity")
+    assert len(agy) >= 2 and "--conversation" in agy[-1]["argv"]
+    assert all(c["prompt"].startswith(AGY_HEADLESS) for c in agy)
+    assert not any(AGY_HEADLESS.strip() in c["prompt"] for c in calls(env, "codex"))
+    starts = [e["text"] for e in env["bus"]._all(
+        "SELECT * FROM events WHERE thread_id=? AND kind='turn_start' AND agent='antigravity'", tid)]
+    assert starts and all("recipe antigravity/2" in s for s in starts)
+
+
+def test_incomplete_agy_discussion_turn_is_reported_without_a_drift_notice(env, no_spawn, monkeypatch):
+    bus = env["bus"]
+    monkeypatch.setenv("FAKE_BEHAVIOUR", "denied")  # codex replies normally
+    tid = Service(bus, HUMAN).start_discussion("q", peers=["codex", "antigravity"], max_rounds=2)["thread"]["id"]
+    run_job(bus, tid)
+    msgs = bus.history(tid)["messages"]
+    system = [m["body"] for m in msgs if m["sender"] == SYSTEM]
+    assert not [b for b in system if "PEER_FORMAT_CHANGED" in b]
+    assert [b for b in system if b.startswith("antigravity could not take its turn: PEER_TURN_INCOMPLETE")]
+    assert not [m for m in msgs if m["sender"] == "antigravity"]  # nothing made to look like a reply
+    assert bus.peer_session(tid, "antigravity") is None  # a first turn that stopped early isn't pinned
+
+
+def test_incomplete_agy_review_keeps_its_session_without_a_fresh_retry(env, no_spawn, monkeypatch):
+    bus = env["bus"]
+    monkeypatch.setattr("agent_bus.worker.Worker.review_diff", lambda self, refs, interdiff: ("diff", "Diff"))
+    me = Service(bus, "claude", bus.register_session("claude", env={}))
+    tid = me.request_review("antigravity", str(env["repo"]), BASE, HEAD)["thread"]["id"]
+    run_job(bus, tid)  # a normal first pass pins a session
+    sid = bus.peer_session(tid, "antigravity")
+    assert sid
+    monkeypatch.setenv("FAKE_BEHAVIOUR", "denied")
+    me.request_review("antigravity", str(env["repo"]), BASE, "c" * 40, prev_head_commit_id=HEAD)
+    before = len(calls(env, "antigravity"))
+    run_job(bus, tid)
+    assert bus.thread(tid)["status"] == "needs_human"
+    assert len(calls(env, "antigravity")) == before + 1  # a fresh session would stop the same way
+    assert bus.peer_session(tid, "antigravity") == sid
+    bodies = [m["body"] for m in bus.history(tid)["messages"] if m["sender"] == SYSTEM]
+    assert any("PEER_TURN_INCOMPLETE" in b for b in bodies)
+    assert not any("PEER_FORMAT_CHANGED" in b for b in bodies)
+
+
+def test_incomplete_agy_repair_reports_the_denial(env, no_spawn, monkeypatch):
+    bus = env["bus"]
+    monkeypatch.setenv("FAKE_BEHAVIOUR", "nojson")
+    monkeypatch.setenv("FAKE_AGY_DENIED_REPAIR", "1")
+    monkeypatch.setattr("agent_bus.worker.Worker.review_diff", lambda self, refs, interdiff: ("diff", "Diff"))
+    me = Service(bus, "claude", bus.register_session("claude", env={}))
+    tid = me.request_review("antigravity", str(env["repo"]), BASE, HEAD)["thread"]["id"]
+    run_job(bus, tid)
+    msgs = bus.history(tid)["messages"]
+    assert bus.thread(tid)["status"] == "needs_human"
+    assert any("PEER_TURN_INCOMPLETE" in m["body"] for m in msgs if m["sender"] == SYSTEM)
+    assert not any(m["kind"] == "review_verdict" for m in msgs)
+
+
 def test_aliases_of_one_binary_are_probed_separately(env, no_spawn):
     bus = env["bus"]
     real = cfg.Config.load().peer_command("codex")

@@ -12,6 +12,10 @@ Behaviour is driven by env vars so tests can script outcomes:
                   FAKE_SILENT_REPAIR=agents does the same only on a repair turn, and
                   FAKE_STRAY adds a non-JSON stdout line
   FAKE_BEHAVIOUR=newevents  also emit event types no adapter knows
+  FAKE_BEHAVIOUR=denied  (antigravity) agy's headless auto-denial of run_command: exit 0, no
+                  reply, denied_actions in the result.  denied_reply: the same, then a reply;
+                  denied_blank: a whitespace-only response; unfinished: the tool never reaches an end
+                  state; toolerror: ERROR, no denial
   FAKE_MCP_LIST   what `codex mcp list --json` prints
 Round-1 prompts get a proposal; later prompts agree with the lowest proposal id
 mentioned (or object, for `stubborn`).
@@ -125,6 +129,35 @@ if behaviour == "silent" or (repair and listed("FAKE_SILENT_REPAIR")):
         out({"event": "init", "conversation_id": sid})
     if os.environ.get("FAKE_STRAY"):
         print("warning: something unstructured", flush=True)
+    sys.exit(0)
+if agent == "antigravity" and repair and os.environ.get("FAKE_AGY_DENIED_REPAIR"):
+    behaviour = "denied"
+if agent == "antigravity" and behaviour in ("denied", "denied_reply", "denied_blank", "unfinished", "toolerror"):
+    # The headless denial agy 1.5.13 sends in plan mode with --sandbox (live probe,
+    # 2026-11-23): run_command goes ACTIVE then ERROR, the result is SUCCESS with an empty
+    # response and lists denied_actions, exit 0.  Variants: denied_reply also answers from
+    # context; denied_blank's response is whitespace only; unfinished leaves the tool with
+    # no end state; toolerror has no denial.
+    su = lambda **kw: out({"event": "step_update", "step_update": {"conversation_id": sid, **kw}})  # noqa: E731
+    tool = {"step_type": "tool", "tool_name": "run_command",
+            "tool_info": {"name": "run_command", "parameters": {"CommandLine": "jj log"}}}
+    out({"event": "init", "conversation_id": sid, "init": {"permission_mode": "request-review"}})
+    su(step_index=0, state="DONE", step_type="user_input")
+    su(step_index=1, state="DONE", step_type="agent_response",
+       usage={"input_tokens": 12732, "output_tokens": 652, "thinking_tokens": 366, "cache_read_tokens": 0})
+    su(step_index=2, state="ACTIVE", **tool)
+    if behaviour != "unfinished":
+        su(step_index=2, state="ERROR", **tool)
+    response = "  \n" if behaviour == "denied_blank" else ""
+    if behaviour == "denied_reply":
+        response = reply
+        su(step_index=3, state="ACTIVE", step_type="agent_response", text_delta=reply)
+        su(step_index=3, state="DONE", step_type="agent_response")
+    res = {"conversation_id": sid, "status": "SUCCESS", "response": response,
+           "usage": {"input_tokens": 12732, "output_tokens": 652, "thinking_tokens": 366, "cache_read_tokens": 0}}
+    if behaviour.startswith("denied"):
+        res["denied_actions"] = [{"action": "command", "display_name": "Bash"}]
+    out({"event": "result", "result": res})
     sys.exit(0)
 if behaviour == "newevents":
     out({"type": "brand_new_event"} if agent != "antigravity" else {"event": "brand_new_event"})

@@ -25,7 +25,7 @@ from typing import Iterator
 from . import config as cfg
 from . import prompts, quota
 from .db import HUMAN, SYSTEM, Bus, BusError
-from .peers import TurnResult, adapter, cli_version, extract_json, format_usage
+from .peers import ADAPTERS, TurnResult, adapter, cli_version, extract_json, format_usage
 
 LEASE_S = 120
 
@@ -213,9 +213,10 @@ class Worker:
                      cancelled=self.cancelled, peer_tag=tag)
         # A fresh session can't fix running out of usage; it would only spend more.  Check
         # again first: another worker may have found this agent out of usage meanwhile.
-        # Nor can it fix a changed output format.
+        # Nor can it fix a changed output format, or a turn the CLI stopped partway through
+        # (it would stop the same way, and the working conversation would be dropped).
         if (not res.ok and resume_id and not res.timed_out and not res.quota and not res.format_changed
-                and not self.cancelled()):
+                and not res.incomplete and not self.cancelled()):
             block = self.bus.quota_block(agent, quota.model_key(model))
             if block:
                 self.event("turn_end", f"failed: {res.error}" + format_usage(res.usage), agent)
@@ -237,6 +238,11 @@ class Worker:
             self.format_notice(agent, version, res.error or "")
             if resume_id:
                 self.set_peer_session(agent, resume_id)
+            return res
+        if res.incomplete:
+            # An ordinary failure the callers report on the thread, not drift.  Keep any
+            # pinned conversation, but don't pin a first turn's conversation that stopped
+            # early: the next turn's fresh prompt restates everything.
             return res
         if res.ok:
             # Newer evidence: it has usage again (account-wide, and for this model).
@@ -295,9 +301,11 @@ class Worker:
 
     def preamble(self, agent: str, t: dict) -> str:
         repo_note = f" in {t['repo']}" if t["repo"] else ""
+        web = ADAPTERS[agent].web_search if agent in ADAPTERS else True
         return prompts.PREAMBLE.format(
             agent=agent, thread=t["id"], participants=", ".join(t["participants"]),
-            initiator="the human user" if t["initiator"] == HUMAN else t["initiator"], repo_note=repo_note)
+            initiator="the human user" if t["initiator"] == HUMAN else t["initiator"], repo_note=repo_note,
+            web_note=" and search the web" if web else "")
 
     def question(self, t: dict) -> str:
         """The question, fenced as peer data when an agent (not the human user) asked it."""
@@ -456,6 +464,10 @@ class Worker:
         res = self.turn(agent, prompt, resume=resume, fresh_prompt=fresh_prompt)
         if res.quota or res.format_changed:
             return  # noticed in turn(); no cursor move, no repair, no partial vote
+        if res.incomplete:
+            # Stopped partway with no reply: report it, and never repair or post a move.
+            self.system(f"{agent} could not take its turn: {res.error}")
+            return
         if delivered_upto is not None and (res.ok or res.text):
             self.mark_delivered(agent, delivered_upto)
         if not res.ok and not res.text:
@@ -469,6 +481,9 @@ class Worker:
             res2 = self.turn(agent, repair, fresh_prompt=(fresh_prompt or prompt) + "\n\n" + repair)
             if res2.quota or res2.format_changed:
                 return  # out of usage or format drift mid-repair: post nothing from either attempt
+            if res2.incomplete:
+                self.system(f"{agent} could not repair its reply: {res2.error}")
+                return
             action = extract_json(res2.text) if res2.text else None
         if not self.valid_action(action, blind):
             self.safe_post(agent, res.text.strip()[:20000] or "(empty reply)", kind="message",
@@ -596,6 +611,8 @@ class Worker:
             if res2.quota or res2.format_changed:
                 self.finish_thread("needs_human")
                 return
+            if res2.incomplete:
+                res = res2
             verdict = normalize_verdict(extract_json(res2.text) if res2.text else None)
         if verdict is None:
             if self.finish_thread("needs_human"):
