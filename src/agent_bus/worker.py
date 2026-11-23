@@ -277,7 +277,7 @@ class Worker:
         drift = self.bus.peer_drift(self.thread_id).get(agent)
         if drift:
             return self.drifted(agent, drift)
-        ad = adapter(agent, self.config, settings)
+        ad = adapter(agent, self.config, settings, repo=t["repo"])
         resume_id = self.bus.peer_session(self.thread_id, agent) if resume else None
         timeout = max(30.0, min(self.config.turn_timeout_s, self.deadline_left()))
         shown = "".join(f" · {k} {v}" for k, v in settings.items())
@@ -446,7 +446,7 @@ class Worker:
 
     def preamble(self, agent: str, t: dict) -> str:
         repo_note = f" in {t['repo']}" if t["repo"] else ""
-        web = adapter(agent, self.config).web_search  # as the turn itself resolves it
+        web = adapter(agent, self.config, repo=t["repo"]).web_search  # as the turn itself resolves it
         return prompts.PREAMBLE.format(
             agent=agent, thread=t["id"], participants=", ".join(t["participants"]),
             initiator="the human user" if t["initiator"] == HUMAN else t["initiator"], repo_note=repo_note,

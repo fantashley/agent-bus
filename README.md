@@ -126,16 +126,18 @@ else stays read-only:
 |---|---|---|---|
 | Claude Code | WebSearch, WebFetch | `--tools` (the session's whole built-in set) and `--allowedTools` | removed and `--disallowedTools` |
 | Codex | hosted `web_search`: search and open pages | `-c web_search="cached"`, unless `peers.codex.args` sets another mode | `-c web_search="disabled"` (also when `peers.codex.args` sets it) |
-| Antigravity | `search_web` only: plan mode has no page fetch | needs no approval in plan mode | **instruction only** |
+| Antigravity | `search_web` only: plan mode has no page fetch | needs no approval in plan mode | the turn's agent (`--agent`) has no `search_web` |
 
 To turn it off for an agent, set `peers.<agent>.web_search = false` in `config.json` (or
-`local.agentBus.peerSettings.<agent>.web_search = false`). The preamble then stops offering it.
-agy 1.5.13 has no flag or permission rule that removes `search_web` (`search_web(*)` and
-`read_url(*)` deny rules are ignored), so for Antigravity the off switch only tells the model
-not to use it, and a review or discussion with it can't be guaranteed web-free. `agent-bus
-agents` shows each peer's web search, and says when off isn't enforced. agent-bus's switch
-decides Codex's mode, so a `web_search` in `~/.codex/config.toml` doesn't apply to peers. A
-per-repo switch isn't there yet.
+`local.agentBus.peerSettings.<agent>.web_search = false`). To turn it off for every agent in a
+repo, make its `repos` entry an object: `{"path": "~/work", "web_search": false}` (or the same
+attrset in `local.agentBus.repos`). A repo entry can only turn search off, so if any entry
+covering a repo (itself or a parent directory) says false, it's off there. Discussions without
+a repo follow the per-agent setting. The preamble then stops offering it. agy 1.5.13 has no
+flag or deny rule for `search_web` (`search_web(*)` and `read_url(*)` rules are ignored), but
+the custom agent each turn runs as lists its tools, and leaves `search_web` out (issue #54).
+`agent-bus agents` shows each peer's web search, and the repos where it's off. agent-bus's
+switch decides Codex's mode, so a `web_search` in `~/.codex/config.toml` doesn't apply to peers.
 
 Where the requests go: Claude's WebSearch and Codex's `web_search` (searching and opening
 pages) run on Anthropic's and OpenAI's side, and agy's `search_web` is Google-grounded search
@@ -149,15 +151,28 @@ and agy 1.5.13:
 - **Codex:** the read-only sandbox blocks writes and shell network access (`touch` fails with a
   read-only file system, `curl` can't resolve hosts). The `apps` feature is turned off because
   it adds a `codex_apps` MCP server, which `codex mcp list` doesn't show, with tools such as
-  plugin management and site publishing. `features.apps=false` and the web search mode come
-  after `peers.codex.args`, so a later `-c` can't undo them. The MCP listing that decides which
+  plugin management and site publishing. `goals` (goal state that outlives the turn),
+  `image_generation` (writes images outside the sandbox) and `tool_suggest` (plugin installs)
+  are off too. The sandbox and approval modes, these features and the web search mode come
+  after `peers.codex.args`, so a later `-c` can't undo them, and `-s`/`--sandbox`,
+  `--dangerously-bypass-approvals-and-sandbox`, `--approve-for-me`, the hidden `--yolo` and
+  `--not-so-yolo`, `--worktree` (creates a git
+  worktree) and `--trust` (saves project trust) there are dropped. The
+  collaboration tools (`spawn_agent` and friends) stay: nothing switches them off, and a spawned
+  agent runs in the same read-only sandbox. The MCP listing that decides which
   servers to switch off sees every `-c`/`--config` spelling and `--profile` from those args.
 - **Antigravity:** every turn passes `--settings` with deny rules for `command(*)`,
   `write_file(*)` (which covers edits) and `execute_url(*)` (the browser subagent). Deny wins over
   any allow rule in your own settings, so a `--settings` in `peers.antigravity.args` is dropped.
   Without these rules, plan mode writes files without asking under the system temp directory,
   and a terminal command is auto-denied and ends the turn with no reply. With them, either one
-  is a tool error the model answers past.
+  is a tool error the model answers past. Sub-agents inherit the rules. Each turn also runs as
+  a custom agent (`--agent`, defined under `~/.local/state/agent-bus/antigravity-agent`, which
+  goes in with `--add-dir`) whose tools are `read_file` and, when search is on, `search_web`.
+  That removes `invoke_subagent`, `swarm`, `schedule`, `run_workflow`, `send_message` and the
+  rest: no deny rule covers them, and a sub-agent in a "branch" workspace creates a branch and
+  a git worktree in the reviewed repo. An `--agent` (or `-agent`: agy takes single-dash flags too) in `peers.antigravity.args`
+  is dropped, and so is `-settings`.
 
 Pages a peer reads are untrusted. A peer's reply already reaches you and the other agents as
 `peer_data`, and a peer can't write files, use the network from a shell, or run commands at
@@ -166,7 +181,7 @@ are denied). Text a page injects can still steer both what the peer says and wha
 or fetches next. Web tools are an outbound path:
 a search query or a fetched URL can carry whatever the peer has read, including private code
 in a review, to the search provider or to the site it names. If that matters for an agent, turn
-its web search off (for Antigravity that's only an instruction).
+its web search off, or turn it off for the repo.
 
 ## Out of usage
 

@@ -117,7 +117,8 @@ class Adapter:
         t = obj.get("type")
         return t if isinstance(t, str) else None
 
-    def __init__(self, config: Config, settings: dict | None = None, participant: str | None = None):
+    def __init__(self, config: Config, settings: dict | None = None, participant: str | None = None,
+                 repo: str | None = None):
         self.config = config
         self.participant = participant or self.agent
         if config.harness_of(self.participant) != self.agent:
@@ -126,7 +127,8 @@ class Adapter:
         self.command = config.peer_command(self.participant, self.default_command)
         self.extra = config.peer_args(self.participant)
         self.settings = settings or {}  # validated {model, effort}; see Config.peer_settings
-        self.web_search = config.web_search(self.participant)
+        # Off for the participant, or for the allow-listed repo the turn runs in (#46, #54).
+        self.web_search = config.web_search(self.participant, repo)
 
     def launch_fingerprint(self, cwd: str | None = None) -> str | None:
         """What isolation evidence for a turn of this participant must match (#32, #43):
@@ -562,6 +564,10 @@ def _drop_codex_feature(args: list[str], feature: str) -> list[str]:
         if a == "--":
             out.extend(args[i:])
             break
+        if a in ("-c", "--config"):  # its value is a value, whatever it looks like
+            out.extend(args[i : i + 2])
+            i += 2
+            continue
         if a == "--enable" and i + 1 < len(args) and args[i + 1] == feature:
             i += 2
             continue
@@ -574,18 +580,54 @@ def _drop_codex_feature(args: list[str], feature: str) -> list[str]:
 
 
 def _codex_overrides(args: list[str]) -> list[str]:
-    """The values of every ``-c``/``--config`` override in a codex argv slice."""
+    """The values of every ``-c``/``--config`` override in a codex argv slice.  A separate
+    value is consumed with its flag, so one like ``--`` or ``-cx=1`` is never read as a flag."""
     out: list[str] = []
-    for i, a in enumerate(args):
+    i = 0
+    while i < len(args):
+        a = args[i]
         if a == "--":
             break
         if a in ("-c", "--config"):
             if i + 1 < len(args):
                 out.append(args[i + 1])
-        elif a.startswith("--config="):
+            i += 2
+            continue
+        if a.startswith("--config="):
             out.append(a.split("=", 1)[1])
         elif a.startswith("-c") and len(a) > 2 and not a.startswith("--"):
             out.append(a[3:] if a.startswith("-c=") else a[2:])
+        i += 1
+    return out
+
+
+def _codex_options_end(args: list[str]) -> int:
+    """Where a codex argv slice's options end: its first ``--`` that isn't a ``-c`` value."""
+    i = 0
+    while i < len(args):
+        if args[i] == "--":
+            return i
+        i += 2 if args[i] in ("-c", "--config") else 1
+    return len(args)
+
+
+def _drop_bool_flags(args: list[str], flags: set[str]) -> list[str]:
+    """Remove valueless ``flags`` from an argv slice, up to a ``--``.  A ``-c``/``--config``
+    value is skipped with its flag, so it is never mistaken for one."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            out.extend(args[i:])
+            break
+        if a in ("-c", "--config"):
+            out.extend(args[i : i + 2])
+            i += 2
+            continue
+        if a not in flags:
+            out.append(a)
+        i += 1
     return out
 
 
@@ -600,6 +642,10 @@ def _codex_split_profile(args: list[str]) -> tuple[list[str], list[str]]:
         if a == "--":
             rest.extend(args[i:])
             break
+        if a in ("-c", "--config"):
+            rest.extend(args[i : i + 2])
+            i += 2
+            continue
         if a in ("-p", "--profile") and i + 1 < len(args):
             profile, i = ["--profile", args[i + 1]], i + 2
             continue
@@ -775,11 +821,37 @@ _AGY_QUOTA = (r"quota reached", r"quota (?:exceeded|exhausted|has been exhausted
 _CODEX_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
 
+# Codex features switched off for every headless turn, after the configured args so they
+# can't turn one back on (codex 0.171.0, live probes 2026-11-23):
+# - apps: a codex_apps MCP server that `codex mcp list` doesn't show and the read-only sandbox
+#   doesn't cover (plugin management, site publishing and more; issue #46).
+# - goals: create_goal/update_goal keep a goal on the thread that outlives the turn.
+# - image_generation: image_gen makes an image and saves it outside the sandbox's reach.
+# - tool_suggest: request_plugin_install, which installs a plugin into ~/.codex.  It wasn't
+#   declared in the probes once apps was off, so this is belt and braces.
+# Left on: the collaboration tools (spawn_agent, send_message, ...).  No switch removes them
+# (features.multi_agent and multi_agent_v2 = false don't: the model's catalog entry picks
+# multi-agent v2), and a spawned agent is a thread of the same process with the same config:
+# a probe's sub-agent got `Read-only file system` for `touch`.  They can't act outside the
+# sandbox; they only cost tokens.
+CODEX_FEATURES_OFF = ("apps", "goals", "image_generation", "tool_suggest")
+# Flags that pick a sandbox or approval mode themselves, so they'd beat our `-c` overrides,
+# and ones that change the repo or codex's own state outside the sandbox: --worktree creates
+# a managed git worktree, and --trust saves trust for the project (MCP commands included).
+# --yolo and --not-so-yolo are hidden aliases codex exec 0.171.0 accepts; it doesn't take
+# abbreviated long flags (`--dangerously` is rejected).
+_CODEX_SANDBOX_FLAGS = {"-s", "--sandbox"}
+_CODEX_SANDBOX_BOOL_FLAGS = {"--dangerously-bypass-approvals-and-sandbox", "--yolo", "--not-so-yolo",
+                             "--approve-for-me", "--worktree", "--trust"}
+
+
 class CodexAdapter(Adapter):
     agent = "codex"
     # 2: the `apps` feature (its codex_apps MCP server) is switched off, and web search can be
     # (issue #46).
-    recipe = "2"
+    # 3: goals, image_generation and tool_suggest off too; the sandbox and approval overrides
+    # come after the configured args, whose own sandbox flags are dropped (issue #54).
+    recipe = "3"
     known_events = frozenset({"thread.started", "turn.started", "item.started", "item.updated", "item.completed",
                               "turn.completed", "turn.failed", "error"})
     default_command = cfg.AGENT_INFO["codex"]["cli"]
@@ -819,8 +891,9 @@ class CodexAdapter(Adapter):
         return sorted({d["name"] for d in data
                        if isinstance(d, dict) and isinstance(d.get("name"), str) and d.get("enabled", True)})
 
-    def __init__(self, config: Config, settings: dict | None = None, participant: str | None = None):
-        super().__init__(config, settings, participant)
+    def __init__(self, config: Config, settings: dict | None = None, participant: str | None = None,
+                 repo: str | None = None):
+        super().__init__(config, settings, participant, repo)
         # A web_search="disabled" in peers.codex.args turns search off for the preamble and
         # the report too, so they say what the turn will really have.
         modes = [_codex_value(o) for o in _codex_overrides(self.extra) if _config_key(o) == "web_search"]
@@ -836,8 +909,9 @@ class CodexAdapter(Adapter):
         return args
 
     def extra_args(self) -> list[str]:
-        # apps stays off: a features table is kept, and the final -c features.apps=false wins.
-        flags, keys = set(), {"features.apps"}
+        # These features stay off: a features table is kept, and the final -c features.X=false
+        # wins.  So do the sandbox and approval modes: flags that set them are dropped.
+        flags, keys = set(_CODEX_SANDBOX_FLAGS), {f"features.{f}" for f in CODEX_FEATURES_OFF}
         if self.settings.get("model"):
             flags |= {"-m", "--model"}
             keys.add("model")
@@ -845,7 +919,10 @@ class CodexAdapter(Adapter):
             keys.add("model_reasoning_effort")
         if not self.web_search:
             keys.add("web_search")
-        return _drop_codex_feature(_strip_flags(self.extra, flags, keys), "apps")
+        out = _drop_bool_flags(_strip_flags(self.extra, flags, keys), _CODEX_SANDBOX_BOOL_FLAGS)
+        for feature in CODEX_FEATURES_OFF:
+            out = _drop_codex_feature(out, feature)
+        return out
 
     def invocation(self, prompt, resume_id, cwd, add_dirs):
         # `apps` (on by default in 0.171.0) adds a codex_apps MCP server that `codex mcp list`
@@ -853,13 +930,14 @@ class CodexAdapter(Adapter):
         # offered plugin management, site publishing and more.  Web search is codex's hosted
         # tool (search and open_page, run by OpenAI), on by default ("cached" in a read-only
         # sandbox); off sets web_search="disabled" (issue #46).
-        common = ["--json", "--skip-git-repo-check", "-c", 'sandbox_mode="read-only"',
-                  "-c", 'approval_policy="never"']
+        common = ["--json", "--skip-git-repo-check"]
         common += self.setting_args()
         extra = self.extra_args()
         # After the configured args, since a later -c wins (a features table, or a server
         # table, merges with it or would replace an earlier dotted key).
-        last = ["-c", "features.apps=false"]
+        last = ["-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"']
+        for feature in CODEX_FEATURES_OFF:
+            last += ["-c", f"features.{feature}=false"]
         # The read-only sandbox doesn't cover MCP side effects, so switch every server off.
         for name in self.mcp_servers(cwd):
             # `-c` takes a dotted path with bare keys: a quoted key names a *different*
@@ -877,7 +955,7 @@ class CodexAdapter(Adapter):
         elif not any(_config_key(o) == "web_search" for o in _codex_overrides(extra)):
             last += ["-c", 'web_search="cached"']
         # ...but before a `--`, after which everything is positional.
-        cut = extra.index("--") if "--" in extra else len(extra)
+        cut = _codex_options_end(extra)
         extra = extra[:cut] + last + extra[cut:]
         # A profile goes before `exec`: `exec resume` rejects --profile (codex 0.171.0).
         profile, extra = _codex_split_profile(extra)
@@ -957,12 +1035,26 @@ class AntigravityAdapter(Adapter):
     agent = "antigravity"
     # 2: headless tool guidance in every prompt; denied actions reported as an incomplete turn.
     # 3: deny rules for commands and file writes; the guidance offers web search (issue #46).
-    recipe = "3"
+    # 4: a custom main agent whose tool list is the whole inventory (issue #54).
+    recipe = "4"
     # agy 1.5.13 in plan mode declares search_web (Google-grounded search, run server side) but
-    # no page fetch, and no permission rule or flag switches search_web off (live probes,
-    # 2026-11-23): `search_web(*)` and `read_url(*)` deny rules are ignored.
+    # no page fetch.  `search_web(*)` and `read_url(*)` deny rules are ignored, but a custom
+    # agent's `tools` list removes it (live probes, 2026-11-23): see peer_agent.
     web_tools = "search only (plan mode has no page fetch)"
-    web_off_enforced = False
+    # The tools a headless turn's agent gets.  Plan mode on its own also declares write_file,
+    # edit_file, run_command, ask_question, define_subagent, invoke_subagent,
+    # manage_subagents, send_message, schedule, run_workflow and swarm (agy 1.5.13, live
+    # probes 2026-11-23).  The deny rules stop the writes and commands, and a sub-agent
+    # inherits them (a probe's sub-agent got "Matches user-configured deny rule" for
+    # write_file), but no rule covers the orchestration tools, and they act outside the turn:
+    # invoke_subagent with a "branch" workspace created a branch and a git worktree in the
+    # reviewed repo (under ~/src too); swarm workers get working copies the same way;
+    # schedule sets timers and cron jobs (IsDaemon ones keep firing after the task);
+    # run_workflow runs a Python orchestration script.  An agent's `tools` list is the whole
+    # inventory apart from manage_task (background tasks of this conversation, none of which
+    # can start without run_command) and the MCP tools (agent-bus only, see check_isolation).
+    agent_tools = ("read_file",)
+    web_tool_names = ("search_web",)
     # Session-only permission rules (Deny wins over any Allow or Ask, in agy's own settings
     # too).  Without them a command is auto-denied as needing approval and the turn ends with
     # no reply; with them it is a tool error the model answers past.  write_file also covers
@@ -1011,17 +1103,44 @@ class AntigravityAdapter(Adapter):
                 f"Antigravity has MCP servers configured ({', '.join(sorted(live))}) that a headless peer "
                 "can't be isolated from. Remove them, or set peers.antigravity.allow_mcp = true to accept that.")
 
+    def peer_agent(self) -> tuple[str, str]:
+        """(name, directory) of the custom agent a headless turn runs as: plan mode with only
+        ``agent_tools`` (and search_web while web search is on).  agy finds an agent in the
+        ``.agents/agents`` of a workspace directory, so the directory goes in with --add-dir.
+        It holds nothing but agent-bus's own definitions.  A same-named agent in the reviewed
+        repo's .agents doesn't win over it (live probe, agy 1.5.13), and an unknown --agent
+        name fails the turn ("unknown agent") rather than falling back to the default."""
+        tools = list(self.agent_tools) + (list(self.web_tool_names) if self.web_search else [])
+        name = f"agent-bus-peer-{'web' if self.web_search else 'noweb'}"
+        base = cfg.state_dir() / "antigravity-agent"
+        agents = base / ".agents" / "agents"
+        agents.mkdir(parents=True, exist_ok=True, mode=0o700)
+        text = (f"---\nname: {name}\ndescription: agent-bus headless read-only peer\nmainAgent: true\n"
+                f"subagent: false\ntools: [{', '.join(tools)}]\n---\n"
+                "You are a headless, read-only peer in an agent-bus discussion or review. Follow the "
+                "instructions in the user's message.\n")
+        path = agents / f"{name}.md"
+        if not path.exists() or path.read_text() != text:
+            tmp = agents / f".{name}.{new_uuid()}.tmp"
+            tmp.write_text(text)
+            os.replace(tmp, path)  # atomic: a concurrent turn reads the old or new file whole
+        return name, str(base)
+
     def invocation(self, prompt, resume_id, cwd, add_dirs):
         self.check_isolation()
+        name, agent_dir = self.peer_agent()
         argv = [self.command, "--mode", "plan", "--sandbox", "--output-format", "stream-json",
-                "--settings", json.dumps({"permissions": {"deny": list(self.deny_rules)}})]
+                "--settings", json.dumps({"permissions": {"deny": list(self.deny_rules)}}),
+                "--agent", name, "--add-dir", agent_dir]
         for d in add_dirs:
             argv += ["--add-dir", d]
         if resume_id:
             argv += ["--conversation", resume_id]
         argv += self.setting_args()
-        # Our --settings carries the deny rules: one in the configured args could replace it.
-        argv += _strip_flags(self.extra_args(), {"--settings"})
+        # Our --settings carries the deny rules, and our --agent the tool list: one in the
+        # configured args could replace them.  agy parses flags Go-style, so a single dash works
+        # as well as two (`-agent x`, `-settings=...`).
+        argv += _strip_flags(self.extra_args(), {"--settings", "-settings", "--agent", "-agent"})
         # Every turn, resumed or not, says which tools work unattended (recipe 2).
         guide = AGY_HEADLESS if self.web_search else AGY_HEADLESS_NO_WEB
         prompt = guide + prompt
@@ -1160,19 +1279,25 @@ def _agy_hint(params) -> str:
 ADAPTERS = {a.agent: a for a in (ClaudeAdapter, CodexAdapter, AntigravityAdapter)}
 
 
-def adapter(agent: str, config: Config, settings: dict | None = None) -> Adapter:
-    """The adapter for a turn of participant ``agent``: its harness's, with its launch settings."""
+def adapter(agent: str, config: Config, settings: dict | None = None, repo: str | None = None) -> Adapter:
+    """The adapter for a turn of participant ``agent``: its harness's, with its launch settings
+    (and the web search switch of the allow-listed ``repo`` it runs in, if any)."""
     harness = config.participant(agent).harness
-    return ADAPTERS[harness](config, settings, participant=agent)
+    return ADAPTERS[harness](config, settings, participant=agent, repo=repo)
 
 
 def web_search_report(agent: str, config: Config) -> dict:
-    """What a headless turn of ``agent`` gets for web search, for `agent-bus agents` (#46)."""
+    """What a headless turn of ``agent`` gets for web search, for `agent-bus agents` (#46):
+    on or off for the participant, and the allow-listed repos that turn it off (#54)."""
     cls = ADAPTERS[config.harness_of(agent)]
     on = adapter(agent, config).web_search  # the same resolution the turn and preamble use
+    off_in = config.web_search_off_repos() if on else []
     note = cls.web_tools if on else ("off" if cls.web_off_enforced
                                      else "off by instruction only: the CLI has no switch for it")
-    return {"enabled": on, "off_enforced": cls.web_off_enforced, "tools": cls.web_tools, "note": note}
+    if off_in:
+        note += f"; off in {', '.join(off_in)}"
+    return {"enabled": on, "off_enforced": cls.web_off_enforced, "tools": cls.web_tools, "note": note,
+            "off_in_repos": off_in}
 
 
 def extract_json(text: str) -> dict | None:

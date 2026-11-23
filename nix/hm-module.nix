@@ -103,6 +103,9 @@ let
   listed = harness: cfg.agents == null || lib.elem harness cfg.agents
     || lib.any (name: lib.elem name cfg.agents)
       (lib.attrNames (lib.filterAttrs (_: p: p.harness == harness) cfg.participants));
+  # Repo entries with web_search left null are written as plain paths.
+  repos = map (r: if lib.isString r then r
+    else if r.web_search == null then r.path else { inherit (r) path web_search; }) cfg.repos;
   # Only the keys that are set, so the harness's defaults apply otherwise.
   participants = lib.mapAttrs (_: v: lib.filterAttrs (_: x: x != null) v) cfg.participants;
   # Only the keys that are set, so the CLI's defaults apply otherwise.
@@ -132,15 +135,33 @@ in
     };
 
     repos = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
+      type = lib.types.listOf (lib.types.either lib.types.str (lib.types.submodule {
+        options = {
+          path = lib.mkOption {
+            type = lib.types.str;
+            description = "The repository or parent directory.";
+          };
+          web_search = lib.mkOption {
+            type = lib.types.nullOr lib.types.bool;
+            default = null;
+            example = false;
+            description = ''
+              false: peers working in this repo may not search the web, whatever their own
+              `web_search` says. An entry can only turn it off (null or true: as configured
+              per agent), so any entry covering a repo that sets false wins.
+            '';
+          };
+        };
+      }));
       default = [ ];
-      example = [ "~/dotfiles" "~/src" ];
+      example = lib.literalExpression ''[ "~/dotfiles" "~/src" { path = "~/work"; web_search = false; } ]'';
       description = ''
         Repositories (or parent directories) that discussions and reviews may
         target. A request naming a repo outside this list is refused, and peers
         run with that repo as their working directory. This is not a read
         sandbox: what a peer can read is governed by its own CLI's read-only
-        mode (plan mode / read-only sandbox).
+        mode (plan mode / read-only sandbox). An entry can also be
+        `{ path; web_search = false; }` to keep peers off the web in that repo.
       '';
     };
 
@@ -244,8 +265,8 @@ in
             default = null;
             example = false;
             description = ''
-              Whether this agent's headless turns may search the web (null: on). Antigravity
-              has no switch for its search_web tool, so for it false is only an instruction.
+              Whether this agent's headless turns may search the web (null: on). A `repos`
+              entry can also turn it off for every agent in that repo.
             '';
           };
         };
@@ -342,7 +363,7 @@ in
       home.packages = [ cfg.package ];
       xdg.configFile."agent-bus/config.json".source =
         json.generate "agent-bus-config.json" (lib.recursiveUpdate
-          ({ inherit (cfg) repos; }
+          ({ inherit repos; }
             // lib.optionalAttrs (cfg.agents != null) { inherit (cfg) agents; }
             // lib.optionalAttrs (peerSettings != { }) { peers = peerSettings; }
             // lib.optionalAttrs (participants != { }) { inherit participants; })
