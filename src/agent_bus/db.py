@@ -141,6 +141,15 @@ CREATE TABLE IF NOT EXISTS usage_limits (  -- how full each usage-limit window w
     observed_at REAL NOT NULL,
     PRIMARY KEY (agent, window)
 );
+CREATE TABLE IF NOT EXISTS auto_resumes (  -- a thread parked by a usage limit, to resume after it (#26)
+    thread_id TEXT PRIMARY KEY,
+    agents TEXT NOT NULL,               -- JSON list: the peers or reviewers it waits on
+    due REAL NOT NULL,                  -- when their blocks expire
+    park_id TEXT NOT NULL,              -- unique per park: the resume job's dedupe key
+    guard TEXT NOT NULL,                -- the thread's round, head, revision and reviewer when parked
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS auto_resumes_due ON auto_resumes(due);
 CREATE TABLE IF NOT EXISTS peer_drift (  -- a discussion peer whose CLI output can't be used (issue #40)
     thread_id TEXT NOT NULL,
     agent TEXT NOT NULL,
@@ -749,8 +758,15 @@ class Bus:
             rows = self.conn.execute(
                 "UPDATE jobs SET status='failed', error='worker died (lease expired or never claimed)',"
                 " updated_at=? WHERE (status='running' AND lease_expires<?)"
-                " OR (status='queued' AND created_at<?) RETURNING id",
+                " OR (status='queued' AND created_at<?) RETURNING id, thread_id, dedupe_key, lease_owner",
                 (now, now, now - self.QUEUE_GRACE_S)).fetchall()
+            for r in rows:
+                # An automatic resume (see autoresume.py) has no one watching for it: say on
+                # the thread that it never started.
+                key, tid = r["dedupe_key"] or "", r["thread_id"]
+                if r["lease_owner"] is None and key.startswith((f"{tid}:resume:auto:", f"{tid}:retry:auto:")):
+                    self.post(r["thread_id"], SYSTEM, "The automatic resume's worker never started. Run "
+                              f"`agent-bus resume {r['thread_id']}` to retry.", kind="status")
         return [r["id"] for r in rows]
 
     def create_job(self, thread_id: str, kind: str, params: dict, dedupe_key: str | None) -> tuple[dict, bool]:
@@ -905,9 +921,18 @@ class Bus:
 
     def clear_quota(self, agent: str, model: str | None = None) -> int:
         """Lift ``agent``'s account-wide block, and its block for ``model`` if given."""
-        cur = self.conn.execute("DELETE FROM quota_blocks WHERE agent=? AND scope IN ('', ?)",
-                                (agent, model or ""))
+        with self.tx():
+            cur = self.conn.execute("DELETE FROM quota_blocks WHERE agent=? AND scope IN ('', ?)",
+                                    (agent, model or ""))
+            if cur.rowcount:
+                self.due_now(agent)
         return cur.rowcount if cur.rowcount is not None else 0
+
+    def due_now(self, agent: str) -> None:
+        """A block of ``agent`` was lifted early: threads waiting on it (auto_resumes) are
+        due now, and the next sweep checks whether anything else still stops them."""
+        self.conn.execute("UPDATE auto_resumes SET due=MIN(due, ?) WHERE agents LIKE ?",
+                          (_now(), f'%"{agent}"%'))
 
     # How long a usage-limit reading with no reset time is shown.
     LIMIT_FRESH_S = 6 * 3600

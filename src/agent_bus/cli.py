@@ -290,6 +290,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--limit", type=int, default=20, help="most threads to list (default 20)")
     s.add_argument("--json", action="store_true")
 
+    s = sub.add_parser("auto-resume", help="resume threads parked by a usage limit that has reset "
+                                           "(runs by itself; this shows what's planned)")
+    s.add_argument("--wait", action="store_true", help="(used internally) keep sweeping until none is planned")
+
     s = sub.add_parser("threads", help="list threads")
     s.add_argument("--all", action="store_true", help="include resolved and cancelled threads")
     s.add_argument("--json", action="store_true")
@@ -402,6 +406,24 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
+    from . import autoresume
+    if args.cmd == "auto-resume":
+        if args.wait:
+            return autoresume.wait(bus)
+        for tid in autoresume.sweep(bus):
+            print(f"resumed {tid}")
+        planned = autoresume.pending(bus)
+        for r in planned:
+            print(f"{r['thread_id']}: resumes after {', '.join(json.loads(r['agents']))} "
+                  f"{'has' if len(json.loads(r['agents'])) == 1 else 'have'} usage again "
+                  f"(about {time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(r['due']))})")
+        if not planned:
+            print("no automatic resumes planned")
+        return 0
+    # A thread whose usage limit has reset resumes now, except one this command changes
+    # (cancel, resume, reply): the explicit action goes first.
+    acting = args.cmd in ("cancel", "resume", "reply")
+    autoresume.sweep_quietly(bus, exclude=frozenset({args.thread} if acting else ()))
     svc = Service(bus, HUMAN)
     color = rex.stdout_is_tty()
     if args.cmd == "ask":
@@ -414,8 +436,12 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         from . import quota
         conf = cfg.Config.load()
         if args.clear_quota:
-            n = bus.conn.execute("DELETE FROM quota_blocks WHERE agent=?", (args.clear_quota,)).rowcount
+            with bus.tx():
+                n = bus.conn.execute("DELETE FROM quota_blocks WHERE agent=?", (args.clear_quota,)).rowcount
+                bus.due_now(args.clear_quota)
             print(f"cleared {n} out-of-usage block(s) for {args.clear_quota}")
+            for tid in autoresume.sweep(bus):  # threads that waited only on it go now
+                print(f"resumed {tid}")
             return 0
         avail = conf.availability()
         from .peers import cli_version, web_search_report

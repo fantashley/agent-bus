@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 from . import config as cfg
-from . import quota
+from . import autoresume, quota
 from . import rex, unvotable, worker
 from .db import HUMAN, SYSTEM, Bus, BusError, wrap_peer
 
@@ -341,6 +341,9 @@ class Service:
                     refs["heads"] = [*self._heads(t), head_commit_id]
                     if kept or override:
                         refs["peer_settings"] = {reviewer: {**kept, **override}}
+                    if (t["refs"] or {}).get("auto_resumes"):
+                        refs["auto_resumes"] = t["refs"]["auto_resumes"]  # still counts for this thread
+                    autoresume.forget(self.bus, t["id"])  # this pass replaces the parked one
                     self.bus.set_thread(t["id"], refs=json.dumps(refs), status="open", round=t["round"] + 1,
                                         max_rounds=t["round"] + 1,
                                         goal=f"Review {change_id or head_commit_id[:12]} in "
@@ -452,6 +455,7 @@ class Service:
             # Its pass failed or was cancelled: requesting it again retries it on the same thread.
             reviewer = t["refs"]["reviewer"]
             self._quota_check(reviewer, "reviewer", ((t["refs"].get("peer_settings") or {}).get(reviewer)))
+            autoresume.forget(self.bus, t["id"])  # this retry replaces any planned one
             self.bus.set_thread(t["id"], status="open")
             job_row, created = self.bus.create_job(t["id"], "review", {"mode": "retry"},
                                                    f"reviews:{t['id']}:retry:{time.time():.6f}")
@@ -537,6 +541,7 @@ class Service:
         last = self.bus.review_standings(t["id"])["reviewers"][nxt]
         refs.update(reviewer=nxt, prev_head_commit_id=last["head_commit_id"]
                     if last["base_commit_id"] == base else None)
+        autoresume.forget(self.bus, t["id"])  # this pass replaces the parked one
         self.bus.set_thread(t["id"], status="open", round=t["round"] + 1, max_rounds=t["round"] + 1,
                             goal=goal)
         # Scoped to the thread and round: create_job's global dedupe lookup must never
@@ -628,19 +633,26 @@ class Service:
         """Human only: lift the turn cap and give a stalled discussion more rounds."""
         if self.agent != HUMAN:
             raise BusError("HUMAN_ONLY", "only the human user can resume a thread")
+        # One transaction from reading the thread to reopening it, so an automatic resume
+        # (or its worker) can't change it in between; the worker starts after the commit.
+        self._launch_later = []
+        try:
+            with self.bus.tx():
+                res = self._resume(thread, extra_rounds)
+            launches = self._launch_later
+        finally:
+            self._launch_later = None
+        for job in launches:
+            if job["created"]:
+                worker.spawn(job["id"])
+        return res
+
+    def _resume(self, thread: str, extra_rounds: int) -> dict:
         t = self.bus.thread(thread)
         if t["status"] in ("resolved",):
             raise BusError("THREAD_CLOSED", "thread is already resolved")
         overrides = (t["refs"] or {}).get("peer_settings") or {}
-        if t["kind"] == "discussion":
-            peers = [p for p in t["participants"] if p != t["initiator"]]
-        elif (t["refs"] or {}).get("reviewers"):
-            # A complete review only needs resolving, which runs no reviewer.
-            peers = [] if self.bus.review_standings(thread)["complete"] else list(t["refs"]["reviewers"])
-        else:
-            peers = [r for r in [(t["refs"] or {}).get("reviewer")] if r]
-        for p in peers:
-            self.config.require_available(p, "peer" if t["kind"] == "discussion" else "reviewer")
+        peers = self._resume_peers(t)
         # The human is retrying now: forget cached out-of-usage blocks for these peers, so
         # a stale or wrong one doesn't stop the retry.  A real limit is found again.
         cleared = [p for p in peers if self.bus.clear_quota(p, quota.model_key(quota.effective_model(
@@ -648,6 +660,49 @@ class Service:
         # And the format drift that kept peers out of this discussion's rounds: the human
         # resumes once the adapter handles the new format, and a real drift is found again.
         drifted = self.bus.clear_peer_drift(thread)
+        # This resume replaces any automatic one, and restarts the count of those.
+        autoresume.forget(self.bus, thread)
+        note = ((f"Resumed by the human user with {extra_rounds} more round(s)."
+                 if t["kind"] == "discussion" else "Resumed by the human user.")
+                + (f" Cleared out-of-usage state for {', '.join(cleared)}." if cleared else "")
+                + (f" Cleared format-drift state for {', '.join(drifted)}." if drifted else ""))
+        return self._reopen(t, extra_rounds, note, auto_resumes=0, key=f"{time.time():.0f}")
+
+    def auto_resume(self, thread: str, park_id: str, agents: list[str], extra_rounds: int = 2) -> dict:
+        """Resume a thread parked only because ``agents`` ran out of usage, now that their
+        blocks have expired (see autoresume.resume_one, which calls this inside the
+        transaction that claims the planned resume)."""
+        t = self.bus.thread(thread)
+        self._resume_peers(t)  # each must still be available
+        if t["repo"]:
+            self._allowed_repo(t["repo"])  # and its repo still allow-listed
+        n = int((t["refs"] or {}).get("auto_resumes") or 0) + 1
+        note = (f"Resumed automatically: the usage limit that stopped {', '.join(agents)} has reset "
+                f"(automatic resume {n} of {self.config.auto_resume_max}"
+                + (f", with {extra_rounds} more round(s))." if t["kind"] == "discussion" else ")."))
+        # The caller starts the worker once its transaction has committed the job.
+        self._launch_later = []
+        try:
+            self._reopen(t, extra_rounds, note, auto_resumes=n, key=f"auto:{park_id}")
+            return self._launch_later[0] if self._launch_later else {}
+        finally:
+            self._launch_later = None
+
+    def _resume_peers(self, t: dict) -> list[str]:
+        """The headless peers or reviewers a resume of ``t`` would run (each must be available)."""
+        if t["kind"] == "discussion":
+            peers = [p for p in t["participants"] if p != t["initiator"]]
+        elif (t["refs"] or {}).get("reviewers"):
+            # A complete review only needs resolving, which runs no reviewer.
+            peers = [] if self.bus.review_standings(t["id"])["complete"] else list(t["refs"]["reviewers"])
+        else:
+            peers = [r for r in [(t["refs"] or {}).get("reviewer")] if r]
+        for p in peers:
+            self.config.require_available(p, "peer" if t["kind"] == "discussion" else "reviewer")
+        return peers
+
+    def _reopen(self, t: dict, extra_rounds: int, note: str, auto_resumes: int, key: str) -> dict:
+        thread = t["id"]
         fields: dict[str, Any] = {"status": "open"}
         count = self.bus._one("SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender NOT IN (?,?)",
                               thread, HUMAN, SYSTEM)["n"]
@@ -655,18 +710,17 @@ class Service:
         if t["kind"] == "discussion":
             fields["max_rounds"] = max(t["max_rounds"], t["round"]) + extra_rounds
             fields["deadline"] = time.time() + self.config.deadline_minutes * 60
+        if t["refs"] is not None or auto_resumes:
+            fields["refs"] = json.dumps({**(t["refs"] or {}), "auto_resumes": auto_resumes})
         self.bus.set_thread(thread, **fields)
-        self.bus.post(thread, SYSTEM, (f"Resumed by the human user with {extra_rounds} more round(s)."
-                      if t["kind"] == "discussion" else "Resumed by the human user.")
-                      + (f" Cleared out-of-usage state for {', '.join(cleared)}." if cleared else "")
-                      + (f" Cleared format-drift state for {', '.join(drifted)}." if drifted else ""),
-                      kind="status")
-        res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(thread))}
+        res: dict[str, Any] = {}
         if t["kind"] == "discussion":
-            res["job"] = self._dispatch(thread, "discussion", {"mode": "start_later"},
-                                        f"{thread}:resume:{time.time():.0f}")
+            res["job"] = self._dispatch(thread, "discussion", {"mode": "start_later"}, f"{thread}:resume:{key}")
         elif t["kind"] == "review" and not self.bus.active_job(thread) and not self._review_settled(t):
-            res["job"] = self._dispatch(thread, "review", {"mode": "retry"}, f"{thread}:retry:{time.time():.0f}")
+            res["job"] = self._dispatch(thread, "review", {"mode": "retry"}, f"{thread}:retry:{key}")
+        # After the job lookups, whose reaping may post an older job's notice: this one is last.
+        self.bus.post(thread, SYSTEM, note, kind="status")
+        res["thread"] = thread_summary(self.bus.thread(thread))
         return res
 
     def _review_settled(self, t: dict) -> bool:
@@ -686,6 +740,7 @@ class Service:
         if self.agent != HUMAN:
             raise BusError("HUMAN_ONLY", "only the human user can cancel a thread")
         pids = self.bus.cancel_thread(thread)
+        autoresume.forget(self.bus, thread)
         killed = []
         for pid in pids:
             try:
@@ -706,9 +761,14 @@ class Service:
                            f"{root} is not in the agent-bus repo allowlist ({cfg.config_path()})")
         return root
 
+    # Set while a caller will start the worker itself, after its transaction commits.
+    _launch_later: list | None = None
+
     def _dispatch(self, thread: str, kind: str, params: dict, dedupe_key: str) -> dict:
         job, created = self.bus.create_job(thread, kind, params, dedupe_key)
-        if created:
+        if self._launch_later is not None:
+            self._launch_later.append({"id": job["id"], "created": created})
+        elif created:
             worker.spawn(job["id"])
         return self._job_info(job, created)
 

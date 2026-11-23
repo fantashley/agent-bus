@@ -15,7 +15,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from . import config as cfg
-from . import procinfo, quota, service
+from . import autoresume, procinfo, quota, service
 from .db import Bus, BusError
 from .peers import cli_version
 
@@ -32,6 +32,10 @@ Codex and Antigravity are available; `whoami` lists them) and to the human user'
   several agents must all approve: they review one at a time).
 - Don't ping-pong: reply only when you have something new. Threads have hard message and round caps.
 """
+
+
+# Service methods behind tools that change threads (see call()).
+ACTING_TOOLS = frozenset({"send", "reply", "request_review", "start_discussion", "advance_discussion"})
 
 
 def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPServer:
@@ -60,12 +64,21 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None) -> MCPSer
                     "message": "You are running as a headless agent-bus peer; your reply is posted for you. "
                                "agent-bus tools are disabled in this session."}
         bus.touch_session(session_id)
+        # A thread whose usage limit has reset resumes now: before a read, so it shows the
+        # thread resumed; after a tool that acts on threads, so a follow-up request or a
+        # note goes first (a follow-up replaces the plan).
+        acts = getattr(fn, "__name__", "") in ACTING_TOOLS
+        if not acts:
+            autoresume.sweep_quietly(bus)
         try:
             return fn(*args, **kwargs)
         except BusError as e:
             return {"error": e.code, "message": e.message}
         except ValueError as e:
             return {"error": "BAD_REQUEST", "message": str(e)}
+        finally:
+            if acts:
+                autoresume.sweep_quietly(bus)
 
     @mcp.tool()
     def whoami() -> dict[str, Any]:

@@ -64,6 +64,8 @@ DEFAULTS = {
     "initiator_grace_s": 180,
     "quota_cooldown_s": 900,
     "usage_warn_at": 0.8,
+    "auto_resume_after_quota": True,
+    "auto_resume_max": 3,
     "max_messages": 60,
     "max_diff_bytes": 200_000,
     "peers": {},
@@ -103,6 +105,9 @@ class Config:
     quota_cooldown_s: int = 900
     # Warn that an agent is close to its usage limit once a window is this full (#26).
     usage_warn_at: float = 0.8
+    # Resume a thread parked by a usage limit once it resets, at most this many times (#26).
+    auto_resume_after_quota: bool = True
+    auto_resume_max: int = 3
     max_messages: int = 60
     max_diff_bytes: int = 200_000
     # Per-agent overrides: {"claude": {"command": "/path/claude", "args": [...]}}
@@ -121,6 +126,11 @@ class Config:
         w = conf.usage_warn_at
         if isinstance(w, bool) or not isinstance(w, (int, float)) or not 0 < w <= 1:
             raise ValueError("usage_warn_at must be a fraction above 0 and at most 1, e.g. 0.8")
+        if not isinstance(conf.auto_resume_after_quota, bool):
+            raise ValueError("auto_resume_after_quota must be true or false")
+        if isinstance(conf.auto_resume_max, bool) or not isinstance(conf.auto_resume_max, int) \
+                or conf.auto_resume_max < 0:
+            raise ValueError("auto_resume_max must be a whole number, 0 or more")
         for agent, entry in (conf.peers or {}).items():  # reject a bad model/effort when loading
             if agent in AGENT_INFO and isinstance(entry, dict):
                 check_peer_settings(agent, {k: entry.get(k) for k in ("model", "effort")})

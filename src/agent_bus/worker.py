@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from . import config as cfg
-from . import prompts, quota, unvotable
+from . import autoresume, prompts, quota, unvotable
 from .db import HUMAN, SYSTEM, Bus, BusError
 from .peers import Adapter, TurnResult, adapter, cli_version, extract_json, format_usage
 
@@ -168,6 +168,31 @@ class Worker:
 
     def system(self, body: str, kind: str = "status", recipient: str | None = None) -> None:
         self.post(SYSTEM, body, kind=kind, recipient=recipient)
+
+    def park_on_quota(self, agent: str) -> bool:
+        """Park the thread as needs_human because ``agent`` is out of usage, planning an
+        automatic resume for when that resets, in the same transaction."""
+        plan = None
+        with self.fenced():
+            if not self.bus.transition(self.thread_id, "needs_human"):
+                return False
+            plan = self.plan_auto_resume(self.thread(), [agent])
+        self.after_park(plan)
+        return True
+
+    def plan_auto_resume(self, t: dict, agents: list[str]) -> dict | None:
+        """Inside the parking transaction: plan the automatic resume and say so."""
+        plan = autoresume.schedule(self.bus, self.config, t, agents)
+        if plan:
+            self.bus.post(self.thread_id, SYSTEM, autoresume.notice(plan, self.config), kind="status")
+        return plan
+
+    def after_park(self, plan: dict | None) -> None:
+        if plan:
+            try:
+                autoresume.spawn_waiter()
+            except OSError as e:  # MCP calls and CLI commands still sweep lazily
+                self.event("error", f"could not start the auto-resume waiter: {e}")
 
     def finish_thread(self, status: str) -> bool:
         """Terminal transition, only if the thread is still open (a vote or cancel may have won)."""
@@ -473,6 +498,12 @@ class Worker:
             self.system(f"No consensus is possible while {', '.join(snapshot)} can't vote again. Needs the "
                         f"human user.\n{format_dissent(self.bus.dissent(self.thread_id))}",
                         recipient=None if init == HUMAN else init)
+            # Only usage limits stand in the way: they reset by themselves.  A stuck peer's
+            # quota reason hides any format drift it also has, which doesn't.
+            drifted = self.bus.peer_drift(self.thread_id)
+            plan = (self.plan_auto_resume(t, list(snapshot))
+                    if all(r["why"] == "quota" and p not in drifted for p, r in snapshot.items()) else None)
+        self.after_park(plan)
         return True
 
     def done(self) -> bool:
@@ -775,8 +806,11 @@ class Worker:
         res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh)
         if res.quota or res.format_changed:
             # Head, reviewer and session stay pinned for `agent-bus resume` after the reset
-            # (or once the adapter handles the new format).
-            self.finish_thread("needs_human")
+            # (or once the adapter handles the new format).  A reset can resume it by itself.
+            if res.quota:
+                self.park_on_quota(reviewer)
+            else:
+                self.finish_thread("needs_human")
             return None
         if res.ok or res.text:
             self.mark_delivered(reviewer, upto)
@@ -785,7 +819,10 @@ class Worker:
             res2 = self.turn(reviewer, "Reply again with only the JSON verdict object described above.",
                              fresh_prompt=fresh + "\n\nReply with only the JSON verdict object.")
             if res2.quota or res2.format_changed:
-                self.finish_thread("needs_human")
+                if res2.quota:
+                    self.park_on_quota(reviewer)
+                else:
+                    self.finish_thread("needs_human")
                 return None
             if res2.incomplete:
                 res = res2
