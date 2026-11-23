@@ -246,7 +246,8 @@ turns on it and tells you when it should be back. This was agreed on agent-bus t
   - **Claude Code:** the stream's `rate_limit_event` gives `unifiedWindows` (`five_hour`,
     `seven_day`), each with its `utilization` and reset time.
   - **Codex:** `exec --json` streams nothing about limits, but the session's rollout file
-    (`$CODEX_HOME/sessions/…/rollout-…-<session>.jsonl`) does: the last `token_count` event's
+    (`$CODEX_HOME/sessions/…/rollout-…-<session>.jsonl`, in the participant's `codex_home`
+    if it sets one) does: the last `token_count` event's
     `rate_limits.primary` / `secondary`, with `used_percent`, `window_minutes` and `resets_at`.
   - **Antigravity** (agy 1.5.13) reports nothing of the kind, in its stream or elsewhere, so it
     never gets a warning before it runs out.
@@ -527,6 +528,7 @@ own model and launch settings:
 local.agentBus.participants = {
   codex-mini = { harness = "codex"; model = "gpt-5-mini"; effort = "low"; };
   claude-work = { harness = "claude"; command = "claude-work"; account = "work"; };
+  codex-work = { harness = "codex"; codex_home = "~/.codex-work"; account = "work"; };
 };
 ```
 
@@ -536,7 +538,8 @@ rules:
 - **Names** are 1–32 lowercase letters, digits and hyphens, starting with a letter. `human`
   and `system` are reserved, and a built-in name must keep its own harness.
 - **Settings** a participant leaves out come from its harness's `peers.<harness>` entry
-  (`command`, `args`, `model`, `effort`, `web_search`, and `allow_mcp` for antigravity).
+  (`command`, `args`, `model`, `effort`, `web_search`, `allow_mcp` for antigravity and
+  `codex_home` for codex).
 - **Everywhere a name is used**, a participant name works: `ask --with codex,codex-mini`,
   `send(to=...)`, `start_discussion(peers=...)`, `request_review(reviewer=...)` and
   `reviewers=[...]`, `peer_settings` and `agents`. Each participant keeps its own
@@ -550,9 +553,18 @@ rules:
   harness share its out-of-usage blocks and usage readings unless one sets `account`, which
   gets its own. Antigravity's per-model blocks are scoped by account and model.
   `agent-bus agents --clear-quota codex-mini` clears the block for everyone sharing it.
+- **Another Codex login:** set `codex_home` rather than a wrapper `command` that changes
+  `CODEX_HOME`. agent-bus runs the participant's turns (and `codex mcp list`, so that home's
+  MCP servers are the ones switched off) with that `CODEX_HOME`, and reads its usage-limit
+  readings from that home's rollout files. agent-bus doesn't guess a wrapper's environment:
+  a wrapper that picks another home by itself gets no usage readings (out-of-usage blocks
+  still work, from the turn's own error). A `codex_home` other than `peers.codex.codex_home`
+  is another account, so it needs an `account` of its own: participants sharing such a home
+  name the same account, and no account label is used from two homes. `agent-bus agents` shows each participant's account and
+  `CODEX_HOME`.
 - **Isolation evidence** stays with the harness. Two participants share it only when the
   executable, the adapter recipe and the launch settings that affect isolation (args, MCP
-  and web settings) all match. Model and effort don't count.
+  and web settings, and `codex_home`) all match. Model and effort don't count.
 - **Antigravity's MCP check** reads the default config directory. An antigravity participant
   with its own `command` or `args` might load another one, so its turns are refused unless it
   sets `allow_mcp = true`.

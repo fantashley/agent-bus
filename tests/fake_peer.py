@@ -17,7 +17,7 @@ Behaviour is driven by env vars so tests can script outcomes:
                   reply, denied_actions in the result.  denied_reply: the same, then a reply;
                   denied_blank: a whitespace-only response; unfinished: the tool never reaches an end
                   state; toolerror: ERROR, no denial
-  FAKE_MCP_LIST   what `codex mcp list --json` prints
+  FAKE_MCP_LIST   what `codex mcp list --json` prints ($CODEX_HOME/fake-mcp.json wins if it exists)
   FAKE_APPROVE    comma-separated agents whose review verdicts approve (others request changes)
   FAKE_CLAUDE_USED / FAKE_CODEX_USED  how full the five_hour / primary usage-limit window is
                   (a fraction for claude's stream, a percentage in codex's rollout file)
@@ -50,6 +50,11 @@ if agent == "codex":
     while len(rest) >= 2 and rest[0] in ("-c", "--profile"):
         rest = rest[2:]
     if rest[:2] == ["mcp", "list"]:
+        # A CODEX_HOME's own servers, as its config.toml would list them.
+        own = os.path.join(os.environ.get("CODEX_HOME", "/nonexistent"), "fake-mcp.json")
+        if os.path.exists(own):
+            print(open(own).read())
+            sys.exit(0)
         print(os.environ.get("FAKE_MCP_LIST") or json.dumps(
             [{"name": "agent-bus", "enabled": True}, {"name": "github", "enabled": True},
              {"name": "off", "enabled": False}]))
@@ -68,7 +73,8 @@ log = os.environ.get("FAKE_LOG")
 if log:
     with open(log, "a") as f:
         f.write(json.dumps({"agent": agent, "argv": argv, "prompt": prompt,
-                            "peer_env": os.environ.get("AGENT_BUS_PEER")}) + "\n")
+                            "peer_env": os.environ.get("AGENT_BUS_PEER"),
+                            "codex_home": os.environ.get("CODEX_HOME")}) + "\n")
 
 repair = "Reply again with only" in prompt
 if behaviour == "nojson" and not repair:

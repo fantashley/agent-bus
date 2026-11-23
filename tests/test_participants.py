@@ -479,3 +479,156 @@ def test_stored_thread_naming_a_removed_participant_fails_clearly(env, no_spawn)
     with pytest.raises(ValueError, match="unknown peer 'codex-mini'"):
         Service(bus, HUMAN).resume(tid)
     assert bus.thread(tid)["participants"] == ["codex-mini"]  # history is kept
+
+
+# ------------------------------------------------------------------ codex_home (#66)
+
+
+def test_codex_home_is_validated(env):
+    bad = [
+        ({"mini": {"harness": "codex", "codex_home": "relative/dir", "account": "a"}}, "must be an absolute path"),
+        ({"mini": {"harness": "codex", "codex_home": "", "account": "a"}}, "must be an absolute path"),
+        ({"mini": {"harness": "codex", "codex_home": 3, "account": "a"}}, "must be an absolute path"),
+        ({"mini": {"harness": "claude", "codex_home": "/x"}}, "only to the codex harness"),
+        # Another home is another login: its readings need an account of their own.
+        ({"mini": {"harness": "codex", "codex_home": "/x"}}, "set participants.mini.account to a label"),
+        ({"a": {"harness": "codex", "codex_home": "/x", "account": "one"},
+          "b": {"harness": "codex", "codex_home": "/x/", "account": "two"}}, "share codex_home /x"),
+    ]
+    for participants, error in bad:
+        configure(env, participants=participants)
+        with pytest.raises(ValueError, match=error):
+            cfg.Config.load()
+    # An account inherited from peers.codex is the harness's own login, not another one.
+    data = json.loads(config_path(env).read_text())
+    data["peers"]["codex"]["account"] = "personal"
+    data["participants"] = {"mini": {"harness": "codex", "codex_home": "/x"}}
+    config_path(env).write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="account to a label of its own"):
+        cfg.Config.load()
+    data["participants"]["mini"]["account"] = "personal"
+    config_path(env).write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="account to a label of its own"):
+        cfg.Config.load()
+    # Even as the only codex participant: the harness's label may have blocks stored already.
+    data["participants"] = {"codex": {"codex_home": "/profiles/work"}}
+    config_path(env).write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="account to a label of its own"):
+        cfg.Config.load()
+    # ...nor one a participant on the harness's home uses (codex review, t-91d811).
+    data["peers"]["codex"].pop("account")
+    data["peers"]["codex"]["codex_home"] = "/profiles/main"
+    data["participants"] = {"codex": {"account": "personal"},
+                            "work": {"harness": "codex", "codex_home": "/profiles/work", "account": "personal"}}
+    config_path(env).write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="different Codex homes but the same account personal"):
+        cfg.Config.load()
+    data["participants"]["work"]["account"] = "work"
+    config_path(env).write_text(json.dumps(data))
+    cfg.Config.load()
+    configure(env, participants={}, peers={"claude": {"codex_home": "/x"}})
+    with pytest.raises(ValueError, match="peers.claude.codex_home applies only"):
+        cfg.Config.load()
+
+
+def test_codex_home_in_peers_is_the_harness_default(env):
+    """peers.codex.codex_home moves the default account's home: no account is needed for the
+    participants that inherit it, and the built-in subject stays `codex`."""
+    data = json.loads(config_path(env).read_text())
+    data["peers"]["codex"]["codex_home"] = "~/codex-main"
+    data["participants"] = {**MINI, "codex-wrapped": {"harness": "codex", "account": "w"}}
+    config_path(env).write_text(json.dumps(data))
+    conf = cfg.Config.load()
+    home = cfg._home("~/codex-main")
+    assert conf.codex_home("codex") == conf.codex_home("codex-mini") == home
+    assert quota.subject(conf, "codex") == quota.subject(conf, "codex-mini") == "codex"
+
+
+def test_default_participants_have_no_codex_home(env):
+    conf = cfg.Config.load()
+    assert all(conf.codex_home(a) is None for a in cfg.AGENTS)
+    ad = adapter("codex", conf)
+    assert ad.home is None and ad.child_env() == {}
+
+
+def test_codex_home_runs_the_turn_and_feeds_its_usage_readings(env, no_spawn, monkeypatch):
+    work = env["tmp"] / "codex-work"
+    work.mkdir()
+    (work / "fake-mcp.json").write_text(json.dumps([{"name": "work-only", "enabled": True}]))
+    configure(env, participants={"codex-work": {"harness": "codex", "codex_home": str(work), "account": "work"}})
+    bus = env["bus"]
+    monkeypatch.setenv("FAKE_CODEX_USED", "93")
+    tid = Service(bus, HUMAN).start_discussion("Q?", peers=["codex", "codex-work"], max_rounds=1)["thread"]["id"]
+    run_job(bus, tid)
+    homes = {c["agent"] if c["codex_home"] != str(work) else "codex-work": c for c in calls(env)
+             if c["agent"] == "codex"}
+    # The built-in one runs with the worker's own CODEX_HOME, as before; codex-work with its own,
+    # whose MCP servers are the ones switched off.
+    assert homes["codex"]["codex_home"] == str(env["tmp"] / "codex")
+    assert "mcp_servers.github.enabled=false" in homes["codex"]["argv"]
+    assert "mcp_servers.work-only.enabled=false" in homes["codex-work"]["argv"]
+    assert "mcp_servers.github.enabled=false" not in homes["codex-work"]["argv"]
+    assert list((work / "sessions").glob("*/*/*/rollout-*.jsonl"))
+    # Each account's reading is kept under its own subject.
+    by = {(w["agent"], w["window"]): w["used"] for w in bus.usage_limits()}
+    assert by == {("codex", "primary"): 0.93, ("codex@work", "primary"): 0.93}
+    conf = cfg.Config.load()
+    assert [w["agent"] for w in quota.near_limit(bus, conf, "codex-work")] == ["codex@work"]
+
+
+def test_codex_home_resumed_turn_reads_only_its_own_rollout(env):
+    """A resumed turn snapshots, and then reads, the rollout file in the participant's home."""
+    from agent_bus.peers import StreamState
+    work = env["tmp"] / "codex-work"
+    configure(env, participants={"codex-work": {"harness": "codex", "codex_home": str(work), "account": "work"}})
+    conf = cfg.Config.load()
+    sid = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+    day = work / "sessions" / "2026" / "11" / "23"
+    day.mkdir(parents=True)
+    roll = day / f"rollout-2026-11-23T00-00-00-{sid}.jsonl"
+    roll.write_text("")
+    ad = adapter("codex-work", conf)
+    st = StreamState(external_id=sid, resumed=True)
+    ad.before_run(st, sid)
+    assert st.rollout == (roll, 0)
+    # The worker's own home holds nothing for it: the default participant finds no file.
+    st2 = StreamState(external_id=sid, resumed=True)
+    adapter("codex", conf).before_run(st2, sid)
+    assert st2.rollout is None
+
+
+def test_codex_home_changes_the_launch_fingerprint_only_when_set(env):
+    configure(env, participants={"codex-work": {"harness": "codex", "codex_home": "/x", "account": "w"},
+                                 **MINI})
+    conf = cfg.Config.load()
+    fp = lambda name: adapter(name, conf).launch_fingerprint()  # noqa: E731
+    assert fp("codex") == fp("codex-mini") != fp("codex-work")
+
+
+def test_agents_cli_shows_account_and_codex_home(env, capsys):
+    from agent_bus import cli
+    configure(env, participants={"codex-work": {"harness": "codex", "codex_home": "/x/work", "account": "work"}})
+    assert cli.main(["agents", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["codex-work"]["codex_home"] == "/x/work" and out["codex-work"]["account"] == "work"
+    assert "codex_home" not in out["codex"] and "account" not in out["codex"]
+    assert cli.main(["agents"]) == 0
+    text = capsys.readouterr().out
+    assert "[harness codex, account work]" in text and "CODEX_HOME /x/work" in text
+
+
+def test_codex_home_is_passed_as_written_but_compared_as_it_resolves(env):
+    """`..` after a symlink is left to the filesystem; two spellings of one home are one home."""
+    real = env["tmp"] / "mnt" / "work"
+    (real / "current").mkdir(parents=True)
+    (real / "codex").mkdir()
+    (env["tmp"] / "profiles").mkdir()
+    (env["tmp"] / "profiles" / "current").symlink_to(real / "current")
+    odd = str(env["tmp"] / "profiles" / "current" / ".." / "codex")
+    configure(env, participants={"a": {"harness": "codex", "codex_home": odd, "account": "one"}})
+    conf = cfg.Config.load()
+    assert conf.codex_home("a") == odd and adapter("a", conf).child_env() == {"CODEX_HOME": odd}
+    configure(env, participants={"a": {"harness": "codex", "codex_home": odd, "account": "one"},
+                                 "b": {"harness": "codex", "codex_home": str(real / "codex"), "account": "two"}})
+    with pytest.raises(ValueError, match="share codex_home"):
+        cfg.Config.load()

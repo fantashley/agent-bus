@@ -499,6 +499,11 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
             harness = conf.harness_of(a)
             if harness != a:
                 v["harness"] = harness
+            # What its usage blocks and readings are kept under, and where Codex's come from.
+            if conf.account(a):
+                v["account"] = conf.account(a)
+            if conf.codex_home(a):
+                v["codex_home"] = conf.codex_home(a)
             if v["available"]:
                 v["version"] = cli_version(bus, harness, conf.peer_command(a))
                 v["web_search"] = web_search_report(a, conf)
@@ -519,7 +524,10 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         for a, v in avail.items():
             print(f"  {'yes' if v['available'] else 'no ':<4} {a:<12} {v['reason']}"
                   + (f" ({v['version']})" if v.get("version") else "")
-                  + (f" [harness {v['harness']}]" if v.get("harness") else ""))
+                  + (f" [{', '.join(f'{k} {v[k]}' for k in ('harness', 'account') if v.get(k))}]"
+                     if v.get("harness") or v.get("account") else ""))
+            if v.get("codex_home"):
+                print(f"       CODEX_HOME {v['codex_home']}")
             if v.get("web_search"):
                 print(f"       web search as a peer: {'on, ' if v['web_search']['enabled'] else ''}"
                       f"{v['web_search']['note']}")

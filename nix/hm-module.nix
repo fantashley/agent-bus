@@ -217,6 +217,17 @@ in
               harness and account, so one account running out doesn't stop the other.
             '';
           };
+          codex_home = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "~/.codex-work";
+            description = ''
+              Codex only: the `CODEX_HOME` its headless turns run with, an absolute path or one
+              starting with `~` (null: the harness's `peers.codex.codex_home`, else the worker's
+              own). agent-bus also reads usage-limit readings from that home's rollout files, so
+              a home other than the harness's needs an `account` of its own.
+            '';
+          };
           command = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
             default = null;
@@ -287,7 +298,8 @@ in
       description = ''
         Extra keys for config.json: max_rounds, deadline_minutes,
         turn_timeout_s, initiator_grace_s, quota_cooldown_s, max_messages, max_diff_bytes,
-        `peers.<agent>.{command,args}` to override how a peer CLI is run, and
+        `peers.<agent>.{command,args}` to override how a peer CLI is run,
+        `peers.codex.codex_home` for the CODEX_HOME Codex peers run with, and
         `peers.antigravity.allow_mcp = true` to let Antigravity peers run even
         though its other MCP servers can't be switched off per session.
       '';

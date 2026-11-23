@@ -40,7 +40,8 @@ PARTICIPANT_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
 RESERVED_NAMES = frozenset({"human", "system"})
 # What a participant entry may set.  Launch settings (everything but ``harness``) default
 # to the harness's own ``peers.<harness>`` entry.
-PARTICIPANT_KEYS = frozenset({"harness", "model", "effort", "command", "args", "web_search", "allow_mcp", "account"})
+PARTICIPANT_KEYS = frozenset({"harness", "model", "effort", "command", "args", "web_search", "allow_mcp", "account",
+                              "codex_home"})
 # The account a participant's usage counts against, when it isn't the harness's default
 # one (a wrapper command or args that sign in elsewhere).  Scopes usage blocks (#26, #43).
 _ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}")
@@ -103,6 +104,23 @@ def _check_launch(where: str, harness: str, entry: dict, who: str) -> None:
     account = entry.get("account")
     if account is not None and not (isinstance(account, str) and _ACCOUNT.fullmatch(account)):
         raise ValueError(f"{where}.account must be a short label (letters, digits and ._@+-), got {account!r}")
+    if "codex_home" in entry:
+        home = entry["codex_home"]
+        if harness != "codex":
+            raise ValueError(f"{where}.codex_home applies only to the codex harness")
+        if not (isinstance(home, str) and home and os.path.isabs(os.path.expanduser(home))):
+            raise ValueError(f"{where}.codex_home must be an absolute path (or start with ~), got {home!r}")
+
+
+def _home(path: str | None) -> str | None:
+    """A configured ``codex_home`` as Codex is given it: only ``~`` expanded, since a lexical
+    cleanup of ``..`` could pick another directory than a symlinked path really is."""
+    return os.path.expanduser(path) if path else None
+
+
+def _same_home(path: str | None) -> str | None:
+    """Where a ``codex_home`` really is, for telling whether two name the same home."""
+    return os.path.realpath(os.path.expanduser(path)) if path else None
 
 
 DEFAULTS = {
@@ -193,6 +211,7 @@ class Config:
             if agent in HARNESS_INFO and isinstance(entry, dict):
                 _check_launch(f"peers.{agent}", agent, entry, agent)
         named = conf._resolve_participants()
+        conf._check_codex_homes(named)
         for key in conf.peers:
             if key not in HARNESS_INFO and key in named:
                 raise ValueError(f"peers.{key}: `peers` is keyed by harness; set {key}'s launch settings "
@@ -236,6 +255,40 @@ class Config:
         base = self.peers.get(harness) if isinstance(self.peers.get(harness), dict) else {}
         own = {k: v for k, v in entry.items() if k != "harness"}
         return Participant(name, harness, {**base, **own})
+
+    def _check_codex_homes(self, named: dict[str, Participant]) -> None:
+        """Usage readings come from a participant's CODEX_HOME but are kept per harness and
+        account (#66), so a home tells logins apart: a participant with another home than its
+        harness's needs an account of its own, participants sharing such a home share an
+        account, and no account label is used from two homes."""
+        base = self.peers.get("codex") if isinstance(self.peers.get("codex"), dict) else {}
+        # The harness's home as configured, not the worker's $CODEX_HOME: validation must not
+        # depend on which process loads the config.
+        default = _same_home(base.get("codex_home"))
+        harness_account = base.get("account") or None
+        home_of: dict[str | None, tuple[str, str | None]] = {}  # account -> (participant, home)
+        account_of: dict[str, tuple[str, str | None]] = {}  # non-default home -> (participant, account)
+        for name, p in named.items():
+            if p.harness != "codex":
+                continue
+            home = _same_home(p.settings.get("codex_home"))
+            home = None if home == default else home  # None: the harness's own home
+            account = p.settings.get("account") or None
+            # Its own label: one inherited from peers.codex names the harness's login, and may
+            # have blocks stored under it already.
+            if home is not None and (account is None or account == harness_account):
+                raise ValueError(f"participants.{name}.codex_home is another Codex home than the codex harness's, "
+                                 f"so it signs in to another account: set participants.{name}.account to a label "
+                                 "of its own (usage limits are tracked per account)")
+            if home is not None and home in account_of and account_of[home][1] != account:
+                raise ValueError(f"participants {account_of[home][0]} and {name} share codex_home {home} but name "
+                                 "different accounts")
+            if account in home_of and home_of[account][1] != home:
+                raise ValueError(f"participants {home_of[account][0]} and {name} use different Codex homes but the "
+                                 f"same account {account or '(the default)'}: give each login its own account label")
+            if home is not None:
+                account_of.setdefault(home, (name, account))
+            home_of.setdefault(account, (name, home))
 
     def participant_map(self) -> dict[str, Participant]:
         # Resolved on every call (it's a handful of entries): tests and callers may change
@@ -331,6 +384,11 @@ class Config:
     def account(self, agent: str) -> str | None:
         """The account label ``agent``'s usage counts against, if configured."""
         return self.launch(agent).get("account") or None
+
+    def codex_home(self, agent: str) -> str | None:
+        """The CODEX_HOME ``agent``'s turns run with, if configured (#66); None leaves the
+        child the worker's own (``$CODEX_HOME``, else ``~/.codex``)."""
+        return _home(self.launch(agent).get("codex_home"))
 
     def _repo_entries(self) -> list[dict]:
         """``repos`` as {"path", "web_search"?} entries: a bare string is a path."""
