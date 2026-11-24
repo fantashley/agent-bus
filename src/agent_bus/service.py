@@ -15,7 +15,7 @@ from typing import Any
 from . import config as cfg
 from . import autoresume, quota
 from . import rex, unvotable, worker
-from .db import HUMAN, SYSTEM, Bus, BusError, is_quiet, review_progress, wrap_peer
+from .db import HUMAN, SYSTEM, Bus, BusError, deadline_message, is_quiet, overdue, past_deadline, review_progress, wrap_peer
 
 # A pinned commit id: the full 40 hex digits, or a prefix of at least 7 that request_review
 # resolves to one commit in the repo (#73).  Upper case is accepted and lowered.
@@ -46,7 +46,9 @@ def present(m: dict) -> dict:
     return out
 
 
-def thread_summary(t: dict) -> dict:
+def thread_summary(t: dict, goal: bool = True) -> dict:
+    """A thread as agents see it.  ``goal=False`` leaves out the goal: replies to a thread's
+    own moves (send, wait, inbox) don't repeat it, since it can be long (#74)."""
     keys = ("id", "kind", "goal", "participants", "initiator", "status", "round", "max_rounds")
     out = {k: t[k] for k in keys}
     if t["kind"] == "review":
@@ -56,6 +58,8 @@ def thread_summary(t: dict) -> dict:
     if t["initiator"] not in (HUMAN, SYSTEM, None):
         # An agent wrote the goal; label it so it isn't read as an instruction.
         out["goal"] = wrap_peer(t["initiator"], t["goal"])
+    if not goal:
+        del out["goal"]
     if t["deadline"]:
         out["deadline"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t["deadline"]))
     if t["final_proposal"]:
@@ -76,9 +80,18 @@ class Service:
 
     # ------------------------------------------------------------------ messaging
 
-    def send(self, body: str, thread: str | None = None, to: str | None = None, kind: str = "message",
-             on: str | None = None, stance: str | None = None, reasons: str | None = None,
-             refs: dict | None = None) -> dict:
+    def send(self, body: str | None = None, thread: str | None = None, to: str | None = None,
+             kind: str = "message", on: str | None = None, stance: str | None = None,
+             reasons: str | None = None, refs: dict | None = None) -> dict:
+        reasons = reasons.strip() if reasons and reasons.strip() else None
+        if kind == "vote":
+            # A vote's on/stance/reasons say everything; a body is optional (#74).  The
+            # reasons go into the body too, so every rendering of the vote shows them.
+            text = body.strip() if body and body.strip() else ""
+            if not text:
+                body = reasons or f"{stance} on {on}"
+            elif reasons and reasons not in text:
+                body = f"{text}\n\nReasons: {reasons}"
         if not body or not body.strip():
             raise ValueError("body is empty")
         if to is not None:
@@ -102,10 +115,44 @@ class Service:
         m = self.bus.post(thread, self.agent, body, kind=kind, session_id=self.session_id, recipient=to,
                           data=data)
         t = self.bus.thread(thread)
-        res = {"posted": present(m), "thread": thread_summary(t)}
+        res = {"posted": present(m), "thread": thread_summary(t, goal=False)}
+        if kind == "vote" and t["status"] == "open" and not self.bus._blind(t, self.agent):
+            note = self._superseded(thread, on)
+            if note:
+                res["superseded"] = note
         if t["kind"] == "discussion" and t["status"] == "open":
             res["next"] = "Call wait(thread) for the other participants' moves."
         return res
+
+    def _superseded(self, thread: str, on: str) -> str | None:
+        """A warning when a vote went to a proposal that newer ones have since followed:
+        proposals arrive concurrently, so one may land just before a vote on an older one."""
+        props = self.bus.proposals(thread)
+        target = next((p for p in props if p["data"].get("proposal_id") == on), None)
+        newer = [p for p in props if target and p["id"] > target["id"]]
+        if not newer:
+            return None
+        return (f"{on} is not the latest proposal: {self._list_proposals(newer)} came after it. Your vote "
+                "counts only for " + on + "; vote on a newer one if that is what you back.")
+
+    @staticmethod
+    def _list_proposals(props: list[dict]) -> str:
+        return ", ".join(f"{p['data']['proposal_id']} (by {p['sender']})" for p in props)
+
+    def _newer_than_my_stance(self, t: dict) -> str | None:
+        """A hint for a participant whose latest vote predates proposals from others: they
+        may want to vote on the newer one (proposals and votes cross in flight)."""
+        if t["kind"] != "discussion" or t["status"] != "open" or self.agent not in t["participants"]:
+            return None
+        mine = self.bus.standings(t["id"]).get(self.agent)
+        if not mine:
+            return None
+        newer = [p for p in self.bus.proposals(t["id"])
+                 if p["id"] > mine["message_id"] and p["sender"] != self.agent]
+        if not newer:
+            return None
+        return (f"Proposals posted since your latest stance ({mine['stance']} on {mine['proposal_id']}): "
+                f"{self._list_proposals(newer)}. Your stance still counts only for {mine['proposal_id']}.")
 
     def reply(self, message_id: int, body: str) -> dict:
         orig = self.bus.message(message_id)
@@ -125,13 +172,17 @@ class Service:
         res: dict[str, Any] = {"messages": [present(m) for m in msgs]}
         if thread:
             t = self.bus.thread(thread)
-            res["thread"] = thread_summary(t)
+            res["thread"] = thread_summary(t, goal=False)
             # The last message in this batch (or, with none, the last one read on the
             # thread): pass it to wait(after_message_id=...) to replay anything after it,
             # e.g. a reply lost when the connection dropped, or the next page (#72).
             res["cursor"] = msgs[-1]["id"] if msgs else self.bus.cursor(self.subscriber, thread)
             if self.bus._blind(t, self.agent):
                 res["blind"] = BLIND_NOTE
+            else:
+                hint = self._newer_than_my_stance(t)
+                if hint:
+                    res["newer_proposals"] = hint
         return res
 
     # ------------------------------------------------------------------ waiting (#72)
@@ -143,6 +194,7 @@ class Service:
         notices (db.is_quiet) don't end it by themselves unless ``wake_quiet``; a full
         page does, so quiet notices can never hide what comes after them.
         ``after_message_id`` replays everything after that message instead (Bus.replay)."""
+        self.bus.expire_discussion(thread)  # its notice is then among the messages (#74)
         if after_message_id is not None:
             msgs = self.bus.replay(self.subscriber, self.agent, thread, int(after_message_id), limit=limit)
             return self._batch(thread, msgs) if msgs else None
@@ -214,6 +266,7 @@ class Service:
         return {"job": info, "peers": peers}
 
     def history(self, thread: str, limit: int = 200) -> dict:
+        self.bus.expire_discussion(thread)
         h = self.bus.history(thread, viewer=None if self.agent == HUMAN else self.agent, limit=limit)
         res = {"thread": thread_summary(h["thread"]), "messages": [present(m) for m in h["messages"]]}
         if h["thread"]["kind"] == "review":
@@ -224,9 +277,11 @@ class Service:
 
     def threads(self, include_closed: bool = False) -> dict:
         who = None if self.agent == HUMAN else self.agent
+        self.bus.expire_discussions()
         return {"threads": [thread_summary(t) for t in self.bus.threads(include_closed, agent_type=who)]}
 
     def thread_state(self, thread: str) -> dict:
+        self.bus.expire_discussion(thread)
         t = self.bus.thread(thread)
         res: dict[str, Any] = {"thread": thread_summary(t)}
         if t["kind"] == "discussion":
@@ -234,6 +289,9 @@ class Service:
                 res["blind"] = BLIND_NOTE  # standings would show who has proposed what
             else:
                 res["standings"] = self.bus.standings(thread)
+                hint = self._newer_than_my_stance(t)
+                if hint:
+                    res["newer_proposals"] = hint
             job = self.bus.active_job(thread)
             res["worker"] = job["status"] if job else "idle"
         elif t["kind"] == "review":
@@ -335,6 +393,10 @@ class Service:
             raise ValueError(f"{thread} is not a discussion")
         if self.agent not in (t["initiator"], HUMAN):
             raise BusError("NOT_INITIATOR", "only the initiator (or the human user) can advance a discussion")
+        expired = self.bus.expire_discussion(thread)
+        t = self.bus.thread(thread)
+        if expired or past_deadline(t):
+            raise BusError("DEADLINE_REACHED", deadline_message(t, parked=expired, refused="can't be advanced"))
         if t["status"] != "open":
             raise BusError("THREAD_CLOSED", f"thread is {t['status']}")
         if t["round"] >= t["max_rounds"]:
@@ -358,8 +420,25 @@ class Service:
             raise BusError(unvotable.code(s.stuck), "no peer can take another round: "
                            + unvotable.explain(s.stuck, thread, self.config)
                            + f" Every peer backs {s.backs}: {how}, or retry once they can vote again.")
-        job = self._dispatch(thread, "discussion", {"mode": "advance"}, f"{thread}:advance:{t['round'] + 1}")
-        return {"thread": thread_summary(t), "job": job}
+        # Checked again where the job is queued: a sweep may have parked the thread meanwhile.
+        self._launch_later = []
+        try:
+            with self.bus.tx():
+                now = self.bus.thread(thread)
+                if past_deadline(now):
+                    raise BusError("DEADLINE_REACHED", deadline_message(now, parked=False,
+                                                                        refused="can't be advanced"))
+                if now["status"] != "open" or now["round"] != t["round"]:
+                    raise BusError("THREAD_CLOSED" if now["status"] != "open" else "THREAD_BUSY",
+                                   f"thread {thread} changed meanwhile ({now['status']}, round {now['round']})")
+                job = self._dispatch(thread, "discussion", {"mode": "advance"}, f"{thread}:advance:{t['round'] + 1}")
+            launches = self._launch_later
+        finally:
+            self._launch_later = None
+        for j in launches:
+            if j["created"]:
+                worker.launch(self.bus, j["id"])
+        return {"thread": thread_summary(t, goal=False), "job": job}
 
     def request_review(self, reviewer: str | None, repo: str, base_commit_id: str, head_commit_id: str,
                        change_id: str | None = None, prev_head_commit_id: str | None = None,
@@ -1022,6 +1101,7 @@ class Service:
         resumed session on the thread, with the same hardening and usage accounting as any turn
         (#91).  Their answers come back as ``debrief`` messages; the thread's status and
         verdicts never change.  One per peer per thread until the human user resumes it."""
+        self.bus.expire_discussion(thread)  # an overdue discussion is finished (#74)
         t = self.bus.thread(thread)
         if t["kind"] not in ("review", "discussion"):
             raise ValueError(f"{thread} is a {t['kind']} thread; only reviews and discussions can be debriefed")
@@ -1125,6 +1205,20 @@ class Service:
         if job and job["kind"] == "debrief":
             # Its job would stand in for the resumed thread's own (one job per thread).
             raise BusError("THREAD_BUSY", f"a debrief of {thread} is running; resume it once that has finished")
+        if job and job["status"] == "running" and t["kind"] == "discussion" and (overdue(t) or t["status"] != "open"):
+            # A live worker is finishing past the deadline, or has parked the thread and not
+            # yet exited: a resume now would let its turn or notice land in the new window,
+            # and the new job would be deduplicated against the old one (#74).  A queued job
+            # that never started is what a resume relaunches, so that one doesn't block.
+            raise BusError("THREAD_BUSY", f"{thread}'s worker is still finishing; resume it once that job "
+                           "has ended")
+        if job and job["status"] == "queued" and t["kind"] == "discussion" and t["deadline"] \
+                and t["deadline"] <= time.time():
+            # A job that never started before the deadline: its mode (an advance runs at most
+            # one round) shouldn't stand in for the resume's own job (#74).
+            self.bus.conn.execute("UPDATE jobs SET status='cancelled', error='the discussion deadline passed "
+                                  "before it started', updated_at=? WHERE id=? AND status='queued'",
+                                  (time.time(), job["id"]))
         # Each peer may be debriefed once more after this resume (#91).
         t = {**t, "refs": {**(t["refs"] or {}), "debrief_after": self.bus.last_message_id(thread)}}
         overrides = (t["refs"] or {}).get("peer_settings") or {}

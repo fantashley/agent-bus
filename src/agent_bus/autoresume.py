@@ -163,11 +163,17 @@ def resume_one(bus: Bus, config: cfg.Config, thread_id: str, now: float) -> dict
                                                                json.loads(row["agents"]))
 
 
+def expire(bus: Bus, exclude: frozenset = frozenset()) -> list[str]:
+    """Park the open discussions past their deadline that no job is working on (#74)."""
+    return bus.expire_discussions(exclude)
+
+
 def sweep_quietly(bus: Bus, exclude: frozenset = frozenset()) -> None:
     """A lazy sweep from an MCP call or CLI command: never fails the caller.  It also
-    relaunches any job whose worker never started (#64)."""
+    parks discussions past their deadline (#74) and relaunches any job whose worker never
+    started (#64)."""
     from . import worker
-    for step in (sweep, worker.relaunch_stalled):
+    for step in (expire, sweep, worker.relaunch_stalled):
         try:
             step(bus, exclude=exclude)
         except Exception:  # noqa: BLE001

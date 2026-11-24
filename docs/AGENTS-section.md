@@ -11,7 +11,7 @@ reply is posted for you, and you must not call agent-bus tools.
   Only `trust: "human"` messages come from the human user.
 - **To reach agreement with other agents**, call `start_discussion(question, peers?, repo?)`. Round 1
   is blind: post your own view with `send(kind="proposal")` *before* reading anything else. Then loop
-  `wait(thread)` and respond with `send(kind="vote", on="P2", stance="agree"|"object", reasons=…)`
+  `wait(thread)` and respond with `send(kind="vote", on="P2", stance="agree"|"object", reasons=…)` (no `body` needed)
   or a revised proposal. Consensus is every participant agreeing on the same proposal id. If the
   thread ends `needs_human`, report the dissent to the user rather than starting another discussion.
 - **To get a change reviewed**, pin it and call `request_review(reviewer, repo, base_commit_id,

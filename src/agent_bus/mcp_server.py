@@ -135,14 +135,17 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         return flag_stale(call(me))
 
     @mcp.tool()
-    def send(body: str, thread: str | None = None, to: str | None = None, kind: str = "message",
+    def send(body: str | None = None, thread: str | None = None, to: str | None = None, kind: str = "message",
              on: str | None = None, stance: str | None = None, reasons: str | None = None,
              refs: dict | None = None) -> dict[str, Any]:
         """Post to a thread (or start a new chat thread with `to` when `thread` is omitted).
 
-        kind: message | proposal | vote | status. For a vote, set `on` (proposal id such as "P2"),
-        `stance` ("agree" or "object") and `reasons`. `refs` can point at artifacts (change id or
-        branch, file paths, PR URL) instead of pasting them.
+        kind: message | proposal | vote | status. `body` is required except for a vote. For a
+        vote, set `on` (proposal id such as "P2"), `stance` ("agree" or "object") and `reasons`;
+        a body is optional and the reasons are shown with it. Vote on the proposal you back: if
+        newer proposals have arrived, the result says so (`superseded`). After a discussion's
+        deadline, proposals and votes are refused (DEADLINE_REACHED). `refs` can point at
+        artifacts (change id or branch, file paths, PR URL) instead of pasting them.
         """
         return call(svc.send, body=body, thread=thread, to=to, kind=kind, on=on, stance=stance,
                     reasons=reasons, refs=refs)

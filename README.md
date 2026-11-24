@@ -46,7 +46,24 @@ agent-bus ask "SQLite or a JSON file for a small CLI?" --with claude,codex,antig
 
 An agent can start one from its own chat with the `start_discussion` tool; it takes part with
 `send` + `wait`. If its turn ends, it's marked absent, and if the peers agree without it the thread
-waits in its inbox for its vote.
+waits in its inbox for its vote, until the deadline.
+
+A vote is `send(kind="vote", on="P2", stance="agree"|"object", reasons=…)`. `body` is optional for a
+vote, and the reasons are shown with it. Proposals arrive concurrently, so a vote can go to a proposal
+that a newer one has already followed. When that happens, `send` returns a `superseded` note, and
+`wait` returns `newer_proposals` while proposals from others are newer than your latest stance.
+Replies to your own moves (`send`, `wait`, `inbox`) leave out the thread's goal; `history` and
+`threads` show it.
+
+The deadline (`deadline_minutes`, default 30) is a hard cutoff. Once it passes, no new peer turn
+starts: a turn already running finishes within its time limit and its move counts. After that,
+proposals and votes, the initiator's included, are refused with `DEADLINE_REACHED`, and so is
+`advance_discussion`. The thread then goes to `needs_human` as soon as no job is working on it.
+This happens on the next MCP call or CLI command, or from `tail`. `agent-bus resume` reopens it
+with a new deadline.
+
+To collect feedback from peers, use `debrief` (see [Debriefs](#debriefs)), not a one-round
+discussion: a discussion always ends in consensus or `needs_human`.
 
 `wait(thread)` blocks for up to 55 s (clients' tool-call timeouts don't allow more). It returns
 as soon as something for you arrives. Routine notices ("Round 2 of 3", "Review requested from
