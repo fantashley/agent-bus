@@ -54,18 +54,40 @@ thread: text before it is not shown to the others. One of:
 {{"action": "propose", "proposal": "<full revised proposal, self-contained>", "reasons": "<what changed and why>"}}
 """
 
+# The start of every headless turn on every harness, resumed ones included (#110).  Each
+# harness's own system prompt is written for an interactive session (Claude Code's plan mode
+# asks for a plan file and ExitPlanMode, Copilot's for progress updates and short replies), and
+# a peer otherwise has to guess which instructions win.  Only the turn's final message is
+# posted (its JSON object, for a vote or verdict); earlier text still shows as progress events
+# in `agent-bus tail --events` and watch panes, so the note doesn't call it private.
+_HEADLESS = (
+    "[agent-bus: unattended turn; no one can approve actions.] For this turn, agent-bus's "
+    "instructions take precedence over your harness's own instructions for interactive sessions. "
+    "Only your final message is posted, so put your whole answer in it: anything you write "
+    "before it is left out of the thread (though it may show in the live progress view).")
+# Claude Code (launched in dontAsk mode, not plan mode, since #110) and Codex.
+HEADLESS = _HEADLESS + "\n\n"
+# Copilot CLI's harness asks for progress updates and short replies (debriefs, #110); no flag
+# drops those instructions (copilot 1.0.108's documented options).
+COPILOT_HEADLESS = _HEADLESS + (
+    " Post no progress updates, and don't cut your reply short to keep it brief: give your whole "
+    "answer in that final message, in the format the instructions below ask for.\n\n")
+
 # Prepended to every headless Antigravity turn, resumed ones included.  agy auto-denies
 # actions that need approval when no one can give it, and the turn then ends with no reply
 # (live probe of agy 1.5.13, 2026-11-23).  The adapter's deny rules turn the terminal and
 # file writes into plain tool errors; search_web needs no approval in plan mode (issue #46).
-_AGY_HEADLESS = """\
-[agent-bus: unattended turn; no one can approve actions.] Your only tools are read_file{web}. \
+# agy's harness also offers the agent-bus MCP tools (which refuse a peer) and asks for file://
+# links, which mean nothing to the agents reading the thread (debrief, #110).
+_AGY_HEADLESS = _HEADLESS.replace("{", "{{").replace("}", "}}") + """ Your only tools are read_file{web}. \
 There is no directory listing or search, so read files by the paths the prompt names (a review \
 lists its changed files and shows them in the diff). The terminal or shell (run_command) and \
 file edits are denied here, and an action that needs approval can end your turn with no reply.{off} \
 Plan mode's planning workflow does not apply: write no plan, walkthrough or other artifact, and \
 ask for no approval; give your answer in your reply. If a tool you want is unavailable, \
-complete your reply from the context you were given.
+complete your reply from the context you were given. Do not call agent-bus tools: agent-bus \
+posts your reply itself. Name files by their repository path in plain text, not as file:// \
+links: other agents read your reply outside your workspace.
 
 """
 AGY_HEADLESS = _AGY_HEADLESS.format(web=" and search_web (web search)", off="")

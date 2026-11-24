@@ -23,7 +23,7 @@ from typing import Callable
 from . import config as cfg
 from .config import Config
 from .db import new_uuid
-from .prompts import AGY_HEADLESS, AGY_HEADLESS_NO_WEB
+from .prompts import AGY_HEADLESS, AGY_HEADLESS_NO_WEB, COPILOT_HEADLESS, HEADLESS
 
 # argv entries above this size go through stdin or a file instead.
 MAX_ARG = 100_000
@@ -128,6 +128,10 @@ class Adapter:
     # The headless turn can run read-only shell commands (git), so a review prompt can give
     # it commands to read the pinned head (#93).
     shell: bool = False
+    # Starts every turn's prompt, resumed ones included: agent-bus's rules for a headless turn
+    # outrank the harness's own interactive-mode instructions (#110).  agy's is longer, and
+    # its adapter adds it itself.
+    headless: str = HEADLESS
 
     def event_type(self, obj: dict) -> str | None:
         t = obj.get("type")
@@ -769,7 +773,9 @@ class ClaudeAdapter(Adapter):
     agent = "claude"
     # 2: --tools limits the built-in tool inventory, not just what is pre-approved (issue #46).
     # 3: one --settings of agent-bus's own: awsAuthRefresh off, and the configured env (#36).
-    recipe = "3"
+    # 4: dontAsk instead of plan mode, and a --permission-mode in the configured args dropped
+    # (#110).
+    recipe = "4"
     known_events = frozenset({"system", "assistant", "user", "result", "rate_limit_event", "stream_event"})
     default_command = cfg.AGENT_INFO["claude"]["cli"]
     # Read-only tools only. No Bash at all: `jj`/`git` accept flags (--tool, --output,
@@ -780,10 +786,14 @@ class ClaudeAdapter(Adapter):
     def invocation(self, prompt, resume_id, cwd, add_dirs):
         # --strict-mcp-config with no --mcp-config loads no MCP servers at all.  --tools is
         # the session's whole built-in tool set (without it Bash, CronCreate and the rest stay
-        # declared, only unapproved); --allowedTools pre-approves the same list.
+        # declared, only unapproved); --allowedTools pre-approves the same list.  dontAsk denies
+        # whatever isn't pre-approved, rather than asking.  Plan mode was as locked down, but its
+        # system prompt asks for a plan file and ExitPlanMode, which a headless reply can't
+        # follow; dontAsk adds no instructions (Claude Code 2.1.331, live probes 2026-11-24: the
+        # same five tools declared, Write "No such tool available", a resumed turn works; #110).
         tools = ",".join(t for t in self.allowed_tools if self.web_search or t not in self.web_tool_names)
         argv = [self.command, "-p", "--output-format", "stream-json", "--verbose",
-                "--permission-mode", "plan", "--strict-mcp-config", "--tools", tools,
+                "--permission-mode", "dontAsk", "--strict-mcp-config", "--tools", tools,
                 "--allowedTools", tools]
         if not self.web_search:  # removed from the session, not just left unapproved
             argv += ["--disallowedTools", ",".join(self.web_tool_names)]
@@ -797,10 +807,10 @@ class ClaudeAdapter(Adapter):
             sid = new_uuid()
             argv += ["--session-id", sid]
         argv += ["--settings", json.dumps(self.flag_settings(), sort_keys=True)]
-        # Ours is the whole inventory, and the only flag settings (a second --settings could
-        # turn the credential refresh back on).
-        argv += _strip_flags(self.extra_args(), {"--tools", "--settings"})
-        return Invocation(argv=argv, stdin=prompt, external_id=sid)
+        # Ours is the whole inventory, the only flag settings (a second --settings could turn
+        # the credential refresh back on) and the only permission mode (a later one wins).
+        argv += _strip_flags(self.extra_args(), {"--tools", "--settings", "--permission-mode"})
+        return Invocation(argv=argv, stdin=self.headless + prompt, external_id=sid)
 
     def flag_settings(self) -> dict:
         """Settings passed with --settings, which outrank the user's and project's own
@@ -1083,7 +1093,7 @@ class CodexAdapter(Adapter):
             argv = [self.command, *profile, "exec", "resume", *common, *extra, resume_id, "-"]
         else:
             argv = [self.command, *profile, "exec", *common, "-C", cwd, *extra, "-"]
-        return Invocation(argv=argv, stdin=prompt, external_id=resume_id)
+        return Invocation(argv=argv, stdin=self.headless + prompt, external_id=resume_id)
 
     def parse_line(self, obj, st, emit):
         typ = obj.get("type")
@@ -1157,7 +1167,9 @@ class AntigravityAdapter(Adapter):
     # 3: deny rules for commands and file writes; the guidance offers web search (issue #46).
     # 4: a custom main agent whose tool list is the whole inventory (issue #54).
     # 5: --disable-slash-commands (issue #93).
-    recipe = "5"
+    # 6: the guidance (in --print) starts with the shared headless rules, and counters the
+    # harness's agent-bus tools and file:// links (#110).
+    recipe = "6"
     # agy 1.5.13 in plan mode declares search_web (Google-grounded search, run server side) but
     # no page fetch.  `search_web(*)` and `read_url(*)` deny rules are ignored, but a custom
     # agent's `tools` list removes it (live probes, 2026-11-23): see peer_agent.
@@ -1520,6 +1532,7 @@ class CopilotAdapter(Adapter):
     """GitHub Copilot CLI (`copilot -p`, 1.0.108; issue #2)."""
     agent = "copilot"
     recipe = "1"
+    headless = COPILOT_HEADLESS
     default_command = cfg.AGENT_INFO["copilot"]["cli"]
     # Every event type seen in live probes of 1.0.108 (2026-11-23), plus the error event its
     # code emits.
@@ -1610,7 +1623,7 @@ class CopilotAdapter(Adapter):
             sid = new_uuid()
             argv += ["--session-id", sid]
         argv += self.extra_args()
-        return Invocation(argv=argv, stdin=prompt, external_id=sid)
+        return Invocation(argv=argv, stdin=self.headless + prompt, external_id=sid)
 
     def parse_line(self, obj, st, emit):
         typ = obj.get("type")
