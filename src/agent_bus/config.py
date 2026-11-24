@@ -210,6 +210,7 @@ DEFAULTS = {
     "auto_resume_max": 3,
     "max_messages": 60,
     "max_diff_bytes": 200_000,
+    "max_snapshot_bytes": 256 * 1024 * 1024,
     "review_followup_budget": 3,
     "peers": {},
     "participants": {},
@@ -256,6 +257,9 @@ class Config:
     auto_resume_max: int = 3
     max_messages: int = 60
     max_diff_bytes: int = 200_000
+    # The most a review's read-only snapshot of its pinned head may hold (#111); over it, a
+    # sparse one (the changed files' directories), else none.  0 turns snapshots off.
+    max_snapshot_bytes: int = 256 * 1024 * 1024
     # Author follow-up requests on a review thread before agent-bus warns that the review is
     # running long (#71); a review still blocked after twice as many waits for the human.
     review_followup_budget: int = 3
@@ -283,6 +287,9 @@ class Config:
         if isinstance(conf.auto_resume_max, bool) or not isinstance(conf.auto_resume_max, int) \
                 or conf.auto_resume_max < 0:
             raise ValueError("auto_resume_max must be a whole number, 0 or more")
+        m = conf.max_snapshot_bytes
+        if isinstance(m, bool) or not isinstance(m, int) or m < 0:
+            raise ValueError("max_snapshot_bytes must be a whole number of bytes, 0 or more (0 turns snapshots off)")
         b = conf.review_followup_budget
         if isinstance(b, bool) or not isinstance(b, int) or b < 1:
             raise ValueError("review_followup_budget must be a whole number, 1 or more")

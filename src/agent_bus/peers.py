@@ -128,6 +128,9 @@ class Adapter:
     # The headless turn can run read-only shell commands (git), so a review prompt can give
     # it commands to read the pinned head (#93).
     shell: bool = False
+    # The turn can list directories or search, so a review prompt need not list the files of
+    # its pinned head's snapshot (#111).
+    lists_files: bool = True
     # Starts every turn's prompt, resumed ones included: agent-bus's rules for a headless turn
     # outrank the harness's own interactive-mode instructions (#110).  agy's is longer, and
     # its adapter adds it itself.
@@ -775,7 +778,8 @@ class ClaudeAdapter(Adapter):
     # 3: one --settings of agent-bus's own: awsAuthRefresh off, and the configured env (#36).
     # 4: dontAsk instead of plan mode, and a --permission-mode in the configured args dropped
     # (#110).
-    recipe = "4"
+    # 5: a review turn also gets its pinned head's read-only snapshot with --add-dir (#111).
+    recipe = "5"
     known_events = frozenset({"system", "assistant", "user", "result", "rate_limit_event", "stream_event"})
     default_command = cfg.AGENT_INFO["claude"]["cli"]
     # Read-only tools only. No Bash at all: `jj`/`git` accept flags (--tool, --output,
@@ -1169,7 +1173,9 @@ class AntigravityAdapter(Adapter):
     # 5: --disable-slash-commands (issue #93).
     # 6: the guidance (in --print) starts with the shared headless rules, and counters the
     # harness's agent-bus tools and file:// links (#110).
-    recipe = "6"
+    # 7: a review turn also gets its pinned head's read-only snapshot with --add-dir, and the
+    # guidance says the prompt lists its files (#111).
+    recipe = "7"
     # agy 1.5.13 in plan mode declares search_web (Google-grounded search, run server side) but
     # no page fetch.  `search_web(*)` and `read_url(*)` deny rules are ignored, but a custom
     # agent's `tools` list removes it (live probes, 2026-11-23): see peer_agent.
@@ -1190,6 +1196,7 @@ class AntigravityAdapter(Adapter):
     # them), but no mode declares them to the model, plan mode or not (live probes 2026-11-24,
     # issue #93); search would need run_command, which stays denied.
     agent_tools = ("read_file",)
+    lists_files = False
     web_tool_names = ("search_web",)
     # Session-only permission rules (Deny wins over any Allow or Ask, in agy's own settings
     # too).  Without them a command is auto-denied as needing approval and the turn ends with
@@ -1472,7 +1479,7 @@ def _copilot_strip(args: list[str], drop: set[str]) -> list[str]:
     return out
 
 
-def _copilot_repo_hooks_check(cwd: str) -> None:
+def _copilot_repo_hooks_check(cwd: str, repo_root: bool = True) -> None:
     """Refuse a checkout that defines repository hooks Copilot could run.
 
     Copilot loads a repository's hooks in -p mode when the folder is trusted, and nothing
@@ -1481,9 +1488,11 @@ def _copilot_repo_hooks_check(cwd: str) -> None:
     set, and sees the review prompt.  agent-bus can't tell whether the user trusted the
     folder, so any repository hook fails the turn (#98 covers the other harnesses).
     Copilot's own repo-wide off switch, ``disableAllHooks`` in .github/copilot/settings.json,
-    is honoured as Copilot resolves it: settings.local.json, applied after it, wins."""
+    is honoured as Copilot resolves it: settings.local.json, applied after it, wins.
+    ``repo_root`` False: only ``cwd`` itself, for an added directory (a review's snapshot of
+    its head, #111, which holds the head's own hook files)."""
     roots = [Path(cwd)]
-    for d in (Path(cwd), *Path(cwd).parents):  # the repository root, where Copilot looks
+    for d in (Path(cwd), *Path(cwd).parents) if repo_root else ():  # the repository root, where Copilot looks
         if (d / ".git").exists() or (d / ".jj").exists():
             if d != roots[0]:
                 roots.append(d)
@@ -1531,7 +1540,8 @@ def _copilot_repo_hooks_check(cwd: str) -> None:
 class CopilotAdapter(Adapter):
     """GitHub Copilot CLI (`copilot -p`, 1.0.108; issue #2)."""
     agent = "copilot"
-    recipe = "1"
+    # 2: a review turn also gets its pinned head's read-only snapshot with --add-dir (#111).
+    recipe = "2"
     headless = COPILOT_HEADLESS
     default_command = cfg.AGENT_INFO["copilot"]["cli"]
     # Every event type seen in live probes of 1.0.108 (2026-11-23), plus the error event its
@@ -1614,6 +1624,7 @@ class CopilotAdapter(Adapter):
         for name in self.mcp_servers(cwd):
             argv += ["--disable-mcp-server", name]
         for d in add_dirs:
+            _copilot_repo_hooks_check(d, repo_root=False)  # an added directory's files load too
             argv += ["--add-dir", d]
         argv += self.setting_args()
         sid = resume_id

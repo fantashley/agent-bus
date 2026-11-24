@@ -272,7 +272,8 @@ in
       description = ''
         Extra keys for config.json: max_rounds, deadline_minutes,
         turn_timeout_s, initiator_grace_s, quota_cooldown_s, max_messages, max_diff_bytes,
-        review_followup_budget,
+        review_followup_budget, max_snapshot_bytes (the cap on a review's read-only copy of
+        its pinned head; 0 turns those copies off),
         `peers.<agent>.{command,args}` to override how a peer CLI is run,
         `peers.codex.codex_home` for the CODEX_HOME Codex peers run with, and
         `peers.antigravity.allow_mcp = true` to let Antigravity peers run even

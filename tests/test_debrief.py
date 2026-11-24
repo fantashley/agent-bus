@@ -25,11 +25,19 @@ def calls(env):
 
 
 def without_prompt(argv):
-    """The argv minus the prompt itself (agy takes it as --print's value; the others on stdin)."""
+    """The argv minus the prompt itself (agy takes it as --print's value; the others on stdin),
+    and minus a review's snapshot directory (#111), which is gone once the thread is finished."""
     if "--print" in argv:
         i = argv.index("--print")
-        return argv[:i] + argv[i + 2:]
-    return argv
+        argv = argv[:i] + argv[i + 2:]
+    out = []
+    for i, a in enumerate(argv):
+        if a == "--add-dir" and i + 1 < len(argv) and "/snapshots/" in argv[i + 1]:
+            continue
+        if i and argv[i - 1] == "--add-dir" and "/snapshots/" in a:
+            continue
+        out.append(a)
+    return out
 
 
 def reviewed(env, reviewer):

@@ -123,12 +123,12 @@ def test_review_prompt_leads_with_files_commits_and_testing(env, no_spawn, monke
     assert f"Diff from base to head (base {base[:12]} to head {head[:12]}), the whole change, because this is your first pass" in p
     assert "time limit of about 1 minute." in p
     # codex has a shell: copyable read-only commands for the pinned head.
-    assert f"git -C {repo} show {head}:<path>" in p
+    assert f"git -C {repo} --no-replace-objects show {head}:<path>" in p
     assert "jj -R" not in p  # a plain git repo: no jj commands (#76)
-    # antigravity has only read_file: told the working copy may not match.
+    # antigravity has only read_file: it reads the pinned head's snapshot (#111).
     agy = calls(env)[1]
     assert agy["agent"] == "antigravity" and "git -C" not in agy["prompt"]
-    assert "may not match the head commit" in agy["prompt"]
+    assert f"are exactly head {head}" in agy["prompt"] and "may not match the head commit" not in agy["prompt"]
     for c in calls(env):
         no_doubled_braces(c["prompt"])
 
@@ -147,7 +147,7 @@ def test_review_prompt_gives_a_shell_reviewer_read_only_jj_commands_in_a_jj_repo
     run_job(bus, claude.request_review(None, str(repo), base, head, reviewers=BOTH)["thread"]["id"])
     codex, agy = calls(env)[:2]
     p = codex["prompt"]
-    assert f"git -C {repo} show {head}:<path>" in p
+    assert f"git -C {repo} --no-replace-objects show {head}:<path>" in p
     assert f"""jj -R {repo} --ignore-working-copy file show -r 'commit_id("{head}")' 'root:"<path>"'""" in p
     assert f"""--ignore-working-copy diff --git --from 'commit_id("{base}")' --to 'commit_id("{head}")'""" in p
     assert f"""jj -R {repo} --ignore-working-copy log -r 'commit_id("{base}")..commit_id("{head}")'""" in p

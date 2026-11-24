@@ -274,7 +274,7 @@ def test_git_probe_error_is_not_reported_as_missing(env, no_spawn, unchecked_com
     real_run = subprocess.run
     # A fatal git error (exit 128, e.g. bad config) is not proof the commit is missing.
     monkeypatch.setattr("agent_bus.worker.subprocess.run", lambda argv, **kw: real_run(
-        ["git", "-c", "=x", *argv[1:]] if argv[:2] == ["git", "rev-parse"] else argv, **kw))
+        ["git", "-c", "=x", *argv[1:]] if argv[:3] == ["git", "--no-replace-objects", "rev-parse"] else argv, **kw))
     with pytest.raises(RuntimeError, match="could not compute diff"):
         Worker(bus, bus.jobs(tid)[-1]["id"]).run()
     assert bus.thread(tid)["status"] == "open"
@@ -288,7 +288,7 @@ def test_unrelated_diff_failure_is_not_reported_as_missing(env, no_spawn, no_jj,
     tid = claude.request_review("codex", str(env["repo"]), real, real)["thread"]["id"]
     real_run = subprocess.run
     monkeypatch.setattr("agent_bus.worker.subprocess.run", lambda argv, **kw: real_run(
-        ["git", "diff", "--no-such-flag"] if argv[:2] == ["git", "diff"] else argv, **kw))
+        ["git", "diff", "--no-such-flag"] if argv[:3] == ["git", "--no-replace-objects", "diff"] else argv, **kw))
     with pytest.raises(RuntimeError, match="could not compute diff"):
         Worker(bus, bus.jobs(tid)[-1]["id"]).run()
     assert bus.thread(tid)["status"] == "open"

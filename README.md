@@ -150,8 +150,19 @@ same things in parallel:
   file even when the diff is cut short), the commit messages of base..head, and an optional
   `testing` note from `request_review` saying how you tested the head. Reviewers can't run
   tests, so they see it as your claim. The diff heading names the base and head, and says
-  whether it is the whole change or an interdiff, and why. Codex also gets copyable read-only
-  `git` commands for reading the pinned head, since the checkout may have moved on. The prompt
+  whether it is the whole change or an interdiff, and why. The checkout may have moved on since
+  the commits were pinned, so every reviewer also gets a **read-only snapshot of the head**:
+  the worker writes the head commit's files (exactly as committed, without untracked or ignored
+  files such as `node_modules`) under `~/.local/state/agent-bus/snapshots/<bus db>/<thread>/<head>`, and
+  the prompt says files there are exactly that head. Claude, Antigravity and Copilot get it as
+  an added directory (`--add-dir`); Codex reads it in its read-only sandbox. Antigravity, which
+  can't list directories or search, also gets the snapshot's file list (capped). A thread's
+  later turns on the same head reuse the snapshot; it is removed once the thread is no longer
+  open, and each worker sweeps stale ones when it starts. Over `max_snapshot_bytes` (256 MiB, or
+  50,000 files) the snapshot holds only the changed files and the other files in their
+  directories, and the prompt says so; over that too, or with `max_snapshot_bytes` set to 0,
+  there is none and the prompt says files on disk may not match. Codex also gets copyable
+  read-only `git` (and `jj`) commands for the pinned commits' history. The prompt
   states the turn's time limit, and that only the JSON verdict is posted.
 - A verdict counts only for the base and head it was given on. **Any new head (or a new base)
   makes every earlier approval stale**, so the review is complete (the thread resolves) once
