@@ -80,11 +80,11 @@ def test_configured_args_cannot_widen_the_turn(env):
         "--yolo", "--allow-all", "--available-tools", "bash", "apply_patch", "--allow-tool=shell",
         "--additional-mcp-config", "@x.json", "--enable-mcp-server", "github", "--plugin-dir", "/p",
         "--agent", "task", "--mode", "autopilot", "--allow-url", "evil.example", "--allow-all-urls",
-        "-Cdir", "--resume", "--trust-folder", "--config-dir", "/elsewhere", "--keep-me", "--model", "gpt-x", "--reasoning-effort", "low"]})
+        "-Cdir", "--resume", "--trust-folder", "--config-dir", "/elsewhere", "--add-dir", "/extra", "--effort", "low", "--keep-me", "--model", "gpt-x", "--reasoning-effort", "low"]})
     set_peers(env, copilot={"web_search": False})
     a = argv(env)
     for bad in ("--yolo", "--allow-all", "bash", "apply_patch", "--allow-tool=shell", "@x.json", "github", "/p",
-                "task", "autopilot", "evil.example", "--allow-all-urls", "-Cdir", "--trust-folder", "/elsewhere"):
+                "task", "autopilot", "evil.example", "--allow-all-urls", "-Cdir", "--trust-folder", "/elsewhere", "--add-dir", "/extra"):
         assert bad not in a
     assert a.count("--resume") == 0 and value(a, "--available-tools") == ["view,grep,rg,glob"]
     assert "--keep-me" in a and a[a.index("--model") + 1] == "gpt-x"  # model and effort pass through
@@ -94,11 +94,12 @@ def test_configured_args_cannot_widen_the_turn(env):
         "PROMPT", None, str(env["repo"]), []).argv
     assert a.count("--model") == 1 and a[a.index("--model") + 1] == "gpt-y"
     assert a.count("--reasoning-effort") == 1 and a[a.index("--reasoning-effort") + 1] == "high"
+    assert "--effort" not in a  # the alias can't override the configured effort
 
 
 def test_permission_env_never_reaches_the_cli(env, monkeypatch):
-    monkeypatch.setenv("COPILOT_ALLOW_ALL", "true")
-    monkeypatch.setenv("COPILOT_ASSISTED_APPROVAL", "1")
+    for name in CopilotAdapter.drop_env:
+        monkeypatch.setenv(name, "true")
     seen = {}
     real = subprocess.Popen
 
@@ -109,13 +110,15 @@ def test_permission_env_never_reaches_the_cli(env, monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", spy)
     res, _ = run(env)
-    assert res.ok and "COPILOT_ALLOW_ALL" not in seen and "COPILOT_ASSISTED_APPROVAL" not in seen
+    assert res.ok and "GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS" in CopilotAdapter.drop_env
+    assert not [n for n in CopilotAdapter.drop_env if n in seen]
     assert seen["AGENT_BUS_PEER"]
 
 
-def test_permission_env_is_refused_in_config(env):
-    set_peers(env, copilot={"env": {"COPILOT_ALLOW_ALL": "true"}})
-    with pytest.raises(ValueError, match="COPILOT_ALLOW_ALL"):
+@pytest.mark.parametrize("name", CopilotAdapter.drop_env)
+def test_permission_env_is_refused_in_config(env, name):
+    set_peers(env, copilot={"env": {name: "true"}})
+    with pytest.raises(ValueError, match=name):
         cfg.Config.load()
 
 
@@ -284,3 +287,15 @@ def test_only_the_per_model_rate_limit_is_scoped_to_the_model(env):
     assert one["scope"] == "model" and "scope" not in weekly
     assert quota.scope_for(conf, "copilot", "gpt-x", "heuristic", per_model=True) == "gpt-x"
     assert quota.scope_for(conf, "copilot", "gpt-x", "heuristic") == ""
+
+
+def test_copilot_model_in_env_names_the_quota_scope(env):
+    # COPILOT_MODEL picks the model below --model: two participants on one account that
+    # choose models this way get separate per-model blocks.
+    from agent_bus import quota
+    set_peers(env, copilot={"env": {"COPILOT_MODEL": "gpt-a"}})
+    conf = cfg.Config.load()
+    assert quota.effective_model(conf, "copilot", {}) == "gpt-a"
+    assert quota.effective_model(conf, "copilot", {"model": "gpt-b"}) == "gpt-b"
+    set_peers(env, copilot={"env": {"COPILOT_MODEL": "gpt-a"}, "args": ["--model", "gpt-c"]})
+    assert quota.effective_model(cfg.Config.load(), "copilot", {}) == "gpt-c"

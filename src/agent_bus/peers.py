@@ -1402,12 +1402,18 @@ _COPILOT_DROP = {
     "-r", "--resume", "--continue", "--session-id", "-n", "--name", "-C",
     "--output-format", "--stream", "-s", "--silent", "--share", "--share-gist", "--sync-session",
     "--usage-output-file", "--log-dir",
+    # Extra directories are the worker's to give (add_dirs): copilot also loads skills and
+    # agents from them as trusted configuration.
+    "--add-dir",
     # Another config directory has other MCP servers, which `copilot mcp list` (run without
     # these args) wouldn't see: set COPILOT_HOME in the participant's env instead.
     "--config-dir",
 }
-# Environment variables equivalent to permission flags (`copilot help environment`).
-_COPILOT_DROP_ENV = ("COPILOT_ALLOW_ALL", "COPILOT_ASSISTED_APPROVAL")
+# Environment variables equivalent to permission flags (`copilot help environment`), and
+# the opt-ins that load the checkout's own hooks and MCP servers in -p mode (off by default
+# there).
+_COPILOT_DROP_ENV = ("COPILOT_ALLOW_ALL", "COPILOT_ASSISTED_APPROVAL",
+                     "GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS", "GITHUB_COPILOT_PROMPT_MODE_WORKSPACE_MCP")
 COPILOT_USAGE = {"input": "input", "output": "output", "cache_read": "cache_read", "cache_write": "cache_write"}
 # Copilot's own usage-limit messages (`copilot help limits` and `help billing`, 1.0.108):
 # "You've hit the rate limit for this model.", "You've hit your session rate limit.",
@@ -1484,7 +1490,7 @@ class CopilotAdapter(Adapter):
         if self.settings.get("model"):
             drop.add("--model")
         if self.settings.get("effort"):
-            drop.add("--reasoning-effort")
+            drop |= {"--reasoning-effort", "--effort"}  # one option, two spellings
         return _copilot_strip(self.extra, drop)
 
     def mcp_servers(self, cwd: str) -> list[str]:

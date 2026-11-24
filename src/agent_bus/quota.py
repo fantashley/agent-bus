@@ -52,8 +52,8 @@ MODEL_FLAGS = {"codex": ("-m", "--model")}
 def effective_model(config: cfg.Config, agent: str, settings: dict) -> str | None:
     """The model participant ``agent``'s turn runs: the per-thread or config setting (which
     replaces any model flag in the extra args), else the last model flag the configured
-    extra args pass, else (Claude) ANTHROPIC_MODEL in its configured env, else None (the
-    CLI's default)."""
+    extra args pass, else ANTHROPIC_MODEL (Claude) or COPILOT_MODEL (Copilot) in its
+    configured env, else None (the CLI's default)."""
     if settings.get("model"):
         return settings["model"]
     flags = MODEL_FLAGS.get(config.harness_of(agent), ("--model",))
@@ -70,6 +70,9 @@ def effective_model(config: cfg.Config, agent: str, settings: dict) -> str | Non
     if found is None and config.harness_of(agent) == "claude":
         # Claude Code's model variable, when agent-bus sets it for the participant (#36).
         found = config.peer_env(agent).get("ANTHROPIC_MODEL") or None
+    elif found is None and config.harness_of(agent) == "copilot":
+        # Copilot's model variable, below --model in its precedence (#2).
+        found = config.peer_env(agent).get("COPILOT_MODEL") or None
     return found
 
 
