@@ -1,6 +1,8 @@
 """#93: what headless peers are shown, as the peers themselves reported it."""
 import json
+import shutil
 import string
+import subprocess
 
 import pytest
 
@@ -122,12 +124,36 @@ def test_review_prompt_leads_with_files_commits_and_testing(env, no_spawn, monke
     assert "time limit of about 1 minute." in p
     # codex has a shell: copyable read-only commands for the pinned head.
     assert f"git -C {repo} show {head}:<path>" in p
+    assert "jj -R" not in p  # a plain git repo: no jj commands (#76)
     # antigravity has only read_file: told the working copy may not match.
     agy = calls(env)[1]
     assert agy["agent"] == "antigravity" and "git -C" not in agy["prompt"]
     assert "may not match the head commit" in agy["prompt"]
     for c in calls(env):
         no_doubled_braces(c["prompt"])
+
+
+def test_review_prompt_gives_a_shell_reviewer_read_only_jj_commands_in_a_jj_repo(env, no_spawn, monkeypatch):
+    """#76: in a read-only sandbox a jj command without --ignore-working-copy fails on its
+    snapshot and git import locks, and @ is the workspace's own commit, not the head."""
+    if shutil.which("jj") is None:
+        pytest.skip("jj not installed")
+    monkeypatch.setenv("FAKE_APPROVE", "codex,antigravity")
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    head = commit("one\n")
+    subprocess.run(["jj", "git", "init", "--colocate"], cwd=repo, check=True, capture_output=True)
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    run_job(bus, claude.request_review(None, str(repo), base, head, reviewers=BOTH)["thread"]["id"])
+    codex, agy = calls(env)[:2]
+    p = codex["prompt"]
+    assert f"git -C {repo} show {head}:<path>" in p
+    assert f"""jj -R {repo} --ignore-working-copy file show -r 'commit_id("{head}")' 'root:"<path>"'""" in p
+    assert f"""--ignore-working-copy diff --git --from 'commit_id("{base}")' --to 'commit_id("{head}")'""" in p
+    assert f"""jj -R {repo} --ignore-working-copy log -r 'commit_id("{base}")..commit_id("{head}")'""" in p
+    assert "never @" in p
+    assert agy["agent"] == "antigravity" and "jj -R" not in agy["prompt"] and "git -C" not in agy["prompt"]
+    no_doubled_braces(p)
 
 
 def test_first_time_reviewer_on_a_later_head_gets_the_whole_change(env, no_spawn, monkeypatch):
