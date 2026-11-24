@@ -939,10 +939,14 @@ class Worker:
         # The self-contained prompt (first pass, retry, or a follow-up whose session can't be
         # resumed) always has the full base..head diff, the reviewer's earlier verdicts and
         # every note on the thread, so a fresh session never reviews a partial view.
-        # It approved, and the head moved only because another reviewer asked for changes since.
+        # It approved, and the head moved only because another reviewer asked for changes since
+        # (that reviewer's latest verdict still does).
+        others: dict[str, str] = {}
+        for m in everything:
+            if mine is not None and m["kind"] == "review_verdict" and m["id"] > mine["id"] and m["sender"] != reviewer:
+                others[m["sender"]] = m["data"].get("verdict")
         approved = (mine is not None and mine["data"].get("verdict") == "approve" and bool(refs.get("reviewers"))
-                    and any(m["kind"] == "review_verdict" and m["id"] > mine["id"] and m["sender"] != reviewer
-                            and m["data"].get("verdict") == "request_changes" for m in everything))
+                    and "request_changes" in others.values())
         fresh = self.review_prompt(t, refs, full_diff, full_heading, notes(everything), earlier,
                                    approved=approved, pushback=pushback)
         replies = "\n\n".join(prompts.render_message(m) for m in notes([m for m in everything

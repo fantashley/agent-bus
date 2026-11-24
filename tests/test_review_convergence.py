@@ -93,11 +93,14 @@ def test_failed_pushback_keeps_the_request_for_changes(env, no_spawn, monkeypatc
     tid = claude.request_review(None, str(repo), base, h1, reviewers=BOTH)["thread"]["id"]
     run_job(bus, tid)
     claude.send("evidence", thread=tid)
-    claude.request_review(None, str(repo), base, h1, prev_head_commit_id=h1, reviewers=BOTH)
+    first = claude.request_review(None, str(repo), base, h1, prev_head_commit_id=h1, reviewers=BOTH)
     monkeypatch.setenv("FAKE_EXHAUSTED", "codex")
     run_job(bus, tid)
     assert bus.thread(tid)["status"] == "needs_human"
     assert bus.review_standings(tid)["changes_requested"] == ["codex"]
+    # Repeating it is still the same request, not a second pushback.
+    again = claude.request_review(None, str(repo), base, h1, prev_head_commit_id=h1, reviewers=BOTH)
+    assert again["job"]["id"] == first["job"]["id"]
 
 
 def test_follow_up_budget_warns_then_waits_for_the_human(env, no_spawn):
@@ -251,9 +254,36 @@ def test_hard_stop_holds_even_if_the_worker_died_before_parking(env, no_spawn):
     # As if the worker died after the verdict, before it parked the thread.
     refs = {k: v for k, v in bus.thread(tid)["refs"].items() if k != "budget_parked"}
     bus.set_thread(tid, status="open", refs=json.dumps(refs))
+    h4 = commit("four\n")
     with pytest.raises(BusError) as e:
-        claude.request_review(None, str(repo), base, commit("four\n"), prev_head_commit_id=prev, reviewers=BOTH)
+        claude.request_review(None, str(repo), base, h4, prev_head_commit_id=prev, reviewers=BOTH)
     assert e.value.code == "REVIEW_LIMIT_REACHED"
+    # The human's resume lifts it, with no reviewer rerun on the same head.
+    res = Service(bus, HUMAN).resume(tid)
+    assert not res.get("job") and res["thread"]["followup_limit"] == 3
+    assert claude.request_review(None, str(repo), base, h4, prev_head_commit_id=prev, reviewers=BOTH)["job"]
+
+
+def test_single_reviewer_resume_lifts_an_unparked_over_limit_review(env, no_spawn):
+    set_config(env, review_followup_budget=1)
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    prev = commit("one\n")
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(repo), base, prev)["thread"]["id"]
+    run_job(bus, tid)
+    for text in ("two\n", "three\n"):
+        h = commit(text)
+        claude.request_review("codex", str(repo), base, h, prev_head_commit_id=prev)
+        run_job(bus, tid)
+        prev = h
+    refs = {k: v for k, v in bus.thread(tid)["refs"].items() if k != "budget_parked"}
+    bus.set_thread(tid, status="open", refs=json.dumps(refs))  # the worker died before parking
+    h4 = commit("four\n")
+    with pytest.raises(BusError):
+        claude.request_review("codex", str(repo), base, h4, prev_head_commit_id=prev)
+    Service(bus, HUMAN).resume(tid)
+    assert claude.request_review("codex", str(repo), base, h4, prev_head_commit_id=prev)["job"]
 
 
 def test_single_reviewer_failed_pushback_keeps_the_request_for_changes(env, no_spawn, monkeypatch):

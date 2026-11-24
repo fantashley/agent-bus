@@ -442,13 +442,22 @@ class Service:
         b = self.config.review_followup_budget
         return {"follow_ups": 0, "followup_budget": b, "followup_limit": 2 * b}
 
-    def _check_budget_park(self, t: dict) -> None:
-        """Refuse a follow-up on a review past its follow-up limit that still asks for changes
-        (parked for the human, or about to be: a worker can die before parking it)."""
+    def _over_budget(self, t: dict) -> bool:
+        """Whether a review is held for the human by its follow-up limit (#71): parked for
+        that, or past the limit with someone still asking for changes (a worker can die
+        between posting that verdict and parking the thread)."""
+        if t["kind"] != "review":
+            return False
+        refs = t["refs"] or {}
+        if t["status"] == "needs_human" and refs.get("budget_parked"):
+            return True
         p = review_progress(t)
-        parked = t["status"] == "needs_human" and (t["refs"] or {}).get("budget_parked")
-        if parked or (p["follow_ups"] >= p["followup_limit"]
-                      and self.bus.review_standings(t["id"])["changes_requested"]):
+        return p["follow_ups"] >= p["followup_limit"] and bool(self.bus.review_standings(t["id"])["changes_requested"])
+
+    def _check_budget_park(self, t: dict) -> None:
+        """Refuse a follow-up on a review held for the human by its follow-up limit."""
+        if self._over_budget(t):
+            p = review_progress(t)
             raise BusError("REVIEW_LIMIT_REACHED", f"{t['id']} still had changes requested after "
                            f"{p['follow_ups']} follow-up requests, so it waits for the human user: ask them to "
                            f"settle the open findings or run `agent-bus resume {t['id']}` to allow more "
@@ -478,6 +487,8 @@ class Service:
             return False
         target = standing["changes_requested"][0]
         verdict = self.bus.last_verdict(t["id"], target)
+        if (t["refs"] or {}).get("pushback_round") == t["round"] and verdict["round"] < t["round"]:
+            return False  # the pushback pass this request started gave no verdict: a retry
         fresh = target not in ((t["refs"] or {}).get("pushbacks") or {})
         return self._note_since(t, verdict["id"]) is not None or bool(fresh and focus and focus.strip())
 
@@ -849,7 +860,7 @@ class Service:
         note = ((f"Resumed by the human user with {extra_rounds} more round(s)."
                  if t["kind"] == "discussion" else "Resumed by the human user.")
                 + (f" It allows {self.config.review_followup_budget} more follow-up request(s); request review "
-                   "again to continue." if (t["refs"] or {}).get("budget_parked") else "")
+                   "again to continue." if self._over_budget(t) else "")
                 + (f" Cleared out-of-usage state for {', '.join(cleared)}." if cleared else "")
                 + (f" Cleared format-drift state for {', '.join(drifted)}." if drifted else ""))
         return self._reopen(t, extra_rounds, note, auto_resumes=0, key=f"{time.time():.0f}")
@@ -896,13 +907,13 @@ class Service:
         if t["kind"] == "discussion":
             fields["max_rounds"] = max(t["max_rounds"], t["round"]) + extra_rounds
             fields["deadline"] = time.time() + self.config.deadline_minutes * 60
-        parked = t["kind"] == "review" and bool((t["refs"] or {}).get("budget_parked"))
+        parked = self._over_budget(t)
         if t["refs"] is not None or auto_resumes:
             refs = {**(t["refs"] or {}), "auto_resumes": auto_resumes}
             if parked:
                 # Over its follow-up limit (#71): allow another budget's worth of follow-ups,
                 # then wait for the author's next request (no reviewer reruns on the same head).
-                refs.pop("budget_parked")
+                refs.pop("budget_parked", None)
                 refs["followup_limit"] = review_progress(t)["follow_ups"] + self.config.review_followup_budget
             if t["kind"] == "review" and not refs.get("reviewers") and self._revision_pass(t) is None:
                 # A round #59 left without a pass: its reviewer's session may never have seen
