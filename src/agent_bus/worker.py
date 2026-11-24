@@ -11,6 +11,7 @@ that stalled and lost its lease can't post over the worker that replaced it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -27,7 +28,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from . import config as cfg
-from . import autoresume, prompts, quota, snapshot, unvotable
+from . import autoresume, prompts, quota, snapshot, unvotable, usages
 from .db import HUMAN, SYSTEM, Bus, BusError, format_dissent, review_progress
 from .peers import ADAPTERS, Adapter, TurnResult, adapter, cli_version, extract_json, format_usage
 
@@ -438,7 +439,17 @@ class Worker:
         # the turn spends more (issue #26).
         near = quota.near_limit(self.bus, self.config, agent)
         # A debrief is labelled as one: "round N (resumed)" would read as another review pass (#100).
-        label = "debrief" if self.debriefing else f"round {t['round']}"
+        # A review turn counts its reviewer's own passes, not the thread's: a reviewer's first
+        # turn on a several-reviewer thread is its pass 1, whatever round the thread is in (#117).
+        # A repair or retry turn belongs to the pass that has no verdict yet.
+        if self.debriefing:
+            label = "debrief"
+        elif t["kind"] == "review":
+            done = self.bus._one("SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender=?"
+                                 " AND kind='review_verdict'", self.thread_id, agent)["n"]
+            label = f"pass {done + 1}"
+        else:
+            label = f"round {t['round']}"
         self.event("turn_start", label + (" (resumed)" if resume_id else "") + shown
                    + f" · {version} · recipe {ad.agent}/{ad.recipe}"
                    + (" · near its usage limit: " + "; ".join(map(quota.describe_window, near)) if near else ""),
@@ -1182,7 +1193,7 @@ class Worker:
                                            if approved else "")
             prompt = prompts.REVIEW_FOLLOWUP.format(
                 head=refs["head_commit_id"], prev=refs["prev_head_commit_id"], replies=replies,
-                rebase=rebase_note, reading=self.reading_note(refs, snap), converge=converge,
+                rebase=rebase_note, reading=self.reading_note(refs, snap, diff=inter), converge=converge,
                 severity=prompts.SEVERITY, budget=budget_note(t),
                 time_limit=self.time_limit_note(), overview=self.review_overview(t, refs, inter, "interdiff"),
                 diff_heading=inter_heading, diff=inter, verdict_format=prompts.VERDICT_FORMAT)
@@ -1321,7 +1332,7 @@ class Worker:
                   + ("." if earlier else " and look for problems not already raised.")
                   if refs.get("reviewers") else ""),
             focus=self.review_notes(t, refs, notes, focus),
-            overview=self.review_overview(t, refs, diff, "change"), reading=self.reading_note(refs, snap),
+            overview=self.review_overview(t, refs, diff, "change"), reading=self.reading_note(refs, snap, diff=diff),
             time_limit=self.time_limit_note(),
             severity=prompts.SEVERITY, converge=converge,
             diff_heading=heading, diff=diff, verdict_format=prompts.VERDICT_FORMAT)
@@ -1350,12 +1361,54 @@ class Worker:
             self.event("snapshot", f"no snapshot of head {snap.head[:12]}: {snap.reason}")
         return snap
 
-    def reading_note(self, refs: dict, snap: snapshot.Snapshot | None = None, listing: bool = True) -> str:
+    def reading_note(self, refs: dict, snap: snapshot.Snapshot | None = None, listing: bool = True,
+                     diff: str | None = None) -> str:
         """How the reviewer can read the pinned head: the snapshot's path (#111), with its
-        file list for a reviewer that can't list directories or search; copyable read-only git
+        file list for a reviewer that can't list directories or search, and where the names
+        ``diff`` defines or edits are used at the head (#117); copyable read-only git
         commands for a reviewer with a shell, in a repository git can read, and jj ones that
-        work in a read-only sandbox in a jj repository (#93, #76); with neither, a note that
-        files on disk may not match the head."""
+        work in a read-only sandbox in a jj repository (#93, #76), with a hint to read a few
+        files or a line range at a time; with neither, a note that files on disk may not
+        match the head."""
+        out = self._reading_note(refs, snap, listing)
+        try:
+            ad = ADAPTERS[self.config.harness_of(refs["reviewer"])]
+        except (KeyError, ValueError):
+            ad = None
+        if ad is not None and ad.shell:
+            out += prompts.READ_TIP_SHELL
+        if ad is not None and not ad.lists_files and diff and listing:
+            out += self.usages_note(refs, diff, snap)
+        return out
+
+    def usages_note(self, refs: dict, diff: str, snap: snapshot.Snapshot | None = None) -> str:
+        """The usages section for a reviewer with no search tool (#117); best effort, and
+        searched once per head and diff (a follow-up's prompt and its fresh fallback share it)."""
+        # The files the reviewer can read at the head: a full snapshot's are all of them; a
+        # sparse one holds some; with none, reads come from the working copy (none are sure).
+        readable = (None if snap is not None and snap.path and snap.mode == "full"
+                    else frozenset(snap.files) if snap is not None and snap.path else frozenset())
+        key = (refs["repo"], refs["head_commit_id"], hashlib.sha256(diff.encode("utf-8", "surrogateescape")).hexdigest(),
+               readable)
+        cache = self.__dict__.setdefault("_usages", {})
+        if key not in cache:
+            try:
+                cache[key] = usages.note(refs["repo"], refs["head_commit_id"], diff, readable)
+            except Exception as e:  # noqa: BLE001 (never what fails a review)
+                cache[key] = ("", False, False)
+                self.event("usages", f"no usage search: {e!r}")
+            else:
+                if cache[key][0]:
+                    self.event("usages", f"usages at head {refs['head_commit_id'][:12]} of the names the diff "
+                               f"touches: {len(cache[key][0])} characters")
+        hits, cut, outside = cache[key]
+        if not hits:
+            return ""
+        return prompts.USAGES.format(head=refs["head_commit_id"], hits=hits,
+                                     capped=prompts.USAGES_CUT if cut else "",
+                                     outside=prompts.USAGES_OUTSIDE if outside else "")
+
+    def _reading_note(self, refs: dict, snap: snapshot.Snapshot | None, listing: bool) -> str:
         try:
             ad = ADAPTERS[self.config.harness_of(refs["reviewer"])]
         except (KeyError, ValueError):
@@ -1373,6 +1426,8 @@ class Worker:
                 return out + prompts.READ_HEAD_FILES
             return out + prompts.READ_HEAD_SHELL.format(commands=commands.format(**ids))
         out = prompts.SNAPSHOT.format(path=snap.path, head=snap.head)
+        if shell:
+            out += prompts.SNAPSHOT_SHELL.format(path=shlex.quote(snap.path))
         if snap.mode == "sparse":
             out += prompts.SNAPSHOT_SPARSE.format(n=len(snap.files), total=snap.tree_files)
         if listing and not lists:

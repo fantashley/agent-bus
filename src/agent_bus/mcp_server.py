@@ -210,7 +210,9 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         such as "Round 2 of 3" or "Review requested from ..." don't end the wait by
         themselves; they come with the next message or on timeout. On timeout it returns
         {"status": "timeout"} with the thread's state and `progress`: per peer working on
-        it, the turn's state, elapsed time, latest activity and tool calls. Call again to
+        it, the turn's state, elapsed time, latest activity and tool calls. On a review thread
+        every result also has `review` (approved / changes_requested / pending per reviewer at
+        the current head) and `next_action` (wait, fix, done or stop). Call again to
         keep waiting; one wait at a time is enough (concurrent waits on a thread share what
         wakes them). after_message_id replays everything after that message, e.g. a reply lost
         when the connection dropped.

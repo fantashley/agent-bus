@@ -99,7 +99,7 @@ def test_debrief_resumes_the_review_session_with_the_same_hardening(env, no_spaw
     starts = [(j["kind"], e["text"]) for j in bus.jobs(tid) for e in bus.events(tid, job_id=j["id"])
               if e["kind"] == "turn_start" and e["agent"] == reviewer]
     labels = [text.split(" · ")[0] for _, text in starts]
-    assert labels == ["round 1", "round 2 (resumed)", "debrief (resumed)"]
+    assert labels == ["pass 1", "pass 2 (resumed)", "debrief (resumed)"]
     assert starts[-1][0] == "debrief"
     # Its tokens are accounted like any turn's.
     job = bus.jobs(tid)[-1]
