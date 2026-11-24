@@ -125,6 +125,9 @@ class Adapter:
     # Variables removed from the CLI's environment: ones that would widen what a headless
     # turn may do, whatever its flags say.
     drop_env: tuple[str, ...] = ()
+    # The headless turn can run read-only shell commands (git), so a review prompt can give
+    # it commands to read the pinned head (#93).
+    shell: bool = False
 
     def event_type(self, obj: dict) -> str | None:
         t = obj.get("type")
@@ -963,6 +966,8 @@ class CodexAdapter(Adapter):
     # `turn.completed.usage` after `exec resume` counts every turn of the session so far
     # (codex 0.171.0, live probe 2026-11-23; tests/data/streams/codex-resume.jsonl too).
     session_usage = True
+    # Commands run in codex's read-only sandbox.
+    shell = True
 
     def mcp_servers(self, cwd: str) -> list[str]:
         """Live MCP servers as codex would load them in ``cwd`` (project config included).
@@ -1151,7 +1156,8 @@ class AntigravityAdapter(Adapter):
     # 2: headless tool guidance in every prompt; denied actions reported as an incomplete turn.
     # 3: deny rules for commands and file writes; the guidance offers web search (issue #46).
     # 4: a custom main agent whose tool list is the whole inventory (issue #54).
-    recipe = "4"
+    # 5: --disable-slash-commands (issue #93).
+    recipe = "5"
     # agy 1.5.13 in plan mode declares search_web (Google-grounded search, run server side) but
     # no page fetch.  `search_web(*)` and `read_url(*)` deny rules are ignored, but a custom
     # agent's `tools` list removes it (live probes, 2026-11-23): see peer_agent.
@@ -1168,6 +1174,9 @@ class AntigravityAdapter(Adapter):
     # run_workflow runs a Python orchestration script.  An agent's `tools` list is the whole
     # inventory apart from manage_task (background tasks of this conversation, none of which
     # can start without run_command) and the MCP tools (agent-bus only, see check_isolation).
+    # agy 1.5.13's registry also has list_dir, grep_search and find_by_name (an agent may list
+    # them), but no mode declares them to the model, plan mode or not (live probes 2026-11-24,
+    # issue #93); search would need run_command, which stays denied.
     agent_tools = ("read_file",)
     web_tool_names = ("search_web",)
     # Session-only permission rules (Deny wins over any Allow or Ask, in agy's own settings
@@ -1254,7 +1263,11 @@ class AntigravityAdapter(Adapter):
     def invocation(self, prompt, resume_id, cwd, add_dirs):
         self.check_isolation()
         name, agent_dir = self.peer_agent()
-        argv = [self.command, "--mode", "plan", "--sandbox", "--output-format", "stream-json",
+        # --disable-slash-commands: in print mode, no slash command or skill expands from the
+        # prompt (peer text included), and plan mode leaves out its /plan meta-prompt, which
+        # asks for plan and walkthrough artifacts and user approval (live probe, agy 1.5.13,
+        # 2026-11-24, issue #93).
+        argv = [self.command, "--mode", "plan", "--sandbox", "--disable-slash-commands", "--output-format", "stream-json",
                 "--settings", json.dumps({"permissions": {"deny": list(self.deny_rules)}}),
                 "--agent", name, "--add-dir", agent_dir]
         for d in add_dirs:

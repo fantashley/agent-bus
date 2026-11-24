@@ -98,6 +98,13 @@ same things in parallel:
   reviewer new to the change gets the full diff plus the earlier verdicts (each naming the head
   it was given on) and your notes; one that reviewed before resumes its own conversation with
   the interdiff since the head it last saw and everything posted since.
+- Each review prompt starts with the changed files (with lines added and removed, listing every
+  file even when the diff is cut short), the commit messages of base..head, and an optional
+  `testing` note from `request_review` saying how you tested the head. Reviewers can't run
+  tests, so they see it as your claim. The diff heading names the base and head, and says
+  whether it is the whole change or an interdiff, and why. Codex also gets copyable read-only
+  `git` commands for reading the pinned head, since the checkout may have moved on. The prompt
+  states the turn's time limit, and that only the JSON verdict is posted.
 - A verdict counts only for the base and head it was given on. **Any new head (or a new base)
   makes every earlier approval stale**, so the review is complete (the thread resolves) once
   every required reviewer has approved the same base..head. Re-reviews are follow-ups, so
@@ -269,7 +276,12 @@ and agy 1.5.13:
   That removes `invoke_subagent`, `swarm`, `schedule`, `run_workflow`, `send_message` and the
   rest: no deny rule covers them, and a sub-agent in a "branch" workspace creates a branch and
   a git worktree in the reviewed repo. An `--agent` (or `-agent`: agy takes single-dash flags too) in `peers.antigravity.args`
-  is dropped, and so is `-settings`.
+  is dropped, and so is `-settings`. agy's `list_dir`, `grep_search` and `find_by_name` aren't
+  offered: agy 1.5.13 never declares them to the model, and searching through the shell would
+  mean replacing the blanket command deny with an allowlist of git and rg flags. Turns also
+  pass `--disable-slash-commands`, so nothing in the prompt expands as a slash command or skill,
+  and plan mode leaves out its `/plan` meta-prompt (plan and walkthrough artifacts and asking
+  for approval).
 
 Pages a peer reads are untrusted. A peer's reply already reaches you and the other agents as
 `peer_data`, and a peer can't write files, use the network from a shell, or run commands at

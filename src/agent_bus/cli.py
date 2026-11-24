@@ -111,7 +111,7 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
                 for e in bus.events(args.thread, after_id=last_ev, agent=args.peer):
                     last_ev = e["id"]
                     if e["kind"] in ("text", "tool", "thinking", "turn_start", "turn_end", "error", "format",
-                                       "relaunch", "api_retry"):
+                                       "relaunch", "api_retry", "repair"):
                         who = e["agent"] or "worker"
                         print(_color(SYSTEM, f"  · {who} {e['kind']}: {e['text']}", color), flush=True)
             st = peer_status(bus, args.thread, args.peer) if args.peer else thread_status(bus, args.thread)
