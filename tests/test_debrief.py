@@ -73,7 +73,7 @@ def test_debrief_resumes_the_review_session_with_the_same_hardening(env, no_spaw
     assert debrief["codex_home"] == review["codex_home"] and debrief["peer_env"] and review["peer_env"]
     resume_flag = {"claude": "--resume", "codex": "resume", "antigravity": "--conversation"}[reviewer]
     assert resume_flag in debrief["argv"] and before[2] in debrief["argv"]
-    hardening = {"claude": ["--permission-mode", "plan", "--strict-mcp-config"],
+    hardening = {"claude": ["--permission-mode", "dontAsk", "--strict-mcp-config"],
                  "codex": ['sandbox_mode="read-only"', 'approval_policy="never"', "mcp_servers.github.enabled=false"],
                  "antigravity": ["--mode", "plan", "--sandbox", "--agent"]}[reviewer]
     assert all(h in debrief["argv"] for h in hardening)

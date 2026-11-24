@@ -10,7 +10,7 @@ directly, instead of a human relaying messages between windows. Designed in
   deleted; read state is a per-session, per-thread cursor.
 - **On-demand worker, no daemon.** Typed actions (`start_discussion`, `advance_discussion`, `debrief`,
   `request_review`) queue a job and spawn `agent-bus run-job <id>`, which holds an SQLite lease and
-  runs the peers headless and read-only (`claude -p --permission-mode plan`,
+  runs the peers headless and read-only (`claude -p --permission-mode dontAsk`,
   `codex exec` with a read-only sandbox, `agy --mode plan --sandbox`), resuming each peer's
   conversation every round.
 - **Safety in the server:** peer text (including an agent's discussion question) is returned as
@@ -281,7 +281,11 @@ What keeps the rest read-only, checked with live probes of Claude Code 2.1.330, 
 and agy 1.5.13:
 - **Claude Code:** `--tools` limits the session to Read, Grep, Glob and the web tools. Without
   it, Bash, CronCreate and the other built-in tools are still declared, just not pre-approved.
-  A `--tools` in `peers.claude.args` is dropped.
+  A `--tools` in `peers.claude.args` is dropped. The permission mode is `dontAsk`, which denies
+  anything not pre-approved instead of asking, and a `--permission-mode` in `peers.claude.args`
+  is dropped. Plan mode was as locked down, but its system prompt asks for a plan file and
+  `ExitPlanMode`, which a headless reply can't follow (live probes of 2.1.331: the same five
+  tools are declared, and `Write` is "No such tool available").
 - **Codex:** the read-only sandbox blocks writes and shell network access (`touch` fails with a
   read-only file system, `curl` can't resolve hosts). The `apps` feature is turned off because
   it adds a `codex_apps` MCP server, which `codex mcp list` doesn't show, with tools such as
@@ -330,6 +334,12 @@ and agy 1.5.13:
   pass `--disable-slash-commands`, so nothing in the prompt expands as a slash command or skill,
   and plan mode leaves out its `/plan` meta-prompt (plan and walkthrough artifacts and asking
   for approval).
+- **Every harness:** each turn's prompt, resumed ones included, starts with a note that
+  agent-bus's instructions take precedence over the harness's own instructions for interactive
+  sessions, and that only the final message is posted (earlier text can still show in the
+  live progress view). Copilot's also says to post no progress
+  updates and not to cut the reply short (its harness asks for both, and no flag drops that).
+  Antigravity's says not to call agent-bus tools and to name files by path, not `file://` links.
 
 Pages a peer reads are untrusted. A peer's reply already reaches you and the other agents as
 `peer_data`, and a peer can't write files, use the network from a shell, or run commands at
