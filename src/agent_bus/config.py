@@ -596,15 +596,49 @@ def repo_root(path: str | os.PathLike) -> str:
     return path
 
 
+def _launched_from() -> str | None:
+    """The resolved path of the installed `agent-bus` script this process started as, if any."""
+    argv0 = sys.argv[0] if sys.argv else ""
+    if os.path.basename(argv0).startswith("agent-bus") and os.access(argv0, os.X_OK):
+        return os.path.realpath(argv0)
+    return None
+
+
+# Resolved once at startup: a link argv[0] went through (a profile's bin/agent-bus) may move
+# to another build while this process keeps running the one it started with.
+_LAUNCHED_FROM = _launched_from()
+
+
 def self_command() -> list[str]:
     """How to re-invoke this program (used to spawn workers and viewers)."""
     env = os.environ.get("AGENT_BUS_BIN")
     if env:
         return [env]
-    argv0 = sys.argv[0] if sys.argv else ""
-    if os.path.basename(argv0).startswith("agent-bus") and os.access(argv0, os.X_OK):
-        return [os.path.abspath(argv0)]
+    # The build this process started as, while it's still installed (cleanup can remove it).
+    if _LAUNCHED_FROM and os.access(_LAUNCHED_FROM, os.X_OK):
+        return [_LAUNCHED_FROM]
     found = shutil.which("agent-bus")
     if found:
         return [found]
     return [sys.executable, "-m", "agent_bus"]
+
+
+def stale_build() -> dict | None:
+    """When this process runs a different agent-bus install than the `agent-bus` on PATH.
+
+    After an upgrade, a long-lived MCP server keeps running the build it started with (and
+    spawns its workers from that build) until its client restarts it.  Compares the path this
+    process started from, resolved at startup, with PATH's `agent-bus` resolved now; None when
+    they match or either can't be told (not started as an installed `agent-bus` script, or
+    none on PATH).
+    """
+    found = shutil.which("agent-bus")
+    if not _LAUNCHED_FROM or not found:
+        return None
+    on_path = os.path.realpath(found)
+    if _LAUNCHED_FROM == on_path:
+        return None
+    return {"running": _LAUNCHED_FROM, "on_path": on_path,
+            "hint": "This agent-bus MCP server is a different build from the agent-bus on PATH "
+                    "(likely started before an upgrade), and the review workers it starts use it "
+                    "too. Restart it: /reload-plugins in Claude Code, or restart the client."}

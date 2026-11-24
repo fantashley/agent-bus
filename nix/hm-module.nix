@@ -6,10 +6,14 @@ self:
 # Installs the CLI, writes ~/.config/agent-bus/config.json, and registers the
 # MCP server with each client without touching their mutable config files:
 #
-# - Claude Code: a local plugin served from a directory marketplace in the
-#   store. When the importing config defines `local.claude` options,
-#   it is enabled through local.claude.extraKnownMarketplaces/enabledPlugins;
-#   otherwise wire `local.agentBus.claudeMarketplace` up yourself.
+# - Claude Code: a local plugin served from a directory marketplace linked at a
+#   stable path (`local.agentBus.claudeMarketplacePath`), whose commands run the
+#   agent-bus in the Home Manager profile. Claude Code remembers a marketplace's
+#   path in ~/.claude/plugins/known_marketplaces.json and doesn't follow later
+#   settings changes, so a store path there would pin it to one build. When the
+#   importing config defines `local.claude` options, it is enabled through
+#   local.claude.extraKnownMarketplaces/enabledPlugins; otherwise register the path
+#   yourself. Activation moves a registration of an older store path to the stable one.
 # - Codex: `agent-bus setup-codex` at activation, which runs `codex mcp add`
 #   and sets env_vars on that one entry (so REX_* reach the server), skipped
 #   when the entry already matches; the rest of ~/.codex/config.toml is left alone.
@@ -22,6 +26,10 @@ self:
 let
   cfg = config.local.agentBus;
   bin = lib.getExe cfg.package;
+  # The profile's agent-bus, for commands kept in places that outlive a rebuild (the
+  # Claude Code plugin, Codex hooks): it always runs the current build.
+  profileBin = "${config.home.profileDirectory}/bin/agent-bus";
+  claudeMarketplacePath = "${config.xdg.dataHome}/agent-bus/claude-marketplace";
   json = pkgs.formats.json { };
 
   mcpEntry = agent: {
@@ -46,7 +54,7 @@ let
       version = cfg.package.version;
       description = "Talk to Codex and Antigravity over the local agent bus";
     }} $out/plugins/agent-bus/.claude-plugin/plugin.json
-    cp ${json.generate "mcp.json" { mcpServers.agent-bus = mcpEntry "claude"; }} \
+    cp ${json.generate "mcp.json" { mcpServers.agent-bus = mcpEntry "claude" // { command = profileBin; }; }} \
       $out/plugins/agent-bus/.mcp.json
   '' + lib.optionalString cfg.claude.hooks.enable ''
     mkdir -p $out/plugins/agent-bus/hooks
@@ -57,7 +65,7 @@ let
   # and at most one Stop continuation per human turn. See README "Hooks".
   hookCmd = event: {
     type = "command";
-    command = "${bin} hook --client claude --event ${event}";
+    command = "${lib.escapeShellArg profileBin} hook --client claude --event ${event}";
     timeout = 5;
   };
   claudeHooks = json.generate "hooks.json" {
@@ -390,7 +398,21 @@ in
       type = lib.types.package;
       readOnly = true;
       default = claudeMarketplace;
-      description = "Directory marketplace holding the agent-bus Claude Code plugin.";
+      description = ''
+        Directory marketplace holding the agent-bus Claude Code plugin. Register
+        `claudeMarketplacePath` rather than this store path, which changes with every build.
+      '';
+    };
+    claudeMarketplacePath = lib.mkOption {
+      type = lib.types.str;
+      readOnly = true;
+      default = claudeMarketplacePath;
+      defaultText = lib.literalExpression ''"''${config.xdg.dataHome}/agent-bus/claude-marketplace"'';
+      description = ''
+        Stable path linked to `claudeMarketplace`, to register with Claude Code as a
+        directory marketplace. The link follows each rebuild, so Claude Code picks up a new
+        build on its next start or `/reload-plugins` without re-adding the marketplace.
+      '';
     };
   };
 
@@ -420,7 +442,7 @@ in
           # can see which Rex block it's in; a no-op when it already matches.
           ${if cfg.codex.hooks.enable then ''
             run ${lib.escapeShellArg bin} setup-codex --bin ${lib.escapeShellArg bin} \
-              --hooks --hooks-bin ${lib.escapeShellArg "${config.home.profileDirectory}/bin/agent-bus"}
+              --hooks --hooks-bin ${lib.escapeShellArg profileBin}
           '' else ''
             run ${lib.escapeShellArg bin} setup-codex --bin ${lib.escapeShellArg bin}
             if [ -e "''${CODEX_HOME:-$HOME/.codex}/hooks.json" ]; then
@@ -435,10 +457,44 @@ in
       '';
     })
 
+    (lib.mkIf cfg.claude.enable {
+      xdg.dataFile."agent-bus/claude-marketplace".source = claudeMarketplace;
+
+      # Claude Code adds a marketplace once (from settings.json or `claude plugin marketplace
+      # add`) and then keeps its own record of the path, so an install that registered one of
+      # this module's store paths, as it did before the stable link, keeps loading that build.
+      # Point such a record at the stable path. A no-op once it's there, and other paths (a
+      # checkout you registered on purpose) are left alone; when Claude Code hasn't recorded
+      # the marketplace yet, it adds it from settings.json by itself.
+      # Re-adding is enough: Claude Code runs a directory marketplace's plugin from the
+      # marketplace directory, not from its versioned copy in plugins/cache (checked with
+      # Claude Code 2.1: `claude plugin list` reports "Read from: <marketplace>/plugins/agent-bus"
+      # and `claude mcp list` follows content swapped at the same version).
+      home.activation.agentBusClaudeMarketplace = lib.hm.dag.entryAfter [ "writeBoundary" "installPackages" "linkGeneration" ] ''
+        PATH="${config.home.profileDirectory}/bin:/etc/profiles/per-user/${config.home.username}/bin:$PATH"
+        # Where the claude CLI keeps its plugin registry (CLAUDE_CODE_PLUGIN_CACHE_DIR moves it).
+        known="''${CLAUDE_CODE_PLUGIN_CACHE_DIR:-''${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins}/known_marketplaces.json"
+        if [ -f "$known" ]; then
+          registered=$(${lib.getExe pkgs.jq} -r '."agent-bus".source.path // empty' "$known" 2>/dev/null || true)
+          case "$registered" in
+            ${builtins.storeDir}/*-agent-bus-claude-marketplace)
+              if command -v claude >/dev/null 2>&1; then
+                if ! run claude plugin marketplace add ${lib.escapeShellArg claudeMarketplacePath} </dev/null; then
+                  warnEcho "agent-bus: could not re-register the Claude Code marketplace; run: claude plugin marketplace add ${claudeMarketplacePath}"
+                fi
+              else
+                warnEcho "agent-bus: claude not on PATH; run: claude plugin marketplace add ${claudeMarketplacePath}"
+              fi
+              ;;
+          esac
+        fi
+      '';
+    })
+
     (lib.mkIf cfg.claude.enable (lib.optionalAttrs hasDotfilesClaude {
       local.claude.extraKnownMarketplaces.agent-bus.source = {
         source = "directory";
-        path = "${claudeMarketplace}";
+        path = claudeMarketplacePath;
       };
       local.claude.enabledPlugins."agent-bus@agent-bus" = true;
     }))
