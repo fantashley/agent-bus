@@ -80,11 +80,11 @@ def test_configured_args_cannot_widen_the_turn(env):
         "--yolo", "--allow-all", "--available-tools", "bash", "apply_patch", "--allow-tool=shell",
         "--additional-mcp-config", "@x.json", "--enable-mcp-server", "github", "--plugin-dir", "/p",
         "--agent", "task", "--mode", "autopilot", "--allow-url", "evil.example", "--allow-all-urls",
-        "-Cdir", "--resume", "--trust-folder", "--keep-me", "--model", "gpt-x", "--reasoning-effort", "low"]})
+        "-Cdir", "--resume", "--trust-folder", "--config-dir", "/elsewhere", "--keep-me", "--model", "gpt-x", "--reasoning-effort", "low"]})
     set_peers(env, copilot={"web_search": False})
     a = argv(env)
     for bad in ("--yolo", "--allow-all", "bash", "apply_patch", "--allow-tool=shell", "@x.json", "github", "/p",
-                "task", "autopilot", "evil.example", "--allow-all-urls", "-Cdir", "--trust-folder"):
+                "task", "autopilot", "evil.example", "--allow-all-urls", "-Cdir", "--trust-folder", "/elsewhere"):
         assert bad not in a
     assert a.count("--resume") == 0 and value(a, "--available-tools") == ["view,grep,rg,glob"]
     assert "--keep-me" in a and a[a.index("--model") + 1] == "gpt-x"  # model and effort pass through
@@ -124,6 +124,14 @@ def test_mcp_list_failure_fails_closed(env, monkeypatch):
     res, _ = run(env)
     assert not res.ok and "copilot mcp list" in res.error
     assert not [c for c in calls(env) if c["agent"] == "copilot"]  # the turn never started
+
+
+def test_mcp_servers_are_listed_with_the_participants_env(env):
+    # A configured env can point copilot at another config, so the listing must see it too.
+    other = json.dumps({"mcpServers": {"elsewhere": {"type": "local", "command": "x", "enabled": True}}})
+    set_peers(env, copilot={"env": {"FAKE_COPILOT_MCP_LIST": other}})
+    a = argv(env)
+    assert [a[i + 1] for i, x in enumerate(a[:-1]) if x == "--disable-mcp-server"] == ["elsewhere"]
 
 
 def test_a_live_mcp_server_stops_the_turn(env, monkeypatch):

@@ -1402,6 +1402,9 @@ _COPILOT_DROP = {
     "-r", "--resume", "--continue", "--session-id", "-n", "--name", "-C",
     "--output-format", "--stream", "-s", "--silent", "--share", "--share-gist", "--sync-session",
     "--usage-output-file", "--log-dir",
+    # Another config directory has other MCP servers, which `copilot mcp list` (run without
+    # these args) wouldn't see: set COPILOT_HOME in the participant's env instead.
+    "--config-dir",
 }
 # Environment variables equivalent to permission flags (`copilot help environment`).
 _COPILOT_DROP_ENV = ("COPILOT_ALLOW_ALL", "COPILOT_ASSISTED_APPROVAL")
@@ -1488,9 +1491,13 @@ class CopilotAdapter(Adapter):
         """Every MCP server copilot would load in ``cwd`` (user, workspace, plugin and
         built-in), so each can be switched off.  Raises if they can't be listed."""
         argv = [self.command, "mcp", "list", "--json"]
+        # With the turn's own environment: a participant's configured env (#36) can point
+        # copilot at another config directory, and so at other MCP servers.
+        env = {k: v for k, v in {**os.environ, **self.child_env()}.items() if k not in self.drop_env}
+        env["AGENT_BUS_PEER"] = "mcp-list"
         try:
             out = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60,
-                                 stdin=subprocess.DEVNULL, env={**os.environ, "AGENT_BUS_PEER": "mcp-list"})
+                                 stdin=subprocess.DEVNULL, env=env)
             if out.returncode != 0:
                 raise PeerSetupError(f"`copilot mcp list` failed: {out.stderr.strip()[:300]}")
             data = json.loads(out.stdout)
