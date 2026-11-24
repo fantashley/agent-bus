@@ -475,8 +475,9 @@ class Service:
                     refs["heads"] = [*self._heads(t), head_commit_id]
                     if kept or override:
                         refs["peer_settings"] = {reviewer: {**kept, **override}}
-                    if old.get("auto_resumes"):
-                        refs["auto_resumes"] = old["auto_resumes"]  # still counts for this thread
+                    for k in ("auto_resumes", "debrief_after"):  # these still count for this thread
+                        if old.get(k):
+                            refs[k] = old[k]
                     autoresume.forget(self.bus, t["id"])  # this pass replaces the parked one
                     self.bus.set_thread(t["id"], status="open", round=t["round"] + 1,
                                         goal=f"Review {change_id or head_commit_id[:12]} in "
@@ -631,8 +632,9 @@ class Service:
         older job have to show it ran for the current round: by a message it posted in that
         round, or by its old-style key, which named the request (unless the thread has made
         that same move before, so the key can't tell the rounds apart)."""
-        row = self.bus._one("SELECT * FROM jobs WHERE thread_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                            t["id"])
+        # Review jobs only: a debrief (#91) is no pass of the review.
+        row = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND kind='review' ORDER BY created_at DESC,"
+                            " rowid DESC LIMIT 1", t["id"])
         if row is None:
             return None
         newest = self.bus._job(row)
@@ -735,6 +737,9 @@ class Service:
             if latest and latest["status"] in ("queued", "running", "done"):
                 return t, latest, False  # idempotent, including a pass `agent-bus resume` restarted
             # Its pass failed or was cancelled: requesting it again retries it on the same thread.
+            if self.bus.active_job(t["id"]):  # a debrief (#91): its job would stand in for the retry
+                raise BusError("REVIEW_BUSY", f"{t['id']} has a debrief running; request this review again "
+                               "once it has finished")
             reviewer = t["refs"]["reviewer"]
             self._quota_check(reviewer, "reviewer", ((t["refs"].get("peer_settings") or {}).get(reviewer)))
             autoresume.forget(self.bus, t["id"])  # this retry replaces any planned one
@@ -866,8 +871,8 @@ class Service:
         pin = self.bus._one("SELECT created_at FROM jobs WHERE id=?", (t["refs"] or {}).get("request_job"))
         if pin is None:
             return None
-        row = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND created_at>=? ORDER BY created_at DESC,"
-                            " rowid DESC LIMIT 1", t["id"], pin["created_at"])
+        row = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND kind='review' AND created_at>=?"
+                            " ORDER BY created_at DESC, rowid DESC LIMIT 1", t["id"], pin["created_at"])
         return self.bus._job(row) if row else None
 
     def _previous_review_set(self, reviewers: list[str], repo: str, prev_head: str, base: str, head: str,
@@ -934,6 +939,88 @@ class Service:
             return exact[0] if prev_head in self._heads(exact[0]) else None
         return next((t for t in mine if prev_head in self._heads(t)), None)
 
+    def debrief(self, thread: str, question: str | None = None, peers: list[str] | None = None) -> dict:
+        """Ask a finished review's or discussion's headless peers for feedback, each in its own
+        resumed session on the thread, with the same hardening and usage accounting as any turn
+        (#91).  Their answers come back as ``debrief`` messages; the thread's status and
+        verdicts never change.  One per peer per thread until the human user resumes it."""
+        t = self.bus.thread(thread)
+        if t["kind"] not in ("review", "discussion"):
+            raise ValueError(f"{thread} is a {t['kind']} thread; only reviews and discussions can be debriefed")
+        if self.agent not in (t["initiator"], HUMAN):
+            raise BusError("NOT_INITIATOR", "only the thread's initiator (or the human user) can debrief it")
+        if question is not None and not question.strip():
+            raise ValueError("question is empty; leave it out for the default question")
+        headless = [p for p in t["participants"] if p != t["initiator"]]
+        named = peers is not None
+        if named:
+            if not peers:
+                raise ValueError("peers is empty; leave it out to debrief every peer")
+            for p in peers:
+                if p not in headless:
+                    raise ValueError(f"{p!r} is not a headless peer on {thread} ({', '.join(headless)})")
+            if len(set(peers)) != len(peers):
+                raise ValueError("a peer is listed twice")
+        if t["repo"]:
+            self._allowed_repo(t["repo"])  # still allow-listed: the peers run there
+        self.bus.reap()
+        with self.bus.tx():
+            t = self.bus.thread(thread)  # decided again inside the transaction
+            if t["status"] not in ("resolved", "needs_human"):
+                raise BusError("THREAD_NOT_FINISHED", f"{thread} is {t['status']}; only a resolved or needs_human "
+                               "thread can be debriefed")
+            if self.bus.active_job(thread):
+                raise BusError("THREAD_BUSY", f"{thread} has a job running; wait for it to finish")
+            done = self._debriefed(t)
+            chosen, skipped = [], {}
+            for p in (peers if named else headless):
+                why = None
+                if p in done:
+                    why = ("DEBRIEF_USED", f"{p} has already given its debrief on {thread} (one per peer, until the "
+                           "human user resumes the thread)")
+                elif self.bus.peer_session(thread, p) is None:
+                    why = ("NO_SESSION", f"{p} has no stored session on {thread} to resume, and a fresh session "
+                           "would not remember the thread")
+                else:
+                    try:
+                        self.config.require_available(p, "peer")
+                    except ValueError as e:  # no longer configured
+                        why = ("AGENT_UNAVAILABLE", str(e))
+                    except BusError as e:
+                        why = (e.code, e.message)
+                    if why is None:
+                        block = self._quota_block(p, ((t["refs"] or {}).get("peer_settings") or {}).get(p))
+                        if block:
+                            why = (quota.code(block), quota.message(p, "peer", block, self.config))
+                if why and named:
+                    raise BusError(*why)
+                if why:
+                    skipped[p] = why
+                else:
+                    chosen.append(p)
+            if not chosen:
+                codes = {c for c, _ in skipped.values()}
+                raise BusError(next(iter(codes)) if len(codes) == 1 else "DEBRIEF_UNAVAILABLE",
+                               "no peer can be debriefed: " + " ".join(m + "." for _, m in skipped.values()))
+            params = {"peers": chosen, "question": question.strip() if question else None, "asker": self.agent}
+            job, created = self.bus.create_job(thread, "debrief", params, None)
+        if created:
+            worker.launch(self.bus, job["id"])
+        res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(thread)), "job": self._job_info(job, created),
+                               "peers": chosen}
+        if skipped:
+            res["skipped_peers"] = {p: m for p, (_, m) in skipped.items()}
+        res["next"] = (f"Call wait(\"{thread}\") for the replies (kind \"debrief\"); they don't change the "
+                       "thread's status or verdicts.")
+        return res
+
+    def _debriefed(self, t: dict) -> set[str]:
+        """Peers whose debrief on ``t`` already counts: an answer since the human user last
+        resumed the thread.  A debrief that got no answer can be asked for again."""
+        after = int((t["refs"] or {}).get("debrief_after") or 0)
+        return {r["sender"] for r in self.bus._all("SELECT DISTINCT sender FROM messages WHERE thread_id=?"
+                                                   " AND kind='debrief' AND id>?", t["id"], after)}
+
     def resume(self, thread: str, extra_rounds: int = 2) -> dict:
         """Human only: lift the turn cap and give a stalled discussion more rounds."""
         if self.agent != HUMAN:
@@ -956,6 +1043,12 @@ class Service:
         t = self.bus.thread(thread)
         if t["status"] in ("resolved",):
             raise BusError("THREAD_CLOSED", "thread is already resolved")
+        job = self.bus.active_job(thread)
+        if job and job["kind"] == "debrief":
+            # Its job would stand in for the resumed thread's own (one job per thread).
+            raise BusError("THREAD_BUSY", f"a debrief of {thread} is running; resume it once that has finished")
+        # Each peer may be debriefed once more after this resume (#91).
+        t = {**t, "refs": {**(t["refs"] or {}), "debrief_after": self.bus.last_message_id(thread)}}
         overrides = (t["refs"] or {}).get("peer_settings") or {}
         peers = self._resume_peers(t)
         # The human is retrying now: forget cached out-of-usage blocks for these peers, so
@@ -1011,8 +1104,7 @@ class Service:
     def _reopen(self, t: dict, extra_rounds: int, note: str, auto_resumes: int, key: str) -> dict:
         thread = t["id"]
         fields: dict[str, Any] = {"status": "open"}
-        count = self.bus._one("SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender NOT IN (?,?)",
-                              thread, HUMAN, SYSTEM)["n"]
+        count = self.bus.agent_messages(thread)
         fields["max_messages"] = max(t["max_messages"], count + self.config.max_messages)
         if t["kind"] == "discussion":
             fields["max_rounds"] = max(t["max_rounds"], t["round"]) + extra_rounds

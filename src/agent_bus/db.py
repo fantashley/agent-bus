@@ -27,7 +27,10 @@ from . import procinfo
 HUMAN = "human"
 SYSTEM = "system"
 
-KINDS = ("message", "proposal", "vote", "final", "status", "review_verdict")
+KINDS = ("message", "proposal", "vote", "final", "status", "review_verdict", "debrief")
+# A peer's answer to a debrief of a finished thread (#91): bounded by its own one-per-peer
+# rule, so it neither counts toward nor is stopped by the thread's message cap.
+UNCOUNTED = ("debrief",)
 THREAD_STATUSES = ("open", "resolved", "needs_human", "cancelled")
 ACTIVE_JOB = ("queued", "running")
 # Token counters agent-bus records per turn, in its own names (see peers.usage_from).
@@ -542,10 +545,15 @@ class Bus:
         t["refs"] = _loads(t["refs"])
         # Derived, not stored: a stored flag could be rolled back with an enclosing
         # transaction.  The human's `resume` lifts it by raising max_messages.
-        t["agent_messages"] = self._one(
-            "SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender NOT IN (?,?)", tid, HUMAN, SYSTEM)["n"]
+        t["agent_messages"] = self.agent_messages(tid)
         t["limit_reached"] = int(t["agent_messages"] >= t["max_messages"])
         return t
+
+    def agent_messages(self, tid: str) -> int:
+        """The agent messages that count toward the thread's message cap."""
+        return self._one("SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender NOT IN (?,?)"
+                         " AND kind NOT IN (SELECT value FROM json_each(?))",
+                         tid, HUMAN, SYSTEM, json.dumps(UNCOUNTED))["n"]
 
     def threads(self, include_closed: bool = False, agent_type: str | None = None,
                 limit: int = 50) -> list[dict]:
@@ -599,7 +607,7 @@ class Bus:
             if is_agent:
                 if t["status"] == "cancelled":
                     raise BusError("THREAD_CANCELLED", f"thread {thread_id} was cancelled")
-                if t["limit_reached"]:
+                if t["limit_reached"] and kind not in UNCOUNTED:
                     raise BusError("THREAD_LIMIT_REACHED",
                                    f"thread {thread_id} reached {t['max_messages']} agent messages; "
                                    "waiting for a human `agent-bus resume`")
@@ -1337,7 +1345,8 @@ class Bus:
             m = self._msg(row)
             if m["sender"] in reviewers:
                 last[m["sender"]] = m
-        active = self._one("SELECT 1 FROM jobs WHERE thread_id=? AND status IN ('queued','running')", thread_id)
+        active = self._one("SELECT 1 FROM jobs WHERE thread_id=? AND status IN ('queued','running')"
+                           " AND kind='review'", thread_id)  # a debrief (#91) reviews nothing
         by: dict[str, dict] = {}
         for r in reviewers:
             m = last.get(r)

@@ -21,6 +21,8 @@ Behaviour is driven by env vars so tests can script outcomes:
   FAKE_APPROVE    comma-separated agents whose review verdicts approve (others request changes)
   FAKE_CLAUDE_USED / FAKE_CODEX_USED  how full the five_hour / primary usage-limit window is
                   (a fraction for claude's stream, a percentage in codex's rollout file)
+  FAKE_RESUME_FAILS  comma-separated agents whose resumed turns fail (exit 1, nothing on
+                  stdout), as when the CLI no longer has the session
   FAKE_REPLAY     a captured stream (tests/data/bedrock) that FAKE_REPLAY_AGENTS print instead,
                   exiting with FAKE_REPLAY_EXIT (default 1); FAKE_LOG also records the env vars
                   named in FAKE_LOG_ENV
@@ -89,7 +91,9 @@ repair = "Reply again with only" in prompt
 # A review pass: a diff, an interdiff, or a same-head pushback (#71).
 reviewing = behaviour == "review" or any(k in prompt for k in ("Diff from base to head", "Interdiff",
                                                                  "has not changed the code"))
-if behaviour == "nojson" and not repair:
+if "agent-bus debrief of thread" in prompt:
+    reply = f"{agent} debrief: the prompts were clear."
+elif behaviour == "nojson" and not repair:
     reply = "Thinking out loud, no JSON."
 elif reviewing and agent in os.environ.get("FAKE_APPROVE", "").split(","):
     reply = 'All good.\n{"verdict": "approve", "summary": "fine", "findings": []}'
@@ -135,6 +139,10 @@ def out(obj):
 def listed(var):
     return agent in [a for a in os.environ.get(var, "").split(",") if a]
 
+
+if resumed and listed("FAKE_RESUME_FAILS"):
+    print(f"error: no session {sid}", file=sys.stderr)
+    sys.exit(1)
 
 if (listed("FAKE_EXHAUSTED") or (listed("FAKE_EXHAUSTED_LATER") and "round 1, which is blind" not in prompt)
         or (listed("FAKE_EXHAUSTED_REPAIR") and repair)):

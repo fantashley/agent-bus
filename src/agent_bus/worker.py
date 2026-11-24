@@ -124,6 +124,8 @@ class Worker:
                 self.run_discussion()
             elif self.job["kind"] == "review":
                 self.run_review()
+            elif self.job["kind"] == "debrief":
+                self.run_debrief()
             else:
                 raise ValueError(f"unknown job kind {self.job['kind']}")
         except LeaseLost:
@@ -168,11 +170,25 @@ class Worker:
             raise Cancelled()
 
     def deadline_left(self) -> float:
+        if self.debriefing:
+            return float("inf")  # a finished thread's deadline has passed; a debrief has its own turns
         t = self.thread()
         return (t["deadline"] - time.time()) if t["deadline"] else float("inf")
 
     def thread(self) -> dict:
         return self.bus.thread(self.thread_id)
+
+    @property
+    def debriefing(self) -> bool:
+        """A debrief job (#91): it runs turns on a finished thread and never changes its state."""
+        return self.job["kind"] == "debrief"
+
+    def retry_hint(self) -> str:
+        """How to retry a turn this job couldn't take.  A debrief is requested again; `agent-bus
+        resume` would reopen the finished thread instead."""
+        if self.debriefing:
+            return f"request the debrief of {self.thread_id} again"
+        return f"run `agent-bus resume {self.thread_id}`"
 
     def event(self, kind: str, text: str = "", agent: str | None = None) -> None:
         self.bus.add_event(self.thread_id, kind, text, agent=agent, job_id=self.job["id"])
@@ -258,12 +274,14 @@ class Worker:
             return t["repo"], [str(scratch)]
         return str(scratch), []
 
-    def turn(self, agent: str, prompt: str, resume: bool = True, fresh_prompt: str | None = None) -> TurnResult:
+    def turn(self, agent: str, prompt: str, resume: bool = True, fresh_prompt: str | None = None,
+             resume_only: bool = False) -> TurnResult:
         """Run one headless turn, resuming the peer's conversation when possible.
 
         If the resume fails, the turn is retried in a fresh session with
         ``fresh_prompt`` (a self-contained prompt that restates the rules), or the
-        same prompt when the caller passes none.
+        same prompt when the caller passes none.  ``resume_only`` (a debrief, #91): never
+        a fresh session; with no stored session, or a resume that fails, the turn fails.
         """
         self.check()
         self.config.require_available(agent, "peer")
@@ -276,12 +294,15 @@ class Worker:
         block = quota.block_for(self.bus, self.config, agent, settings)
         if block:
             return self.blocked(agent, block)
-        # Nor on a discussion peer whose output this discussion already found unusable.
-        drift = self.bus.peer_drift(self.thread_id).get(agent)
+        # Nor on a discussion peer whose output this discussion already found unusable.  A
+        # debrief tries anyway: it records no drift, so a fixed CLI gets its turn.
+        drift = None if self.debriefing else self.bus.peer_drift(self.thread_id).get(agent)
         if drift:
             return self.drifted(agent, drift)
         ad = adapter(agent, self.config, settings, repo=t["repo"])
         resume_id = self.bus.peer_session(self.thread_id, agent) if resume else None
+        if resume_only and resume_id is None:
+            return TurnResult(ok=False, error=f"{agent} has no stored session on this thread to resume")
         timeout = max(30.0, min(self.config.turn_timeout_s, self.deadline_left()))
         shown = "".join(f" · {k} {v}" for k, v in settings.items())
         # Which CLI build and adapter recipe ran this turn, so drift can be tied to an upgrade (#32).
@@ -304,7 +325,9 @@ class Worker:
         # Nor can it fix a changed output format, or a turn the CLI stopped partway through
         # (it would stop the same way, and the working conversation would be dropped).
         # Nor a model or region the provider refuses (#36).
-        if (not res.ok and resume_id and not res.timed_out and not res.quota and not res.format_changed
+        if resume_only and not res.ok and not res.quota:
+            self.event("error", f"resume failed ({res.error}); not starting a fresh session", agent)
+        elif (not res.ok and resume_id and not res.timed_out and not res.quota and not res.format_changed
                 and not res.incomplete and not res.config_error and not self.cancelled()):
             block = quota.block_for(self.bus, self.config, agent, settings)
             if block:
@@ -327,7 +350,7 @@ class Worker:
             return res
         if res.format_changed:
             reason = drift_reason(res.error or "")
-            if t["kind"] == "discussion":
+            if t["kind"] == "discussion" and not self.debriefing:
                 # Later rounds skip it until `agent-bus resume` (issue #40).  A review goes
                 # to needs_human instead, and its next pass tries again.
                 with self.fenced():
@@ -337,7 +360,7 @@ class Worker:
                 self.set_peer_session(agent, resume_id)
             return res
         if res.config_error:
-            if t["kind"] == "discussion":
+            if t["kind"] == "discussion" and not self.debriefing:
                 # Like format drift: later rounds skip it, and the standstill rules see it,
                 # until `agent-bus resume` (#36).  Not cached beyond this discussion.
                 with self.fenced():
@@ -438,9 +461,13 @@ class Worker:
         where = ""
         if self.config.bedrock(agent):
             where = f" in AWS region {self.config.aws_region(agent) or '(the CLI default)'}"
-        self.system(f"PEER_MISCONFIGURED: {agent}'s model provider refused model {quota.model_key(model)}{where}. "
-                    "The model id or inference profile may be wrong, the region may not offer it, or the account "
-                    "may have no access to it (the provider answers these alike). Fix the participant's model or "
+        problem = (f"PEER_MISCONFIGURED: {agent}'s model provider refused model {quota.model_key(model)}{where}. "
+                   "The model id or inference profile may be wrong, the region may not offer it, or the account "
+                   "may have no access to it (the provider answers these alike). ")
+        if self.debriefing:
+            self.system(problem + "Fix the participant's model or env, then " + self.retry_hint() + ".")
+            return
+        self.system(problem + "Fix the participant's model or "
                     f"env, then run `agent-bus resume {self.thread_id}`. A model set for this thread only stays "
                     f"with it: for that, `agent-bus cancel {self.thread_id}` and make a new request with a "
                     "corrected model (without this thread's id or a previous head).")
@@ -468,7 +495,7 @@ class Worker:
             self.quota_noticed.add(("format", agent))
         self.system(f"PEER_FORMAT_CHANGED: {agent} ({version}) exited normally {reason}, so its output "
                     "format has probably changed. The progress events have the details; `agent-bus agents` "
-                    f"shows the installed version. Run `agent-bus resume {self.thread_id}` once it's fixed.")
+                    f"shows the installed version. {self.retry_hint()[0].upper()}{self.retry_hint()[1:]} once it's fixed.")
 
     def unvotable_notice(self, agent: str, reason: dict) -> None:
         """The notice for a peer that can't vote again (see unvotable.peers)."""
@@ -488,10 +515,9 @@ class Worker:
             self.quota_noticed.add(agent)
         if quota.is_auth(block):
             self.system(f"AUTH_REQUIRED: {quota.describe(agent, block)}. To fix it, "
-                        f"{quota.auth_hint(self.config, agent)}, then run `agent-bus resume {self.thread_id}`.")
+                        f"{quota.auth_hint(self.config, agent)}, then {self.retry_hint()}.")
             return
-        self.system(f"{quota.describe(agent, block)}. After that, run `agent-bus resume {self.thread_id}` "
-                    "to retry.")
+        self.system(f"{quota.describe(agent, block)}. After that, {self.retry_hint()} to retry.")
 
     # --------------------------------------------------------------- discussion
 
@@ -1258,6 +1284,59 @@ class Worker:
                     or (tool == "git" and out.returncode != 1):
                 return True
         return False
+
+    # ------------------------------------------------------------------- debrief
+
+    def run_debrief(self) -> None:
+        """Ask a finished thread's peers for feedback, each in its own resumed session (#91).
+
+        The same turns as a review or discussion pass (Worker.turn: per-participant settings,
+        env and CODEX_HOME, each harness's read-only hardening, usage accounting and blocks),
+        but never a fresh session, and nothing here changes the thread's status or verdicts:
+        a peer that can't answer gets a notice, and the thread stays as it was."""
+        t = self.thread()
+        peers = list(self.job["params"]["peers"])
+        if t["repo"] and not self.config.repo_allowed(t["repo"]):
+            # The request was checked against its server's config, which may predate this one.
+            self.system(f"Debrief not started: {t['repo']} is no longer in the agent-bus repo allowlist.",
+                        recipient=None if self.job["params"].get("asker") in (None, HUMAN)
+                        else self.job["params"]["asker"])
+            return
+        self.system(f"Debrief requested from {', '.join(peers)}: each answers in its own resumed session.",
+                    quiet=True)
+        with ThreadPoolExecutor(max_workers=len(peers) or 1) as pool:
+            for f in [pool.submit(self.debrief_one, a, t) for a in peers]:
+                f.result()
+        self.check()
+
+    def debrief_one(self, agent: str, t: dict) -> None:
+        asker = self.job["params"].get("asker") or t["initiator"]
+        to = None if asker == HUMAN else asker  # the human user reads the whole thread
+        res = self.turn(agent, self.debrief_prompt(agent, t), resume_only=True)
+        if res.quota or res.format_changed or res.config_error:
+            return  # noticed in turn(), with how to retry
+        text = (res.text or "").strip()
+        if not res.ok or not text:
+            why = res.error or "no reply"
+            self.system(f"{agent} gave no debrief: {why}. No fresh session was started, since it would not "
+                        "remember this thread. The thread is unchanged.", recipient=to)
+            return
+        self.post(agent, text[:20000], kind="debrief", session_id=f"job:{self.job['id']}", recipient=to,
+                  data={"session": res.external_id})
+
+    def debrief_prompt(self, agent: str, t: dict) -> str:
+        asker = self.job["params"].get("asker") or t["initiator"]
+        question = self.job["params"].get("question")
+        if not question:
+            question = prompts.DEBRIEF_QUESTION
+        elif asker != HUMAN:
+            question = prompts.wrap_peer(asker, question)
+        if t["kind"] == "review":
+            role, step = "a reviewer", "review pass"
+        else:
+            role, step = "a peer", "round"
+        return prompts.DEBRIEF.format(thread=t["id"], kind=t["kind"], role=role, status=t["status"], step=step,
+                                      asker="The human user" if asker == HUMAN else asker, question=question)
 
 
 def tokens(res: TurnResult) -> str:
