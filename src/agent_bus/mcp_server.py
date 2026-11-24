@@ -102,6 +102,12 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
             if acts:
                 autoresume.sweep_quietly(bus)
 
+    def flag_stale(res: dict[str, Any]) -> dict[str, Any]:
+        """``res`` plus ``stale_build`` when this server is an older build than PATH's (#92), so
+        an agent sees it during normal use, not only from whoami, and can tell the human."""
+        stale = None if peer_job else cfg.stale_build()
+        return {**res, "stale_build": stale} if stale else res
+
     @mcp.tool()
     def whoami() -> dict[str, Any]:
         """Your agent-bus identity (participant name, harness and session id), and which other
@@ -123,11 +129,8 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
                    # Usage-limit windows at or above usage_warn_at, by the last reading.
                    "near_limit": [{"agent": a, **quota.limits_summary(w, conf.usage_warn_at)}
                                   for a in others for w in limits.get(a, []) if w["used"] >= conf.usage_warn_at]}
-            stale = cfg.stale_build()
-            if stale:
-                out["stale_build"] = stale
             return out
-        return call(me)
+        return flag_stale(call(me))
 
     @mcp.tool()
     def send(body: str, thread: str | None = None, to: str | None = None, kind: str = "message",
@@ -150,7 +153,7 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
     @mcp.tool()
     def inbox(thread: str | None = None, limit: int = 50) -> dict[str, Any]:
         """Unread messages for you (optionally on one thread). Marks them read for this session."""
-        return call(svc.inbox, thread=thread, limit=limit)
+        return flag_stale(call(svc.inbox, thread=thread, limit=limit))
 
     @mcp.tool()
     def history(thread: str, limit: int = 200) -> dict[str, Any]:
@@ -204,7 +207,7 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         if after_message_id is not None:
             res = call(svc.poll, thread, after_message_id=int(after_message_id))
             if res is not None:
-                return res
+                return flag_stale(res)
         entry, joined = poller(thread)
         task = entry["task"]
         entry["callers"] += 1
@@ -225,7 +228,7 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
             # Only the last wait to leave takes what is still unread; while another wait
             # runs on, its poller delivers it, so nothing is split between the two.
             res = call(svc.wait_timeout, thread, deliver=last)
-        return {**res, "joined": True} if joined else res
+        return flag_stale({**res, "joined": True} if joined else res)
 
     @mcp.tool()
     def start_discussion(question: str, peers: list[str] | None = None, repo: str | None = None,
@@ -240,14 +243,14 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         viewer panes when you're running inside Rex. peer_settings optionally sets a peer's model
         and/or reasoning effort for this discussion, e.g. {"codex": {"effort": "high"}}.
         """
-        return call(svc.start_discussion, question=question, peers=peers, repo=repo,
-                    context_refs=context_refs, max_rounds=max_rounds, deadline_minutes=deadline_minutes,
-                    watch=watch, peer_settings=peer_settings)
+        return flag_stale(call(svc.start_discussion, question=question, peers=peers, repo=repo,
+                               context_refs=context_refs, max_rounds=max_rounds, deadline_minutes=deadline_minutes,
+                               watch=watch, peer_settings=peer_settings))
 
     @mcp.tool()
     def advance_discussion(thread: str) -> dict[str, Any]:
         """Run one more round of a discussion you started (bounded by its max_rounds)."""
-        return call(svc.advance_discussion, thread=thread)
+        return flag_stale(call(svc.advance_discussion, thread=thread))
 
     @mcp.tool()
     def request_review(repo: str, base_commit_id: str, head_commit_id: str, reviewer: str | None = None,
@@ -282,10 +285,10 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         once per head. REVIEW_LIMIT_REACHED means the review ran past its follow-up budget and
         waits for the human user.
         """
-        return call(svc.request_review, reviewer=reviewer, repo=repo, change_id=change_id,
-                    base_commit_id=base_commit_id, head_commit_id=head_commit_id,
-                    prev_head_commit_id=prev_head_commit_id, focus=focus, model=model, effort=effort,
-                    reviewers=reviewers, peer_settings=peer_settings, thread=thread)
+        return flag_stale(call(svc.request_review, reviewer=reviewer, repo=repo, change_id=change_id,
+                               base_commit_id=base_commit_id, head_commit_id=head_commit_id,
+                               prev_head_commit_id=prev_head_commit_id, focus=focus, model=model, effort=effort,
+                               reviewers=reviewers, peer_settings=peer_settings, thread=thread))
 
     return mcp
 
