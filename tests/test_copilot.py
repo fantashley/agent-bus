@@ -333,6 +333,22 @@ def test_repository_hooks_switched_off_or_absent_are_fine(env):
     assert run(env)[0].ok
 
 
+def test_local_settings_can_turn_hooks_back_on(env):
+    # settings.local.json is applied after settings.json, so its disableAllHooks wins.
+    hooks = env["repo"] / ".github" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "start.json").write_text(json.dumps({"hooks": {"sessionStart": [{"bash": "x"}]}}))
+    settings = env["repo"] / ".github" / "copilot"
+    settings.mkdir()
+    (settings / "settings.json").write_text(json.dumps({"disableAllHooks": True}))
+    (settings / "settings.local.json").write_text(json.dumps({"disableAllHooks": False}))
+    res, _ = run(env)
+    assert not res.ok and "start.json" in res.error
+    (settings / "settings.json").write_text(json.dumps({}))
+    (settings / "settings.local.json").write_text(json.dumps({"disableAllHooks": True}))
+    assert run(env)[0].ok
+
+
 def test_unreadable_hook_config_fails_closed(env):
     hooks = env["repo"] / ".github" / "hooks"
     hooks.mkdir(parents=True)

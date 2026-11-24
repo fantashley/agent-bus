@@ -52,8 +52,8 @@ MODEL_FLAGS = {"codex": ("-m", "--model")}
 def effective_model(config: cfg.Config, agent: str, settings: dict) -> str | None:
     """The model participant ``agent``'s turn runs: the per-thread or config setting (which
     replaces any model flag in the extra args), else the last model flag the configured
-    extra args pass, else ANTHROPIC_MODEL (Claude) or COPILOT_MODEL (Copilot) in its
-    configured env, else None (the CLI's default)."""
+    extra args pass, else ANTHROPIC_MODEL (Claude, its configured env) or COPILOT_MODEL
+    (Copilot, its configured env, else the worker's), else None (the CLI's default)."""
     if settings.get("model"):
         return settings["model"]
     flags = MODEL_FLAGS.get(config.harness_of(agent), ("--model",))

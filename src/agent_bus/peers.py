@@ -1456,7 +1456,7 @@ def _copilot_repo_hooks_check(cwd: str) -> None:
     set, and sees the review prompt.  agent-bus can't tell whether the user trusted the
     folder, so any repository hook fails the turn (#98 covers the other harnesses).
     Copilot's own repo-wide off switch, ``disableAllHooks`` in .github/copilot/settings.json,
-    is honoured."""
+    is honoured as Copilot resolves it: settings.local.json, applied after it, wins."""
     roots = [Path(cwd)]
     for d in (Path(cwd), *Path(cwd).parents):  # the repository root, where Copilot looks
         if (d / ".git").exists() or (d / ".jj").exists():
@@ -1474,10 +1474,19 @@ def _copilot_repo_hooks_check(cwd: str) -> None:
 
     found = []
     for root in roots:
-        settings = root / ".github" / "copilot" / "settings.json"
-        if settings.is_file() and load(settings).get("disableAllHooks") is True:
+        off = None
+        for name in ("settings.json", "settings.local.json"):  # the local file is applied last
+            f = root / ".github" / "copilot" / name
+            if f.is_file() and "disableAllHooks" in load(f):
+                off = load(f)["disableAllHooks"]
+        if off is True:
             continue
-        hook_files = sorted((root / ".github" / "hooks").glob("*.json")) if (root / ".github" / "hooks").is_dir() else []
+        hooks_dir = root / ".github" / "hooks"
+        try:
+            hook_files = sorted(p for p in hooks_dir.iterdir() if p.suffix == ".json") if hooks_dir.is_dir() else []
+        except OSError as e:
+            raise PeerSetupError(f"PEER_SETUP: can't list {hooks_dir} to check it for Copilot hooks ({e}); "
+                                 "refusing to run the turn") from e
         for f in hook_files:
             data = load(f)
             if data.get("hooks") and data.get("disableAllHooks") is not True:
