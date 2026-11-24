@@ -75,7 +75,7 @@ _AWS_REGION = re.compile(r"[a-z]{2}(?:-[a-z]+)+-\d+")
 # COPILOT_ALLOW_ALL and COPILOT_ASSISTED_APPROVAL are Copilot CLI's permission switches as
 # environment variables (`copilot help environment`): a peer must never get them.
 _RESERVED_ENV = re.compile(r"AGENT_BUS_.*|CODEX_HOME|PATH|COPILOT_ALLOW_ALL|COPILOT_ASSISTED_APPROVAL"
-                           r"|GITHUB_COPILOT_PROMPT_MODE_(?:REPO_HOOKS|WORKSPACE_MCP)")
+                           r"|GITHUB_COPILOT_PROMPT_MODE_(?:REPO_HOOKS|WORKSPACE_MCP|EXTENSIONS)")
 
 
 @dataclass(frozen=True)
@@ -157,6 +157,7 @@ def _check_env(where: str, env: object) -> None:
                     "COPILOT_ASSISTED_APPROVAL": " (headless Copilot turns stay read-only)",
                     "GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS": " (headless Copilot turns don't run the checkout's hooks)",
                     "GITHUB_COPILOT_PROMPT_MODE_WORKSPACE_MCP": " (headless Copilot turns don't load the checkout's MCP servers)",
+                    "GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS": " (headless Copilot turns don't load the checkout's extensions)",
                     }.get(name, "")
             raise ValueError(f"{where}.env.{name} is set by agent-bus itself{hint}")
         if name.upper() in _SECRET_NAMES or _SECRET_NAME.search(name):
