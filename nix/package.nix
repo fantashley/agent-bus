@@ -19,6 +19,13 @@ python3Packages.buildPythonApplication {
   # when withJujutsu (plain-git users can build without it).
   makeWrapperArgs = [ "--suffix" "PATH" ":" (lib.makeBinPath ([ git ] ++ lib.optional withJujutsu jujutsu)) ];
 
+  # The agent-bus skill (the how-to agents read), installed with the build it describes so
+  # the Home Manager module can ship it to each client (see nix/plugins.nix).
+  postInstall = ''
+    mkdir -p $out/share/agent-bus
+    cp -r skills $out/share/agent-bus/skills
+  '';
+
   nativeCheckInputs = [ python3Packages.pytestCheckHook git ] ++ lib.optional withJujutsu jujutsu;
   # The review tests make throwaway git (and jj) repos, which want a user and a writable home.
   preCheck = ''
