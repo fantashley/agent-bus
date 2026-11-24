@@ -100,6 +100,11 @@ class MissingRevision(Exception):
         super().__init__(f"{repo} has no commit " + ", ".join(f"{sha} ({label})" for label, sha in missing))
 
 
+def clause(text: str) -> str:
+    """``text`` without its closing full stop, to sit inside a sentence that adds its own (#100)."""
+    return text.rstrip().rstrip(".")
+
+
 def commit_tools(repo: str) -> list[str]:
     """The tools that read commits in ``repo``, in the order the review diff tries them: jj
     and then git in a colocated jj repo (jj's --ignore-working-copy doesn't import plain git
@@ -432,7 +437,9 @@ class Worker:
         # Close to its usage limit, by the last reading its CLI gave: worth knowing before
         # the turn spends more (issue #26).
         near = quota.near_limit(self.bus, self.config, agent)
-        self.event("turn_start", f"round {t['round']}" + (" (resumed)" if resume_id else "") + shown
+        # A debrief is labelled as one: "round N (resumed)" would read as another review pass (#100).
+        label = "debrief" if self.debriefing else f"round {t['round']}"
+        self.event("turn_start", label + (" (resumed)" if resume_id else "") + shown
                    + f" · {version} · recipe {ad.agent}/{ad.recipe}"
                    + (" · near its usage limit: " + "; ".join(map(quota.describe_window, near)) if near else ""),
                    agent)
@@ -457,7 +464,7 @@ class Worker:
         if resume_only and not res.ok and not res.quota:
             self.event("error", f"resume failed ({res.error}); not starting a fresh session", agent)
         elif (not res.ok and resume_id and not res.timed_out and not res.quota and not res.format_changed
-                and not res.incomplete and not res.config_error and not self.cancelled()
+                and not res.incomplete and not res.config_error and not res.refused and not self.cancelled()
                 and self.deadline_left() > 0):  # no new CLI run past a discussion's deadline (#74)
             block = quota.block_for(self.bus, self.config, agent, settings)
             if block:
@@ -502,6 +509,10 @@ class Worker:
             self.config_notice(agent, model)
             if resume_id:
                 self.set_peer_session(agent, resume_id)
+            return res
+        if res.refused:
+            # Stopped for isolation (#100): keep any pinned conversation, and never pin the
+            # refused attempt's own session.
             return res
         if res.incomplete:
             # An ordinary failure the callers report on the thread, not drift.  Keep any
@@ -1220,7 +1231,7 @@ class Worker:
         if verdict is None or problem:
             if self.finish_thread("needs_human"):
                 why = (f"gave an inconsistent verdict ({problem})" if problem else
-                       f"did not return a usable verdict: {res.error or 'no valid JSON verdict'}")
+                       f"did not return a usable verdict: {clause(res.error or 'no valid JSON verdict')}")
                 self.safe_post(SYSTEM, f"{reviewer} {why}. Run `agent-bus resume` to retry.",
                                kind="status", recipient=t["initiator"])
             return None
@@ -1614,7 +1625,7 @@ class Worker:
             return  # noticed in turn(), with how to retry
         text = (res.text or "").strip()
         if not res.ok or not text:
-            why = res.error or "no reply"
+            why = clause(res.error or "no reply")
             self.system(f"{agent} gave no debrief: {why}. No fresh session was started, since it would not "
                         "remember this thread. The thread is unchanged.", recipient=to)
             return

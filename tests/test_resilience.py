@@ -249,6 +249,27 @@ def test_stale_build_shows_in_everyday_replies(env, no_spawn, monkeypatch, tmp_p
         assert "Tell the user" in r["stale_build"]["hint"]
     # Also on a refused request: the agent can't fix that by retrying.
     assert "stale_build" in tool("advance_discussion", thread=tid)
+    # And on the tools that start peers, called directly (#95).
+    started = tool("start_discussion", question="Which?", peers=["codex"])
+    assert started["thread"]["id"] and started["stale_build"]["on_path"] == os.path.realpath(new)
+    review = tool("request_review", reviewer="codex", repo=str(env["repo"]),
+                  base_commit_id="a" * 40, head_commit_id="b" * 40)
+    assert review["thread"]["id"] and review["stale_build"]["on_path"] == os.path.realpath(new)
+
+    # A headless peer's server never carries it: the peer can't act on it, and its tools are
+    # refused anyway (#95).
+    monkeypatch.setenv("AGENT_BUS_PEER", "job-1")
+    peer = mcp_server.build("codex", bus=env["bus"])
+
+    def peer_tool(name, **args):
+        return json.loads(asyncio.run(peer.call_tool(name, args)).content[0].text)
+
+    for r in (peer_tool("whoami"), peer_tool("inbox"),
+              peer_tool("start_discussion", question="Which?", peers=["claude"]),
+              peer_tool("request_review", reviewer="claude", repo=str(env["repo"]),
+                        base_commit_id="a" * 40, head_commit_id="b" * 40)):
+        assert "stale_build" not in r
+    assert peer_tool("start_discussion", question="Which?")["error"] == "PEER_READ_ONLY"
 
 
 # ------------------------------------------------- review fixes (t-a3faf1 pass 1)

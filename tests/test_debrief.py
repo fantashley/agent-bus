@@ -95,6 +95,12 @@ def test_debrief_resumes_the_review_session_with_the_same_hardening(env, no_spaw
     assert (after["status"], after["round"], after["refs"]) == (before[0]["status"], before[0]["round"],
                                                                before[0]["refs"])
     assert bus.review_standings(tid) == before[1] and bus.peer_session(tid, reviewer) == before[2]
+    # Its turn is labelled as a debrief, not as another review pass (#100).
+    starts = [(j["kind"], e["text"]) for j in bus.jobs(tid) for e in bus.events(tid, job_id=j["id"])
+              if e["kind"] == "turn_start" and e["agent"] == reviewer]
+    labels = [text.split(" · ")[0] for _, text in starts]
+    assert labels == ["round 1", "round 2 (resumed)", "debrief (resumed)"]
+    assert starts[-1][0] == "debrief"
     # Its tokens are accounted like any turn's.
     job = bus.jobs(tid)[-1]
     assert job["kind"] == "debrief" and job["status"] == "done"

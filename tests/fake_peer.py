@@ -20,6 +20,8 @@ Behaviour is driven by env vars so tests can script outcomes:
   FAKE_MCP_LIST   what `codex mcp list --json` prints ($CODEX_HOME/fake-mcp.json wins if it exists)
   FAKE_COPILOT_MCP_LIST  what `copilot mcp list --json` prints (FAKE_COPILOT_MCP_FAIL: it exits 1)
   FAKE_COPILOT_LIVE_MCP  a server copilot reports loaded and live, as if it weren't switched off
+  FAKE_COPILOT_MCP_EVENT  the session.mcp_servers_loaded event's data (JSON) in place of the
+                  real one; the whole turn is written at once, then it waits to be stopped
   FAKE_APPROVE    comma-separated agents whose review verdicts approve (others request changes)
   FAKE_CLAUDE_USED / FAKE_CODEX_USED  how full the five_hour / primary usage-limit window is
                   (a fraction for claude's stream, a percentage in codex's rollout file)
@@ -149,7 +151,15 @@ def session_turns():
     # The first turn ran without the id in its argv, except copilot's (--session-id).
     return n if agent == "copilot" else 1 + n
 
+# FAKE_COPILOT_MCP_EVENT: the turn's lines are written together at the end, then it waits to
+# be stopped, so they are all in the pipe before the adapter reads the first one.
+batch = [] if agent == "copilot" and os.environ.get("FAKE_COPILOT_MCP_EVENT") else None
+
+
 def out(obj):
+    if batch is not None:
+        batch.append(json.dumps(obj) + "\n")
+        return
     print(json.dumps(obj), flush=True)
 
 
@@ -274,7 +284,11 @@ elif agent == "copilot":
                     else "connected", "source": "builtin"})
     if os.environ.get("FAKE_COPILOT_LIVE_MCP"):
         servers.append({"name": os.environ["FAKE_COPILOT_LIVE_MCP"], "status": "connected"})
-    out({"type": "session.mcp_servers_loaded", "ephemeral": True, "data": {"servers": servers}})
+    if os.environ.get("FAKE_COPILOT_MCP_EVENT"):
+        out({"type": "session.mcp_servers_loaded", "ephemeral": True,
+             "data": json.loads(os.environ["FAKE_COPILOT_MCP_EVENT"])})
+    else:
+        out({"type": "session.mcp_servers_loaded", "ephemeral": True, "data": {"servers": servers}})
     if any(s["status"] != "disabled" for s in servers):
         import time
         time.sleep(30)  # a real turn would go on to run; agent-bus must stop it
@@ -290,6 +304,11 @@ elif agent == "copilot":
         "tokenDetails": {"input": {"tokenCount": 30 * n}, "cache_read": {"tokenCount": 300 * n},
                          "cache_write": {"tokenCount": 0}, "output": {"tokenCount": 8 * n}}}}}}})
     out({"type": "result", "sessionId": sid, "exitCode": 0, "usage": {"premiumRequests": n}})
+    if batch is not None:
+        sys.stdout.write("".join(batch))
+        sys.stdout.flush()
+        import time
+        time.sleep(30)  # agent-bus must stop it
 else:
     out({"event": "init", "conversation_id": sid})
     out({"event": "step_update", "step_update": {"conversation_id": sid, "state": "ACTIVE", "step_type": "agent_response", "text_delta": reply}})

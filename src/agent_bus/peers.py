@@ -64,6 +64,10 @@ class TurnResult:
     # The provider refused the model or region (a wrong model id or inference profile, a
     # region without it, no access to it; #36): retrying or repairing can't help.
     config_error: bool = False
+    # agent-bus refused or stopped the turn to keep the peer isolated (PEER_SETUP: a repository
+    # hook, an MCP server it couldn't switch off, a startup event it couldn't check): a fresh
+    # session would be refused the same way, so the worker neither retries nor pins it (#100).
+    refused: bool = False
 
 
 @dataclass
@@ -247,7 +251,7 @@ class Adapter:
         try:
             inv = self.invocation(prompt, resume_id, cwd, add_dirs or [])
         except PeerSetupError as e:
-            return TurnResult(ok=False, error=str(e))
+            return TurnResult(ok=False, error=str(e), refused=True)
         st = StreamState(external_id=inv.external_id, resumed=bool(resume_id))
         try:
             self.before_run(st, resume_id)
@@ -321,9 +325,13 @@ class Adapter:
                     self.parse_line(obj, st, emit)
                 except Exception as e:  # never let a format change kill the worker
                     emit("error", f"unparsed event: {e}")
-                if st.abort and proc.poll() is None:
+                if st.abort:
+                    # Stop the whole process group, even when its leader has already exited (a
+                    # child may still run), and stop reading: what the CLI buffered before the
+                    # kill isn't parsed (#100).
                     st.error = st.error or st.abort
                     _killpg(proc)
+                    break
         rc = proc.wait()
         killer_done.set()
         if not isinstance(st.external_id, str) or not st.external_id.strip():
@@ -351,7 +359,7 @@ class Adapter:
                               timed_out=True, usage=st.usage, partial_usage=partial, limits=limits)
         if st.abort:
             return TurnResult(ok=False, text="", external_id=st.external_id, error=st.abort, usage=st.usage,
-                              partial_usage=partial, limits=limits)
+                              partial_usage=partial, limits=limits, refused=True)
         if rc != 0 or st.error:
             err = st.error or f"exit {rc}: {''.join(stderr_tail)[-800:]}"
             # err already ends with the stderr tail unless the stream reported its own error.
@@ -1479,6 +1487,11 @@ def _copilot_strip(args: list[str], drop: set[str]) -> list[str]:
     return out
 
 
+# Settings files whose ``hooks`` Copilot loads; the first two also hold ``disableAllHooks``.
+_COPILOT_HOOK_SETTINGS = (".github/copilot/settings.json", ".github/copilot/settings.local.json",
+                          ".claude/settings.json", ".claude/settings.local.json")
+
+
 def _copilot_repo_hooks_check(cwd: str, repo_root: bool = True) -> None:
     """Refuse a checkout that defines repository hooks Copilot could run.
 
@@ -1508,13 +1521,16 @@ def _copilot_repo_hooks_check(cwd: str, repo_root: bool = True) -> None:
 
     found = []
     for root in roots:
+        # Each file is read and parsed once, so a save between two reads can't slip past or
+        # raise (#100).
+        settings = {rel: load(root / rel) for rel in _COPILOT_HOOK_SETTINGS[:2] if (root / rel).is_file()}
         off = None
-        for name in ("settings.json", "settings.local.json"):  # the local file is applied last
-            f = root / ".github" / "copilot" / name
-            if f.is_file() and "disableAllHooks" in load(f):
-                off = load(f)["disableAllHooks"]
+        for rel in _COPILOT_HOOK_SETTINGS[:2]:  # the local file is applied last
+            if "disableAllHooks" in settings.get(rel, {}):
+                off = settings[rel]["disableAllHooks"]
         if off is True:
             continue
+        settings.update({rel: load(root / rel) for rel in _COPILOT_HOOK_SETTINGS[2:] if (root / rel).is_file()})
         hooks_dir = root / ".github" / "hooks"
         try:
             hook_files = sorted(p for p in hooks_dir.iterdir() if p.suffix == ".json") if hooks_dir.is_dir() else []
@@ -1525,16 +1541,13 @@ def _copilot_repo_hooks_check(cwd: str, repo_root: bool = True) -> None:
             data = load(f)
             if data.get("hooks") and data.get("disableAllHooks") is not True:
                 found.append(f)
-        for rel in (".github/copilot/settings.json", ".github/copilot/settings.local.json",
-                    ".claude/settings.json", ".claude/settings.local.json"):
-            f = root / rel
-            if f.is_file() and load(f).get("hooks"):
-                found.append(f)
+        found += [root / rel for rel, data in settings.items() if data.get("hooks")]
     if found:
         raise PeerSetupError(
             "PEER_SETUP: this checkout defines hooks Copilot can run outside a read-only turn ("
             + ", ".join(str(f) for f in found) + "); refusing to run the turn. Remove them, or set "
-            "disableAllHooks in .github/copilot/settings.json.")
+            "disableAllHooks to true in .github/copilot/settings.json or settings.local.json (the "
+            "local file wins).")
 
 
 class CopilotAdapter(Adapter):
@@ -1545,7 +1558,7 @@ class CopilotAdapter(Adapter):
     headless = COPILOT_HEADLESS
     default_command = cfg.AGENT_INFO["copilot"]["cli"]
     # Every event type seen in live probes of 1.0.108 (2026-11-23), plus the error event its
-    # code emits.
+    # code emits and prompt_cache_break (seen live in a resumed debrief turn, #100).
     known_events = frozenset({
         "session.start", "session.resume", "session.info", "session.mcp_servers_loaded", "session.tools_updated",
         "session.usage_checkpoint", "session.error", "session.warning", "session.indexed_search",
@@ -1553,7 +1566,7 @@ class CopilotAdapter(Adapter):
         "assistant.turn_start", "assistant.turn_end", "assistant.message_start", "assistant.message_delta",
         "assistant.message", "assistant.tool_call_delta", "assistant.reasoning", "assistant.reasoning_delta",
         "assistant.idle", "model.call_start", "model.call_finished", "model.call_final_result",
-        "tool.execution_start", "tool.execution_complete", "result"})
+        "tool.execution_start", "tool.execution_complete", "prompt_cache_break", "result"})
     web_tools = "fetch pages (no search tool)"
     web_note = " and fetch web pages"
     # session.usage_checkpoint counts the whole session: a resumed probe's turn reported
@@ -1644,9 +1657,14 @@ class CopilotAdapter(Adapter):
         elif typ == "session.mcp_servers_loaded":
             # Fail closed: every server should come up disabled.  One that is live (or in a
             # state we don't know) wasn't switched off, so the turn stops before it runs.
-            servers = data.get("servers") if isinstance(data.get("servers"), list) else []
-            live = sorted({_safe_name(s.get("name")) for s in servers
-                           if isinstance(s, dict) and s.get("status") != "disabled"})
+            servers = data.get("servers")
+            if not isinstance(servers, list) or not all(isinstance(s, dict) for s in servers):
+                # A shape we can't check is format drift: fail closed rather than skip it (#100).
+                st.abort = ("PEER_SETUP: copilot's session.mcp_servers_loaded event isn't in the "
+                            "expected format, so agent-bus can't check its MCP servers are off; "
+                            "refusing to run the turn")
+                return
+            live = sorted({_safe_name(s.get("name")) for s in servers if s.get("status") != "disabled"})
             if live:
                 st.abort = (f"PEER_SETUP: copilot loaded MCP server(s) agent-bus didn't switch off "
                             f"({', '.join(live)}); refusing to run the turn")

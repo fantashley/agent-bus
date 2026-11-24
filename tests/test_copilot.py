@@ -143,6 +143,28 @@ def test_a_live_mcp_server_stops_the_turn(env, monkeypatch):
     assert not res.ok and "PEER_SETUP" in res.error and "sneaky" in res.error and not res.text
 
 
+@pytest.mark.parametrize("data", [{}, {"servers": "github-mcp-server"}, {"servers": ["github-mcp-server"]},
+                                  {"servers": [{"name": "agent-bus", "status": "disabled"}, None]}])
+def test_a_malformed_mcp_servers_event_stops_the_turn(env, monkeypatch, data):
+    # #100: a shape agent-bus can't check is format drift, so it fails closed.  The rest of
+    # the turn follows straight after it in the pipe: none of it is parsed, and the CLI is
+    # stopped once.
+    from agent_bus import peers
+    kills = []
+    real = peers._killpg
+    monkeypatch.setattr(peers, "_killpg", lambda proc: kills.append(proc.pid) or real(proc))
+    monkeypatch.setenv("FAKE_COPILOT_MCP_EVENT", json.dumps(data))
+    res, events = run(env)
+    assert not res.ok and "PEER_SETUP" in res.error and "expected format" in res.error and not res.text
+    assert len(kills) == 1
+    assert not [e for e in events if e[0] in ("tool", "text")]
+
+
+def test_prompt_cache_break_is_a_known_event():
+    # Seen live in a resumed debrief turn (#100): not reported as an unrecognised event.
+    assert "prompt_cache_break" in CopilotAdapter.known_events
+
+
 # ------------------------------------------------------------------ the stream
 
 
@@ -355,3 +377,90 @@ def test_unreadable_hook_config_fails_closed(env):
     (hooks / "broken.json").write_text("{not json")
     res, _ = run(env)
     assert not res.ok and "broken.json" in res.error
+
+
+def test_each_settings_file_is_read_once(env, monkeypatch):
+    # #100: one read per file, so a save between two reads can't raise KeyError or slip past.
+    from pathlib import Path
+    reads = []
+    real = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: reads.append(self.name) or real(self, *a, **k))
+    hooks = env["repo"] / ".github" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "start.json").write_text(json.dumps({"hooks": {"sessionStart": [{"bash": "x"}]}}))
+    settings = env["repo"] / ".github" / "copilot"
+    settings.mkdir()
+    (settings / "settings.json").write_text(json.dumps({"disableAllHooks": True}))
+    (settings / "settings.local.json").write_text(json.dumps({"disableAllHooks": False, "hooks": {"x": []}}))
+    (env["repo"] / ".claude").mkdir()
+    (env["repo"] / ".claude" / "settings.json").write_text(json.dumps({"permissions": {}}))
+    res, _ = run(env)
+    assert not res.ok and "start.json" in res.error and "settings.local.json" in res.error
+    names = ("settings.json", "settings.local.json", "start.json")
+    assert sorted(n for n in reads if n in names) == ["settings.json", "settings.json", "settings.local.json",
+                                                       "start.json"]  # .github/copilot and .claude
+
+
+def test_a_settings_file_that_changes_between_reads_cannot_raise(env, monkeypatch):
+    # The old check read a file twice: removing disableAllHooks in between raised KeyError.
+    from pathlib import Path
+    real = Path.read_text
+    seen = {}
+
+    def flaky(self, *a, **k):
+        if self.name == "settings.json" and self.parent.name == "copilot":
+            seen[self] = seen.get(self, 0) + 1
+            return json.dumps({"disableAllHooks": True} if seen[self] == 1 else {})
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    settings = env["repo"] / ".github" / "copilot"
+    settings.mkdir(parents=True)
+    (settings / "settings.json").write_text("{}")
+    assert run(env)[0].ok
+
+
+def test_a_hook_refusal_reads_as_one_sentence_on_the_thread(env, no_spawn):
+    # #100: the refusal ends with a full stop, and the notice that quotes it adds its own.
+    bus, repo = env["bus"], env["repo"]
+    base, _ = git_repo(repo)
+    hooks = repo / ".github" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "start.json").write_text(json.dumps({"hooks": {"sessionStart": [{"bash": "x"}]}}))
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "hooks"],
+                   cwd=repo, check=True, capture_output=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True,
+                          text=True).stdout.strip()
+    codex = Service(bus, "codex", bus.register_session("codex"))
+    tid = codex.request_review("copilot", str(repo), base, head)["thread"]["id"]
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    notice = [m["body"] for m in bus.history(tid)["messages"] if "PEER_SETUP" in m["body"]]
+    assert notice and "start.json" in notice[0] and "the local file wins). Run" in notice[0]
+    assert ".." not in notice[0].replace("...", "")
+
+
+def test_a_refused_resumed_turn_keeps_the_session_and_is_not_retried(env, no_spawn, monkeypatch):
+    # #100: a turn agent-bus stopped for isolation isn't a failed resume.  A fresh session
+    # would be refused the same way, and the conversation the review pinned stays pinned.
+    bus, repo = env["bus"], env["repo"]
+    base, head = git_repo(repo)
+    monkeypatch.setenv("FAKE_APPROVE", "copilot")
+    codex = Service(bus, "codex", bus.register_session("codex"))
+    tid = codex.request_review("copilot", str(repo), base, head)["thread"]["id"]
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    session = bus.peer_session(tid, "copilot")
+    assert session
+    (repo / "a.txt").write_text("again\n")
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qam", "again"],
+                   cwd=repo, check=True, capture_output=True)
+    head2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True,
+                           text=True).stdout.strip()
+    monkeypatch.setenv("FAKE_COPILOT_MCP_EVENT", json.dumps({"servers": "?"}))
+    n = len(calls(env))
+    codex.request_review("copilot", str(repo), base, head2, prev_head_commit_id=head)
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    new = calls(env)[n:]
+    assert len(new) == 1 and session in new[0]["argv"]  # the resume only: no fresh session
+    assert bus.peer_session(tid, "copilot") == session
+    assert not [e for e in bus.events(tid) if e["kind"] == "error" and "starting a fresh session" in e["text"]]
