@@ -335,3 +335,22 @@ def test_pushback_at_the_limit_that_hits_quota_is_retried_not_lifted(env, no_spa
     monkeypatch.delenv("FAKE_EXHAUSTED")
     res = Service(bus, HUMAN).resume(tid)
     assert res.get("job") and res["thread"]["followup_limit"] == 2  # the pushback reruns as it was
+
+
+def test_unfinished_pushback_at_the_limit_still_blocks_a_new_head(env, no_spawn, monkeypatch):
+    set_config(env, review_followup_budget=1)
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review(None, str(repo), base, h1, reviewers=BOTH)["thread"]["id"]
+    run_job(bus, tid)
+    h2 = commit("two\n")
+    claude.request_review(None, str(repo), base, h2, prev_head_commit_id=h1, reviewers=BOTH)
+    run_job(bus, tid)  # antigravity blocks
+    claude.request_review(None, str(repo), base, h2, prev_head_commit_id=h2, reviewers=BOTH, focus="evidence")
+    monkeypatch.setenv("FAKE_EXHAUSTED", "antigravity")
+    run_job(bus, tid)  # the pushback hits a usage limit, at the follow-up limit
+    with pytest.raises(BusError) as e:
+        claude.request_review(None, str(repo), base, commit("three\n"), prev_head_commit_id=h2, reviewers=BOTH)
+    assert e.value.code == "REVIEW_LIMIT_REACHED"

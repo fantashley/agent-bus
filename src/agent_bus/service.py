@@ -442,10 +442,11 @@ class Service:
         b = self.config.review_followup_budget
         return {"follow_ups": 0, "followup_budget": b, "followup_limit": 2 * b}
 
-    def _over_budget(self, t: dict) -> bool:
+    def _over_budget(self, t: dict, resuming: bool = False) -> bool:
         """Whether a review is held for the human by its follow-up limit (#71): parked for
         that, or past the limit with someone still asking for changes (a worker can die
-        between posting that verdict and parking the thread)."""
+        between posting that verdict and parking the thread).  When ``resuming``, a pushback
+        pass still due its verdict isn't: the resume reruns it within the limit."""
         if t["kind"] != "review":
             return False
         refs = t["refs"] or {}
@@ -454,7 +455,7 @@ class Service:
         p = review_progress(t)
         if p["follow_ups"] < p["followup_limit"]:
             return False
-        if refs.get("pushback_round") == t["round"] and not any(
+        if resuming and refs.get("pushback_round") == t["round"] and not any(
                 m["round"] == t["round"] for m in self._verdicts(t)):
             return False  # a pushback still to give its verdict: let it finish (a quota resume retries it)
         return bool(self.bus.review_standings(t["id"])["changes_requested"])
@@ -868,7 +869,7 @@ class Service:
         note = ((f"Resumed by the human user with {extra_rounds} more round(s)."
                  if t["kind"] == "discussion" else "Resumed by the human user.")
                 + (f" It allows {self.config.review_followup_budget} more follow-up request(s); request review "
-                   "again to continue." if self._over_budget(t) else "")
+                   "again to continue." if self._over_budget(t, resuming=True) else "")
                 + (f" Cleared out-of-usage state for {', '.join(cleared)}." if cleared else "")
                 + (f" Cleared format-drift state for {', '.join(drifted)}." if drifted else ""))
         return self._reopen(t, extra_rounds, note, auto_resumes=0, key=f"{time.time():.0f}")
@@ -915,7 +916,7 @@ class Service:
         if t["kind"] == "discussion":
             fields["max_rounds"] = max(t["max_rounds"], t["round"]) + extra_rounds
             fields["deadline"] = time.time() + self.config.deadline_minutes * 60
-        parked = self._over_budget(t)
+        parked = self._over_budget(t, resuming=True)
         if t["refs"] is not None or auto_resumes:
             refs = {**(t["refs"] or {}), "auto_resumes": auto_resumes}
             if parked:
