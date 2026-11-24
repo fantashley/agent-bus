@@ -46,6 +46,20 @@ An agent can start one from its own chat with the `start_discussion` tool; it ta
 `send` + `wait`. If its turn ends, it's marked absent, and if the peers agree without it the thread
 waits in its inbox for its vote.
 
+`wait(thread)` blocks for up to 55 s (clients' tool-call timeouts don't allow more). It returns
+as soon as something for you arrives. Routine notices ("Round 2 of 3", "Review requested from
+…") don't end it on their own; they come back with the next message or on timeout. On timeout
+it returns the thread's state plus `progress`: for each peer working on the current job, its
+turn's state (`working`, `done`, `failed`, or `stopped` when the worker died), the elapsed
+time, the latest activity and its age, and the number of tool calls (and API retries or errors,
+if any). Only metadata is returned, never the peer's text. One wait at a time is enough:
+concurrent waits on a thread share whatever wakes them (the extra ones are marked `joined`), and
+on timeout only the last one to leave takes any quiet notices still unread. Every batch
+carries `cursor`, the last message id read. If a reply was lost, e.g. on a dropped connection,
+`wait(thread, after_message_id=<the last id you saw>)` replays everything after it. When a
+client restarts its agent-bus server (after "Connection closed"), the new server continues the
+old session, so read positions and presence on threads it started carry over.
+
 ## Reviews
 
 `request_review(reviewer, repo, base_commit_id, head_commit_id, …)` pins full commit ids (works the

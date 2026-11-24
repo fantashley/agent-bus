@@ -203,8 +203,10 @@ class Worker:
         except BusError as e:
             self.event("error", f"post rejected: {e.code}: {e.message}", sender if sender != SYSTEM else None)
 
-    def system(self, body: str, kind: str = "status", recipient: str | None = None) -> None:
-        self.post(SYSTEM, body, kind=kind, recipient=recipient)
+    def system(self, body: str, kind: str = "status", recipient: str | None = None, quiet: bool = False) -> None:
+        """A system notice.  ``quiet``: a routine lifecycle step that doesn't end a ``wait``
+        by itself (#72); it is still delivered, with the next message or on timeout."""
+        self.post(SYSTEM, body, kind=kind, recipient=recipient, data={"quiet": True} if quiet else None)
 
     def park_on_quota(self, agent: str) -> bool:
         """Park the thread as needs_human because ``agent`` is out of usage, planning an
@@ -606,7 +608,8 @@ class Worker:
                 and not self.bus.agent_present(init, t["initiator_session"]))
 
     def round_one(self, t: dict) -> None:
-        self.system(f"Round 1 (blind): collecting initial proposals from {', '.join(t['participants'])}.")
+        self.system(f"Round 1 (blind): collecting initial proposals from {', '.join(t['participants'])}.",
+                    quiet=True)
         peers = self.peers(t)
         first = self.preamble_and_question(t)
 
@@ -642,7 +645,7 @@ class Worker:
                 self.unvotable_notice(p, r)
             return False
         t = self.thread()
-        self.system(f"Round {t['round']} of {t['max_rounds']}: vote on a proposal or revise one.")
+        self.system(f"Round {t['round']} of {t['max_rounds']}: vote on a proposal or revise one.", quiet=True)
         peers = self.peers(t)
         # Sequential, rotating start, so each peer sees the previous peer's move this round.
         start = (t["round"] - 2) % max(1, len(peers))
@@ -766,7 +769,9 @@ class Worker:
             time.sleep(2)
             if self.initiator_posted(init, round_no) or self.done():
                 return
-        self.system(f"{init} (initiator) did not post in round {round_no}; marked absent for this round.")
+        # It was present but made no move: say so, and keep "absent" for a stale session.
+        self.system(f"No move from {init} (initiator) in round {round_no} within its grace period; continuing "
+                    "without it. Its agreement is still needed for consensus.")
 
     def wrap_up(self) -> None:
         t = self.thread()
@@ -969,7 +974,7 @@ class Worker:
             prompt = fresh
         what = "pushback " if pushback else "follow-up " if followup else ""
         self.system(f"Review {what}{'(retry) ' if mode == 'retry' else ''}"
-                    f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.{fallback}")
+                    f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.{fallback}", quiet=True)
         res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh)
         if res.quota or res.format_changed or res.config_error:
             # Head, reviewer and session stay pinned for `agent-bus resume` after the reset
