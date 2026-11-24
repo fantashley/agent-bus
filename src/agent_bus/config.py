@@ -617,9 +617,11 @@ def _launched_from() -> str | None:
 
 
 def _on_path() -> str | None:
-    """The `agent-bus` a new shell would run, resolved.  Skips this build's own bin directory:
-    a Nix wrapper puts it first on this process's PATH, which would hide an upgrade (#89)."""
-    own = os.path.dirname(_LAUNCHED_FROM) if _LAUNCHED_FROM else None
+    """The `agent-bus` a new shell would run, resolved.  When started through a Nix wrapper,
+    skips this build's own bin directory: the wrapper put it first on this process's PATH,
+    which would hide an upgrade (#89).  Any other launch takes PATH as it is."""
+    wrapped = bool(sys.argv) and os.path.basename(sys.argv[0]) == ".agent-bus-wrapped"
+    own = os.path.dirname(_LAUNCHED_FROM) if _LAUNCHED_FROM and wrapped else None
     for d in os.environ.get("PATH", "").split(os.pathsep):
         if not d or (own and os.path.realpath(d) == own):
             continue

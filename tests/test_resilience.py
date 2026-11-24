@@ -200,6 +200,12 @@ def test_whoami_flags_a_stale_nix_wrapped_server(env, no_spawn, monkeypatch, tmp
     monkeypatch.delenv("AGENT_BUS_BIN", raising=False)
     assert cfg.self_command() == [os.path.realpath(old / "agent-bus")]  # the wrapper, not the wrapped
 
+    # An unwrapped launch takes PATH as it is: its own directory first is not stale.
+    monkeypatch.setenv("PATH", f"{old}:{new}:{os.environ['PATH']}")
+    monkeypatch.setattr(sys, "argv", [str(old / "agent-bus"), "mcp"])
+    monkeypatch.setattr(cfg, "_LAUNCHED_FROM", cfg._launched_from())
+    assert "stale_build" not in whoami()
+
 
 # ------------------------------------------------- review fixes (t-a3faf1 pass 1)
 
