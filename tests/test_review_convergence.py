@@ -332,6 +332,9 @@ def test_pushback_at_the_limit_that_hits_quota_is_retried_not_lifted(env, no_spa
     monkeypatch.setenv("FAKE_EXHAUSTED", "codex")
     run_job(bus, tid)
     assert bus.thread(tid)["status"] == "needs_human"
+    with pytest.raises(BusError) as e:  # #87: wait for (or resume) that pushback, not "allow more"
+        claude.request_review("codex", str(repo), base, commit("three\n"), prev_head_commit_id=h2)
+    assert e.value.code == "REVIEW_LIMIT_REACHED" and "still due its verdict" in str(e.value)
     monkeypatch.delenv("FAKE_EXHAUSTED")
     res = Service(bus, HUMAN).resume(tid)
     assert res.get("job") and res["thread"]["followup_limit"] == 2  # the pushback reruns as it was
@@ -354,3 +357,97 @@ def test_unfinished_pushback_at_the_limit_still_blocks_a_new_head(env, no_spawn,
     with pytest.raises(BusError) as e:
         claude.request_review(None, str(repo), base, commit("three\n"), prev_head_commit_id=h2, reviewers=BOTH)
     assert e.value.code == "REVIEW_LIMIT_REACHED"
+    # #87: a resume reruns that pushback at the same limit, so the error says to wait for it.
+    assert "pushback pass is still due its verdict" in str(e.value)
+    assert "allow more follow-ups" not in str(e.value)
+
+
+def status_bodies(bus, tid):
+    return [m["body"] for m in bus.history(tid)["messages"] if m["kind"] == "status"]
+
+
+def test_two_reviewer_follow_ups_count_through_new_heads_and_a_pushback(env, no_spawn, monkeypatch):
+    """#89: the shape of a real two-reviewer review (several new heads, a handoff after an
+    approval, a pushback), with the default budget of 3 and limit of 6."""
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    heads = [commit("one\n")]
+    res = claude.request_review(None, str(repo), base, heads[0], reviewers=BOTH, change_id="PR-1")
+    tid = res["thread"]["id"]
+    assert (res["thread"]["follow_ups"], res["thread"]["followup_budget"], res["thread"]["followup_limit"]) == (0, 3, 6)
+    run_job(bus, tid)  # codex asks for changes
+    assert status_bodies(bus, tid)[0].startswith(f"Review requested from codex at head {heads[0][:12]}")
+
+    def new_head(text, approve=""):
+        monkeypatch.setenv("FAKE_APPROVE", approve)
+        heads.append(commit(text))
+        out = claude.request_review(None, str(repo), base, heads[-1], prev_head_commit_id=heads[-2],
+                                    reviewers=BOTH, thread=tid, change_id="PR-1")
+        run_job(bus, tid)
+        return out
+
+    # A new head goes to antigravity, which has never reviewed: still the author's follow-up.
+    assert new_head("two\n")["thread"]["follow_ups"] == 1
+    assert f"Review follow-up requested from antigravity at head {heads[-1][:12]}." in status_bodies(bus, tid)
+    assert new_head("three\n")["thread"]["follow_ups"] == 2
+    assert not thread_summary(bus.thread(tid))["budget_warning"]
+    assert "run long" not in claude.inbox(thread=tid)["messages"][-1]["body"]
+    # antigravity approves and hands the head to codex: the handoff is free.
+    assert new_head("four\n", approve="antigravity")["thread"]["follow_ups"] == 3
+    t = bus.thread(tid)
+    assert t["round"] == 5 and thread_summary(t)["follow_ups"] == 3
+    assert thread_summary(t)["budget_warning"] and t["status"] == "open"
+    notice = claude.inbox(thread=tid)["messages"][-1]["body"]
+    assert notice.startswith("codex requested changes") and "run long: 3 follow-up requests" in notice
+
+    # A pushback counts too.
+    claude.send("PUSHBACK: intended", thread=tid)
+    res = claude.request_review(None, str(repo), base, heads[-1], prev_head_commit_id=heads[-1],
+                                reviewers=BOTH, thread=tid)
+    assert res["thread"]["follow_ups"] == 4 and bus.jobs(tid)[-1]["params"]["mode"] == "pushback"
+    run_job(bus, tid)
+    assert f"Review pushback requested from codex at head {heads[-1][:12]}." in status_bodies(bus, tid)
+    assert bus.review_standings(tid)["approved"] == ["antigravity"]
+
+    assert new_head("five\n")["thread"]["follow_ups"] == 5
+    assert bus.thread(tid)["status"] == "open"
+    new_head("six\n")  # the sixth follow-up still asks for changes: the human decides
+    t = bus.thread(tid)
+    assert thread_summary(t)["follow_ups"] == 6 and t["status"] == "needs_human" and t["refs"]["budget_parked"]
+    assert thread_summary(t)["waiting_for_human"]
+    assert "still asks for changes after 6 follow-up requests" in claude.inbox(thread=tid)["messages"][-1]["body"]
+    with pytest.raises(BusError) as e:
+        claude.request_review(None, str(repo), base, commit("seven\n"), prev_head_commit_id=heads[-1],
+                              reviewers=BOTH, thread=tid)
+    assert e.value.code == "REVIEW_LIMIT_REACHED" and "after 6 follow-up requests" in str(e.value)
+    assert "to allow more follow-ups" in str(e.value)
+
+
+def test_single_reviewer_follow_ups_count_to_the_default_limit(env, no_spawn):
+    """#89, the single-reviewer path: new heads and a pushback each count, with the default
+    budget of 3 (a warning) and limit of 6 (the human)."""
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    prev = commit("one\n")
+    tid = claude.request_review("codex", str(repo), base, prev)["thread"]["id"]
+    run_job(bus, tid)
+    for n in range(1, 7):
+        if n == 4:  # the fourth is a pushback on the same head
+            res = claude.request_review("codex", str(repo), base, prev, prev_head_commit_id=prev, focus="intended")
+            assert bus.jobs(tid)[-1]["params"]["mode"] == "pushback"
+        else:
+            h = commit(f"{n}\n")
+            res = claude.request_review("codex", str(repo), base, h, prev_head_commit_id=prev)
+            prev = h
+        assert res["thread"]["id"] == tid and res["thread"]["follow_ups"] == n
+        run_job(bus, tid)
+        t = bus.thread(tid)
+        assert thread_summary(t)["budget_warning"] == (n >= 3)
+        assert t["status"] == ("needs_human" if n == 6 else "resolved")
+    assert f"Review follow-up requested from codex at head {prev[:12]}." in status_bodies(bus, tid)
+    assert "still asks for changes after 6 follow-up requests" in claude.inbox(thread=tid)["messages"][-1]["body"]
+    with pytest.raises(BusError) as e:
+        claude.request_review("codex", str(repo), base, commit("seven\n"), prev_head_commit_id=prev)
+    assert e.value.code == "REVIEW_LIMIT_REACHED" and "to allow more follow-ups" in str(e.value)

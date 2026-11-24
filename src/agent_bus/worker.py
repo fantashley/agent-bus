@@ -972,7 +972,9 @@ class Worker:
                 diff_heading=inter_heading, diff=inter)
         else:
             prompt = fresh
-        what = "pushback " if pushback else "follow-up " if followup else ""
+        # The author's follow-up request is one, even for a reviewer seeing the change for the
+        # first time (#89); a handoff is one only for a reviewer that has reviewed before.
+        what = "pushback " if pushback else "follow-up " if followup or mode == "followup" else ""
         self.system(f"Review {what}{'(retry) ' if mode == 'retry' else ''}"
                     f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.{fallback}", quiet=True)
         res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh)
