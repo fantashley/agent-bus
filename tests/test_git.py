@@ -148,7 +148,7 @@ def test_review_round_trip_in_plain_git_without_jj(env, no_spawn, no_jj):
 
 @pytest.mark.parametrize("label,ok", [
     ("qpvuntsm", True), ("feature/typo-fix", True), ("PR #12", True), ("v1.2+build", True),
-    (" leading", False), ("trailing ", False), ("two\nlines", False), ("x" * 101, False), ("$(rm)", False),
+    (" leading", False), ("trailing ", False), ("fix (review)", False), ("two\nlines", False), ("x" * 101, False), ("$(rm)", False),
 ])
 def test_change_labels(env, no_spawn, label, ok):
     bus = env["bus"]
@@ -161,7 +161,9 @@ def test_change_labels(env, no_spawn, label, ok):
             call()
 
 
-# #42: a well-formed commit id the repository doesn't have is reported on the thread.
+# #42: a well-formed commit id the repository doesn't have is reported on the thread. Since #73
+# request_review refuses one up front, so these tests skip that check (unchecked_commits):
+# the worker still catches a commit that is gone by the time the review runs.
 
 MISSING = "0123456789abcdef0123456789abcdef01234567"
 
@@ -182,7 +184,7 @@ def missing_report(env, tid):
 
 
 @pytest.mark.parametrize("which", ["base", "head"])
-def test_missing_commit_in_plain_git_needs_human(env, no_spawn, no_jj, which):
+def test_missing_commit_in_plain_git_needs_human(env, no_spawn, unchecked_commits, no_jj, which):
     sh = git_repo(env["repo"])
     real = sh("git", "rev-parse", "HEAD")
     base, head = (MISSING, real) if which == "base" else (real, MISSING)
@@ -198,7 +200,7 @@ def test_missing_commit_in_plain_git_needs_human(env, no_spawn, no_jj, which):
     assert not again["job"].get("deduplicated")
 
 
-def test_missing_commit_in_jj_repo_needs_human(env, no_spawn):
+def test_missing_commit_in_jj_repo_needs_human(env, no_spawn, unchecked_commits):
     if shutil.which("jj") is None:
         pytest.skip("jj not installed")
     repo = env["repo"]
@@ -212,7 +214,7 @@ def test_missing_commit_in_jj_repo_needs_human(env, no_spawn):
     assert f"the head commit {MISSING}" in missing_report(env, tid)
 
 
-def test_missing_previous_head_on_followup_needs_human(env, no_spawn, no_jj):
+def test_missing_previous_head_on_followup_needs_human(env, no_spawn, unchecked_commits, no_jj):
     repo = env["repo"]
     sh = git_repo(repo)
     base = sh("git", "rev-parse", "HEAD")
@@ -240,7 +242,7 @@ def test_missing_previous_head_on_followup_needs_human(env, no_spawn, no_jj):
     assert "without prev_head_commit_id" in body
 
 
-def test_missing_head_is_not_read_as_a_path(env, no_spawn, no_jj):
+def test_missing_head_is_not_read_as_a_path(env, no_spawn, unchecked_commits, no_jj):
     repo = env["repo"]
     sh = git_repo(repo)
     base = sh("git", "rev-parse", "HEAD")
@@ -252,7 +254,7 @@ def test_missing_head_is_not_read_as_a_path(env, no_spawn, no_jj):
     assert f"the head commit {MISSING}" in missing_report(env, tid)
 
 
-def test_tree_id_is_not_reviewed_as_a_commit(env, no_spawn, no_jj):
+def test_tree_id_is_not_reviewed_as_a_commit(env, no_spawn, unchecked_commits, no_jj):
     sh = git_repo(env["repo"])
     base = sh("git", "rev-parse", "HEAD")
     tree = sh("git", "rev-parse", "HEAD^{tree}")
@@ -263,7 +265,7 @@ def test_tree_id_is_not_reviewed_as_a_commit(env, no_spawn, no_jj):
     assert f"the head commit {tree}" in missing_report(env, tid)
 
 
-def test_git_probe_error_is_not_reported_as_missing(env, no_spawn, no_jj, monkeypatch):
+def test_git_probe_error_is_not_reported_as_missing(env, no_spawn, unchecked_commits, no_jj, monkeypatch):
     sh = git_repo(env["repo"])
     real = sh("git", "rev-parse", "HEAD")
     bus = env["bus"]

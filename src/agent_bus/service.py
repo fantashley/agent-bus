@@ -17,7 +17,11 @@ from . import autoresume, quota
 from . import rex, unvotable, worker
 from .db import HUMAN, SYSTEM, Bus, BusError, is_quiet, review_progress, wrap_peer
 
-COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+# A pinned commit id: the full 40 hex digits, or a prefix of at least 7 that request_review
+# resolves to one commit in the repo (#73).  Upper case is accepted and lowered.
+COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+FULL_ID_HINT = ("get full ids with `jj log --no-graph -r <rev> -T commit_id` or `git rev-parse <rev>`, "
+                "and never extend a short id by hand")
 # A label for the change under review: a jj change id, a git branch name, or e.g. "PR #12".
 CHANGE_RE = re.compile(r"[A-Za-z0-9#][A-Za-z0-9 ._/#:+-]{0,99}")
 # The longest testing note a review request may carry (#93).
@@ -405,6 +409,8 @@ class Service:
         self.config.require_available(reviewer, "reviewer")
         self._check_review_ids(base_commit_id, head_commit_id, prev_head_commit_id, change_id)
         repo_path = self._allowed_repo(repo)
+        base_commit_id, head_commit_id, prev_head_commit_id = self._resolve_review_ids(
+            repo_path, base_commit_id, head_commit_id, prev_head_commit_id)
         request = [base_commit_id, prev_head_commit_id, head_commit_id]
         refs = {"reviewer": reviewer, "repo": repo_path, "change_id": change_id,
                 "base_commit_id": base_commit_id, "head_commit_id": head_commit_id,
@@ -665,11 +671,63 @@ class Service:
     @staticmethod
     def _check_review_ids(base: str, head: str, prev: str | None, change_id: str | None) -> None:
         for name, value in (("base_commit_id", base), ("head_commit_id", head), ("prev_head_commit_id", prev)):
-            if value is not None and not COMMIT_RE.match(value):
-                raise ValueError(f"{name} must be a full 40-character commit id")
+            if value is not None and not (isinstance(value, str) and COMMIT_RE.fullmatch(value)):
+                raise ValueError(f"{name} must be a commit id: all 40 hex digits, or an unambiguous prefix of "
+                                 f"at least 7 (got {str(value)[:50]!r}); {FULL_ID_HINT}")
         if change_id is not None and (not CHANGE_RE.fullmatch(change_id) or change_id != change_id.strip()):
-            raise ValueError("change_id must be a short label: a jj change id, a git branch name, "
-                             "or e.g. \"PR #12\" (letters, digits, space and ._/#:+-, up to 100 characters)")
+            raise ValueError("change_id must be a short label: letters, digits, space and ._/#:+- only (no "
+                             "parentheses or newlines), starting with a letter, digit or #, at most 100 "
+                             f"characters, e.g. a jj change id (qpvuntsm), a branch (feature/x) or \"PR #12\" "
+                             f"(got {change_id[:50]!r})")
+
+    @staticmethod
+    def _resolve_review_ids(repo: str, base: str, head: str, prev: str | None) -> tuple[str, str, str | None]:
+        """Check a review's pinned commits in ``repo`` before anything is created (#73): resolve
+        each id (or unambiguous prefix) to its full commit id, refuse one the repo doesn't have,
+        and refuse a base that isn't an ancestor of the head, whose diff would also show
+        unrelated changes.  A probe that gives no definite answer lets a full id through: the
+        worker checks again and reports a missing commit on the thread."""
+        tools = worker.commit_tools(repo)
+        given = (("base_commit_id", base), ("head_commit_id", head), ("prev_head_commit_id", prev))
+        if not tools:  # not a jj or git repo: nothing to resolve in, and the worker reports it
+            for name, value in given:
+                if value is not None and len(value) != 40:
+                    raise ValueError(f"{name} must be all 40 hex digits: {repo} is not a jj or git repository, "
+                                     "so a prefix can't be resolved")
+            return base.lower(), head.lower(), prev and prev.lower()
+        out: list[str | None] = []
+        for name, value in given:
+            if value is None:
+                out.append(None)
+                continue
+            value = value.lower()
+            state, ids = worker.resolve_commit(repo, tools, value)
+            if state == "found":
+                out.append(ids[0])
+            elif state == "ambiguous":
+                listed = f" ({', '.join(i[:12] for i in ids[:5])}{', ...' if len(ids) > 5 else ''})" if ids else ""
+                raise BusError("REVISION_AMBIGUOUS", f"{name} {value} matches more than one commit in "
+                               f"{repo}{listed}; pass a longer prefix or the full id: {FULL_ID_HINT}")
+            elif state == "missing":
+                gone = (" If the previous head is gone for good (amended and garbage-collected), request a "
+                        "fresh review without prev_head_commit_id." if name == "prev_head_commit_id" else "")
+                raise BusError("REVISION_NOT_FOUND", f"{repo} has no commit {value} ({name}); nothing was "
+                               f"created. Check the id: {FULL_ID_HINT}. If the commit exists elsewhere, make it "
+                               "available in this repository (push or fetch it; in a jj repo whose commit was "
+                               f"made with git, `jj git import`), then request again.{gone}")
+            elif len(value) == 40:
+                out.append(value)
+            else:
+                raise BusError("REVISION_NOT_FOUND", f"could not resolve {name} {value} in {repo}: pass the "
+                               f"full id ({FULL_ID_HINT})")
+        base, head, prev = out
+        if worker.is_ancestor(repo, tools, base, head) is False:
+            raise BusError("REVISION_NOT_ANCESTOR", f"base {base[:12]} is not an ancestor of head {head[:12]} in "
+                           f"{repo}, so the diff would also show changes that aren't part of this change; "
+                           "nothing was created. Rebase the change onto that base, or pass the commit it is "
+                           "based on as base_commit_id (`jj log --no-graph -r 'fork_point(<base> | <head>)' "
+                           "-T commit_id` or `git merge-base <base> <head>`).")
+        return base, head, prev
 
     def _request_reviews(self, reviewers: list[str], repo: str, base_commit_id: str, head_commit_id: str,
                          change_id: str | None, prev_head_commit_id: str | None, focus: str | None,
@@ -705,6 +763,8 @@ class Service:
         if thread is not None and prev_head_commit_id is None:
             raise ValueError("`thread` names the review to continue; it needs prev_head_commit_id")
         repo_path = self._allowed_repo(repo)
+        base_commit_id, head_commit_id, prev_head_commit_id = self._resolve_review_ids(
+            repo_path, base_commit_id, head_commit_id, prev_head_commit_id)
         goal = f"Review {change_id or head_commit_id[:12]} in {os.path.basename(repo_path)} by {', '.join(order)}"
         request = [base_commit_id, prev_head_commit_id, head_commit_id]
         self.bus.reap()

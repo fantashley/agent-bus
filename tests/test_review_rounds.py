@@ -298,7 +298,7 @@ def test_resume_finishes_a_review_whose_worker_died_after_the_last_approval(env,
     assert calls(env) == []  # nobody reviewed again
 
 
-def test_missing_new_head_for_a_first_time_reviewer_points_to_resume(env, no_spawn, monkeypatch):
+def test_missing_new_head_for_a_first_time_reviewer_points_to_resume(env, no_spawn, unchecked_commits, monkeypatch):
     bus, repo = env["bus"], env["repo"]
     base, commit = git_repo(repo)
     h1 = commit("one\n")
@@ -340,7 +340,7 @@ def test_returning_to_an_earlier_base_needs_fresh_approvals(env, no_spawn, monke
     assert st["complete"] and bus.thread(tid)["refs"]["base_commit_id"] == a
 
 
-def test_repeating_a_failed_followup_reports_that_failure(env, no_spawn, monkeypatch):
+def test_repeating_a_failed_followup_reports_that_failure(env, no_spawn, unchecked_commits, monkeypatch):
     bus, repo = env["bus"], env["repo"]
     base, commit = git_repo(repo)
     h1 = commit("one\n")
@@ -514,7 +514,7 @@ def test_initial_focus_reaches_every_reviewer(env, no_spawn, monkeypatch):
     assert all("FOCUS-NOTE" in c["prompt"] for c in calls(env)) and len(calls(env)) == 2
 
 
-def test_missing_base_on_a_base_only_followup_points_to_resume(env, no_spawn, monkeypatch):
+def test_missing_base_on_a_base_only_followup_points_to_resume(env, no_spawn, unchecked_commits, monkeypatch):
     bus, repo = env["bus"], env["repo"]
     base, commit = git_repo(repo)
     h = commit("one\n")

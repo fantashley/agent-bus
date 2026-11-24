@@ -69,7 +69,17 @@ same in jj and plain git repos). The worker computes the diff with the repo's ow
 `jj diff --git` when the repo has a `.jj` directory and jj is installed, otherwise `git diff`.
 jj is optional: plain git repos never run it. The reviewer returns a structured verdict, and it
 lands as a `review_verdict` in the requester's inbox. `change_id` is an optional label: a jj change
-id, a branch name or `PR #12`.
+id, a branch name or `PR #12` (letters, digits, space and `._/#:+-`, up to 100 characters; no
+parentheses).
+
+The request is checked before anything is created. Each commit id must be in the repo; an
+unambiguous prefix of at least 7 hex digits is resolved to the full id, and the thread records the
+full one. The base must be an ancestor of the head (otherwise the diff would also show unrelated
+changes). A failed check creates no thread and returns `REVISION_NOT_FOUND`,
+`REVISION_AMBIGUOUS` or `REVISION_NOT_ANCESTOR`, with how to get the right id. In a jj repo a
+commit made with plain git is found through git, so `jj git import` is only needed when the repo
+has no `.git`. A commit that goes missing after the request (an amend and `git gc`, say) is still
+reported on the thread by the worker, which then waits for the human user.
 
 For the next pass, request again with `prev_head_commit_id` set to the thread's current head.
 That continues the **same thread** and **resumes the reviewer's own conversation**, so it remembers

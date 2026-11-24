@@ -58,3 +58,13 @@ def no_spawn(monkeypatch):
     from agent_bus import worker
     monkeypatch.setattr(worker, "spawn", lambda jid: spawned.append(jid) or 0)
     return spawned
+
+
+@pytest.fixture
+def unchecked_commits(monkeypatch):
+    """request_review's up-front commit check (#73) gets no definite answer, so a full id the
+    repo doesn't have is accepted: tests of the worker's own missing-commit backstop (#42),
+    which still catches a commit that is gone by the time the review runs."""
+    from agent_bus import worker
+    monkeypatch.setattr(worker, "resolve_commit", lambda repo, tools, rev: ("unknown", []))
+    monkeypatch.setattr(worker, "is_ancestor", lambda repo, tools, base, head: None)
