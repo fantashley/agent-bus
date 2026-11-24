@@ -1257,18 +1257,25 @@ class Bus:
             # Single-reviewer verdicts carry no revision or base; they count for the thread's,
             # in the round they were given (a thread can return to an earlier round's head).
             on_base = m["data"].get("base_commit_id", base) if m else None
+            # A single reviewer's pushback pass (#71) is a new round on the same head: its
+            # request for changes stands until that pass gives a new verdict.
+            rounds = (t["round"], t["round"] - 1) if refs.get("pushback_round") == t["round"] else (t["round"],)
             current = (m["data"].get("revision") == refs.get("revision", 0) if "reviewers" in refs
-                       else at == head and m["round"] == t["round"]) if m else False
+                       else at == head and m["round"] in rounds) if m else False
             if m is None:
                 state = "pending"
             elif not current:
                 state = "stale"
             else:
                 state = "approved" if verdict == "approve" else "changes_requested"
-            if active and r == refs.get("reviewer") and state in ("pending", "stale"):
+            # A same-head pushback (#71) reruns a reviewer whose request for changes stands
+            # until its new verdict: shown as reviewing only while that pass is active.
+            pushback = (state == "changes_requested" and refs.get("pushback_round") == t["round"]
+                        and m["round"] < t["round"])
+            if active and r == refs.get("reviewer") and (state in ("pending", "stale") or pushback):
                 state = "reviewing"
             by[r] = {"state": state, "verdict": verdict, "head_commit_id": at, "base_commit_id": on_base}
-        return {"head_commit_id": head, "reviewers": by,
+        return {"head_commit_id": head, "reviewers": by, **review_progress(t),
                 "approved": [r for r in reviewers if by[r]["state"] == "approved"],
                 "changes_requested": [r for r in reviewers if by[r]["state"] == "changes_requested"],
                 "pending": [r for r in reviewers if by[r]["state"] in ("pending", "stale", "reviewing")],
@@ -1290,6 +1297,32 @@ class Bus:
             if st["reviewers"][r]["state"] != "approved":
                 return r
         return None
+
+
+# The default when a review thread doesn't record its own budget (one from before #71).
+DEFAULT_FOLLOWUP_BUDGET = 3
+
+
+def review_progress(t: dict) -> dict:
+    """How far a review has gone (#71): reviewer passes so far, the author's follow-up
+    requests against the soft budget, and whether it is parked for the human because it
+    ran past twice that.  Reviews report this instead of a discussion's ``max_rounds``."""
+    refs = t["refs"] or {}
+    budget = int(refs.get("followup_budget") or DEFAULT_FOLLOWUP_BUDGET)
+    used = int(refs.get("follow_ups") or 0)
+    return {"passes": t["round"], "follow_ups": used, "followup_budget": budget,
+            "followup_limit": int(refs.get("followup_limit") or 2 * budget),
+            "budget_warning": used >= budget,
+            "waiting_for_human": bool(refs.get("budget_parked")) and t["status"] == "needs_human"}
+
+
+def format_progress(t: dict) -> str:
+    """``pass 5, follow-ups 2/3`` (plus a budget warning, or that it waits for the human)."""
+    p = review_progress(t)
+    out = f"pass {p['passes']}, follow-ups {p['follow_ups']}/{p['followup_budget']}"
+    if p["waiting_for_human"]:
+        return out + ", waiting for human"
+    return out + (", budget warning" if p["budget_warning"] else "")
 
 
 def new_uuid() -> str:

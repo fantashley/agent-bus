@@ -15,7 +15,7 @@ from typing import Any
 from . import config as cfg
 from . import autoresume, quota
 from . import rex, unvotable, worker
-from .db import HUMAN, SYSTEM, Bus, BusError, wrap_peer
+from .db import HUMAN, SYSTEM, Bus, BusError, review_progress, wrap_peer
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # A label for the change under review: a jj change id, a git branch name, or e.g. "PR #12".
@@ -41,6 +41,10 @@ def present(m: dict) -> dict:
 def thread_summary(t: dict) -> dict:
     keys = ("id", "kind", "goal", "participants", "initiator", "status", "round", "max_rounds")
     out = {k: t[k] for k in keys}
+    if t["kind"] == "review":
+        # A review has no round cap; it reports passes and follow-ups instead (#71).
+        del out["max_rounds"]
+        out.update(review_progress(t))
     if t["initiator"] not in (HUMAN, SYSTEM, None):
         # An agent wrote the goal; label it so it isn't read as an instruction.
         out["goal"] = wrap_peer(t["initiator"], t["goal"])
@@ -307,7 +311,8 @@ class Service:
         refs = {"reviewer": reviewer, "repo": repo_path, "change_id": change_id,
                 "base_commit_id": base_commit_id, "head_commit_id": head_commit_id,
                 "prev_head_commit_id": prev_head_commit_id, "focus": focus,
-                "heads": [head_commit_id]}  # every head this thread has been asked to review
+                "heads": [head_commit_id],  # every head this thread has been asked to review
+                **self._budget_refs()}
         if override:
             refs["peer_settings"] = {reviewer: override}
         self.bus.reap()
@@ -327,6 +332,15 @@ class Service:
                 # revision (#59); an older request is new work, or stale.
                 repeat = self._pinned_request(t) == request
                 same = self._revision_pass(t) if repeat else None
+                if same and same["status"] == "done" and prev_head_commit_id == head_commit_id:
+                    # Evidence since this pass asked for changes makes the same-head request a
+                    # new pushback (#71), not a retry of the one that pinned this pass: a note
+                    # since the verdict, or a focus if it hasn't been pushed back on yet.
+                    mine = self.bus.last_verdict(t["id"], reviewer)
+                    fresh = (old.get("pushbacks") or {}).get(reviewer) != current
+                    if self._single_pushback(t, mine, base_commit_id, head_commit_id) and (
+                            self._note_since(t, mine["id"]) is not None or (fresh and focus and focus.strip())):
+                        repeat, same = False, None
                 if repeat and same is None:
                     # Pinned to this request with no pass for it (a thread #59 left without
                     # one): queue that pass now, or report the one already running.
@@ -350,6 +364,19 @@ class Service:
                     raise BusError("REVIEW_STALE", f"{t['id']} has moved on to head {str(current)[:12]}; "
                                    "use that as prev_head_commit_id")
                 else:
+                    self._check_budget_park(t)
+                    # The same head again after a request for changes is a pushback (#71).
+                    mine = self.bus.last_verdict(t["id"], reviewer)
+                    pushback = self._single_pushback(t, mine, base_commit_id, head_commit_id)
+                    if pushback:
+                        self._check_pushback(t, reviewer, mine, focus, (old.get("pushbacks") or {}).get(reviewer)
+                                             == current)
+                        refs["pushbacks"] = {reviewer: current}
+                        refs["pushback_round"] = t["round"] + 1
+                    for k in ("followup_budget", "followup_limit"):
+                        if old.get(k):
+                            refs[k] = old[k]
+                    refs["follow_ups"] = int(old.get("follow_ups") or 0) + 1
                     kept = (old.get("peer_settings") or {}).get(reviewer, {})
                     # The follow-up runs with the thread's settings plus any new ones.
                     self._quota_check(reviewer, "reviewer", {**kept, **override})
@@ -362,13 +389,13 @@ class Service:
                         refs["auto_resumes"] = old["auto_resumes"]  # still counts for this thread
                     autoresume.forget(self.bus, t["id"])  # this pass replaces the parked one
                     self.bus.set_thread(t["id"], status="open", round=t["round"] + 1,
-                                        max_rounds=t["round"] + 1,
                                         goal=f"Review {change_id or head_commit_id[:12]} in "
                                              f"{os.path.basename(repo_path)}")
                     # Scoped to the thread and round: create_job's global dedupe lookup must
                     # never hand back another thread's job (#59) or an earlier round's.
                     job_row, created = self.bus.create_job(t["id"], "review",
-                                                           {"mode": "followup", "round": t["round"] + 1},
+                                                           {"mode": "pushback" if pushback else "followup",
+                                                            "round": t["round"] + 1},
                                                            f"review:{t['id']}:{t['round'] + 1}")
                     self.bus.set_thread(t["id"], refs=json.dumps(refs))
             else:
@@ -408,6 +435,83 @@ class Service:
         job_row, created = self.bus.create_job(t["id"], "review", {"mode": "first", "round": 1}, None)
         self.bus.conn.execute("UPDATE jobs SET dedupe_key=? WHERE id=?", (key, job_row["id"]))
         return t, job_row, created
+
+    def _budget_refs(self) -> dict:
+        """A new review's follow-up count and budget (#71): a warning once the author has made
+        ``review_followup_budget`` follow-up requests, the human after twice as many."""
+        b = self.config.review_followup_budget
+        return {"follow_ups": 0, "followup_budget": b, "followup_limit": 2 * b}
+
+    def _over_budget(self, t: dict, resuming: bool = False) -> bool:
+        """Whether a review is held for the human by its follow-up limit (#71): parked for
+        that, or past the limit with someone still asking for changes (a worker can die
+        between posting that verdict and parking the thread).  When ``resuming``, a pushback
+        pass still due its verdict isn't: the resume reruns it within the limit."""
+        if t["kind"] != "review":
+            return False
+        refs = t["refs"] or {}
+        if t["status"] == "needs_human" and refs.get("budget_parked"):
+            return True
+        p = review_progress(t)
+        if p["follow_ups"] < p["followup_limit"]:
+            return False
+        if resuming and refs.get("pushback_round") == t["round"] and not any(
+                m["round"] == t["round"] for m in self._verdicts(t)):
+            return False  # a pushback still to give its verdict: let it finish (a quota resume retries it)
+        return bool(self.bus.review_standings(t["id"])["changes_requested"])
+
+    def _verdicts(self, t: dict) -> list[dict]:
+        return [m for m in self.bus.history(t["id"])["messages"] if m["kind"] == "review_verdict"]
+
+    def _check_budget_park(self, t: dict) -> None:
+        """Refuse a follow-up on a review held for the human by its follow-up limit."""
+        if self._over_budget(t):
+            p = review_progress(t)
+            raise BusError("REVIEW_LIMIT_REACHED", f"{t['id']} still had changes requested after "
+                           f"{p['follow_ups']} follow-up requests, so it waits for the human user: ask them to "
+                           f"settle the open findings or run `agent-bus resume {t['id']}` to allow more "
+                           "follow-ups, then request review again")
+
+    @staticmethod
+    def _single_pushback(t: dict, mine: dict | None, base: str, head: str) -> bool:
+        """Whether a single-reviewer request is a same-head pushback (#71): the reviewer's
+        verdict in the current pass asked for changes on this very base and head."""
+        refs = t["refs"] or {}
+        return (mine is not None and mine["round"] == t["round"] and mine["data"].get("verdict") == "request_changes"
+                and head == refs.get("head_commit_id") == mine["data"].get("head_commit_id")
+                and base == refs.get("base_commit_id") == mine["data"].get("base_commit_id", base))
+
+    def _note_since(self, t: dict, after: int) -> int | None:
+        """The requester's (or the human user's) newest note on ``t`` after message ``after``."""
+        row = self.bus._one("SELECT MAX(id) AS id FROM messages WHERE thread_id=? AND kind='message'"
+                            " AND sender IN (?,?) AND id>?", t["id"], self.agent, HUMAN, after)
+        return row["id"] if row else None
+
+    def _new_pushback(self, t: dict, focus: str | None) -> bool:
+        """Whether a repeat of the same-head request that pinned ``t``'s revision is a new
+        pushback (#71) rather than a retry: someone asks for changes and the author has sent
+        a note since that verdict, or gives a focus for a reviewer not yet pushed back on."""
+        standing = self.bus.review_standings(t["id"])
+        if not standing["changes_requested"]:
+            return False
+        target = standing["changes_requested"][0]
+        verdict = self.bus.last_verdict(t["id"], target)
+        if (t["refs"] or {}).get("pushback_round") == t["round"] and verdict["round"] < t["round"]:
+            return False  # the pushback pass this request started gave no verdict: a retry
+        fresh = target not in ((t["refs"] or {}).get("pushbacks") or {})
+        return self._note_since(t, verdict["id"]) is not None or bool(fresh and focus and focus.strip())
+
+    def _check_pushback(self, t: dict, reviewer: str, verdict: dict, focus: str | None, used: bool) -> None:
+        """A same-head re-request after ``reviewer`` asked for changes (#71) needs the author's
+        evidence (a note sent since that verdict, or ``focus``), once per reviewer and head."""
+        head = str(verdict["data"].get("head_commit_id"))[:12]
+        if used:
+            raise BusError("CHANGES_REQUESTED", f"{reviewer} already reconsidered its findings at head {head} "
+                           "after a pushback and still asks for changes; push a fix, or ask the human user")
+        if not (focus and focus.strip()) and self._note_since(t, verdict["id"]) is None:
+            raise BusError("CHANGES_REQUESTED", f"{reviewer} asked for changes at head {head}; push a fix and "
+                           "request review of the new head, or, to push back on a finding, `send` a note "
+                           "here with your evidence and request the same head again")
 
     @staticmethod
     def _pinned_request(t: dict) -> list:
@@ -542,7 +646,7 @@ class Service:
         refs: dict[str, Any] = {"reviewers": order, "reviewer": first, "repo": repo_path, "change_id": change_id,
                                 "base_commit_id": base, "head_commit_id": head, "prev_head_commit_id": None,
                                 "focus": focus, "opening_focus": focus, "heads": [head], "revision": 0,
-                                "request": request}
+                                "request": request, **self._budget_refs()}
         if settings:
             refs["peer_settings"] = settings
         t = self.bus.create_thread("review", goal, [self.agent, *order], initiator=self.agent,
@@ -568,6 +672,10 @@ class Service:
         if repeat and old.get("request_job") is None:
             return None, False  # it pinned a revision with nothing to run
         same = self._revision_job(t) if repeat else None
+        if same and same["status"] == "done" and prev == head and self._new_pushback(t, focus):
+            # The same head again, after its pass asked for changes and the author sent
+            # evidence: a pushback (#71), not a repeat of the request that pinned it.
+            same = None
         if same and same["status"] in ("queued", "running", "done"):
             return same, False
         if same and self.bus.review_standings(t["id"])["complete"]:
@@ -582,27 +690,35 @@ class Service:
         if current != prev:
             raise BusError("REVIEW_STALE", f"{t['id']} has moved on to head {str(current)[:12]}; "
                            "use that as prev_head_commit_id")
+        self._check_budget_park(t)
         standing = self.bus.review_standings(t["id"])
-        if head == current and base == old.get("base_commit_id") and standing["changes_requested"]:
-            raise BusError("CHANGES_REQUESTED", f"{', '.join(standing['changes_requested'])} asked for changes "
-                           f"at head {current[:12]}; push a fix and request review of the new head")
+        # A new base or head is a new revision: every earlier verdict goes stale, even one
+        # given on this same base..head before (A -> B -> A).
+        new_revision = (base, head) != (old.get("base_commit_id"), current)
+        pushback = None
+        if not new_revision and standing["changes_requested"]:
+            # The same head after a request for changes: a pushback (#71).  The first reviewer
+            # that asked for changes reconsiders; every approval of this revision stands.
+            pushback = standing["changes_requested"][0]
+            verdict = self.bus.last_verdict(t["id"], pushback)
+            self._check_pushback(t, pushback, verdict, focus, pushback in (old.get("pushbacks") or {}))
         kept = old.get("peer_settings") or {}
         merged = {a: {**kept.get(a, {}), **settings.get(a, {})} for a in order if kept.get(a) or settings.get(a)}
         heads = self._heads(t)
-        # A new base or head is a new revision: every earlier verdict goes stale, even one
-        # given on this same base..head before (A -> B -> A).
-        revision = old.get("revision", 0) + ((base, head) != (old.get("base_commit_id"), current))
+        revision = old.get("revision", 0) + new_revision
         refs = {**old, "base_commit_id": base, "head_commit_id": head, "focus": focus, "prev_head_commit_id": None,
                 "change_id": change_id if change_id is not None else old.get("change_id"),
                 "revision": revision, "request": request,
                 "heads": heads if head in heads else [*heads, head]}
         refs.pop("peer_settings", None)
+        if new_revision:
+            refs.pop("pushbacks", None)  # one pushback per reviewer per revision
         if merged:
             refs["peer_settings"] = merged
         # Pin the new revision first: the standings (and so the next reviewer) are judged
         # against it.  Any refusal below rolls this back with the transaction.
         self.bus.set_thread(t["id"], refs=json.dumps(refs))
-        nxt = self.bus.next_reviewer(t["id"], after=old.get("reviewer"))
+        nxt = pushback or self.bus.next_reviewer(t["id"], after=old.get("reviewer"))
         job_row, created = None, False
         if nxt is None:
             # Everyone has approved this revision (so base and head are unchanged): leave the
@@ -617,12 +733,16 @@ class Service:
         # base, #75); the worker falls back to the full diff when it can't send one.
         last = self.bus.review_standings(t["id"])["reviewers"][nxt]
         refs.update(reviewer=nxt, prev_head_commit_id=last["head_commit_id"])
+        if new_revision or pushback:  # an author follow-up: it counts against the budget (#71)
+            refs["follow_ups"] = int(old.get("follow_ups") or 0) + 1
+        if pushback:
+            refs["pushbacks"] = {**(old.get("pushbacks") or {}), pushback: True}
+            refs["pushback_round"] = t["round"] + 1
         autoresume.forget(self.bus, t["id"])  # this pass replaces the parked one
-        self.bus.set_thread(t["id"], status="open", round=t["round"] + 1, max_rounds=t["round"] + 1,
-                            goal=goal)
+        self.bus.set_thread(t["id"], status="open", round=t["round"] + 1, goal=goal)
         # Scoped to the thread and round: create_job's global dedupe lookup must never
         # hand back another thread's job or an earlier round's.
-        job_row, created = self.bus.create_job(t["id"], "review", {"mode": "followup"},
+        job_row, created = self.bus.create_job(t["id"], "review", {"mode": "pushback" if pushback else "followup"},
                                                f"reviews:{t['id']}:{t['round'] + 1}")
         # The job this revision's request started (None: nothing to run), so a repeat
         # reports on this revision's work, never an older revision's.
@@ -748,6 +868,8 @@ class Service:
         autoresume.forget(self.bus, thread)
         note = ((f"Resumed by the human user with {extra_rounds} more round(s)."
                  if t["kind"] == "discussion" else "Resumed by the human user.")
+                + (f" It allows {self.config.review_followup_budget} more follow-up request(s); request review "
+                   "again to continue." if self._over_budget(t, resuming=True) else "")
                 + (f" Cleared out-of-usage state for {', '.join(cleared)}." if cleared else "")
                 + (f" Cleared format-drift state for {', '.join(drifted)}." if drifted else ""))
         return self._reopen(t, extra_rounds, note, auto_resumes=0, key=f"{time.time():.0f}")
@@ -794,8 +916,14 @@ class Service:
         if t["kind"] == "discussion":
             fields["max_rounds"] = max(t["max_rounds"], t["round"]) + extra_rounds
             fields["deadline"] = time.time() + self.config.deadline_minutes * 60
+        parked = self._over_budget(t, resuming=True)
         if t["refs"] is not None or auto_resumes:
             refs = {**(t["refs"] or {}), "auto_resumes": auto_resumes}
+            if parked:
+                # Over its follow-up limit (#71): allow another budget's worth of follow-ups,
+                # then wait for the author's next request (no reviewer reruns on the same head).
+                refs.pop("budget_parked", None)
+                refs["followup_limit"] = review_progress(t)["follow_ups"] + self.config.review_followup_budget
             if t["kind"] == "review" and not refs.get("reviewers") and self._revision_pass(t) is None:
                 # A round #59 left without a pass: its reviewer's session may never have seen
                 # the previous head, so the retry gets the full diff.
@@ -805,7 +933,8 @@ class Service:
         res: dict[str, Any] = {}
         if t["kind"] == "discussion":
             res["job"] = self._dispatch(thread, "discussion", {"mode": "start_later"}, f"{thread}:resume:{key}")
-        elif t["kind"] == "review" and not self.bus.active_job(thread) and not self._review_settled(t):
+        elif t["kind"] == "review" and not parked and not self.bus.active_job(thread) \
+                and not self._review_settled(t):
             res["job"] = self._dispatch(thread, "review", {"mode": "retry", "round": t["round"]},
                                         f"{thread}:retry:{key}")
         # After the job lookups, whose reaping may post an older job's notice: this one is last.
