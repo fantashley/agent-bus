@@ -308,6 +308,9 @@ class Worker:
 
     def post(self, sender: str, body: str, **kw) -> dict | None:
         """Post on the thread, only while this worker still holds the lease."""
+        if sender == SYSTEM and self.debriefing:
+            # A debrief's notices don't say why the thread is parked (`agent-bus threads`).
+            kw["data"] = {**(kw.get("data") or {}), "debrief": True}
         with self.fenced():
             return self.bus.post(self.thread_id, sender, body, **kw)
 

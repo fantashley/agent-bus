@@ -15,6 +15,16 @@ from agent_bus.db import Bus  # noqa: E402
 FAKE = Path(__file__).resolve().parent / "fake_peer.py"
 
 
+@pytest.fixture(autouse=True)
+def not_in_agent_shell(monkeypatch):
+    """Tests run the human's CLI commands, often from inside an agent's shell: hide the
+    harness markers the CLI's guard looks for (#84).  Guard tests put them back."""
+    from agent_bus import cli
+    for var in (*cli.HARNESS_ENV, "AGENT_BUS_ALLOW_HUMAN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(cli, "harness_ancestor", lambda: None)
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """Isolated state/config dirs with fake peer CLIs wired in."""

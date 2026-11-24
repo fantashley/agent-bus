@@ -15,6 +15,7 @@ checks remain the backstop for that.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from typing import Callable
 
@@ -121,4 +122,50 @@ def shared_codex_daemon(pid: int, ancestors_of: Callable[[int], list[int]] = anc
         args = argv_of(p)
         if args and is_shared_codex_daemon(args):
             return p
+    return None
+
+
+# Agent harnesses whose shell tools could run the human's CLI commands (#84): the
+# executable names they run as, and the npm packages that ship them as scripts.
+HARNESS_EXES = frozenset({"claude", "claude-code", "codex", "agy", "copilot"})
+HARNESS_PACKAGES = ("@anthropic-ai/claude-code", "@openai/codex", "@github/copilot")
+SCRIPT_RUNTIME = re.compile(r"(node|nodejs|bun|deno|python[0-9.]*)")
+
+
+def exe_name(path: str) -> str:
+    """An executable's name without its directory, a login shell's leading ``-`` or a Nix
+    wrapper's decoration (``.claude-wrapped``, ``.claude-unwrapped`` -> ``claude``)."""
+    name = os.path.basename(path).lstrip("-")
+    if name.startswith(".") and name.endswith(("-wrapped", "-unwrapped")):
+        name = name[1:].rsplit("-", 1)[0]
+    return name
+
+
+def harness_in_argv(args: list[str]) -> str | None:
+    """The agent harness a process's argv runs, if any: an exact executable name, or the
+    script a runtime such as node was given.  Never a substring match on the rest of argv."""
+    if not args:
+        return None
+    name = exe_name(args[0])
+    if name in HARNESS_EXES:
+        return name
+    if SCRIPT_RUNTIME.fullmatch(name):
+        script = next((a for a in args[1:] if not a.startswith("-")), None)
+        if script:
+            if exe_name(script) in HARNESS_EXES:
+                return exe_name(script)
+            for pkg in HARNESS_PACKAGES:
+                if f"/{pkg}/" in script.replace("\\", "/"):
+                    return pkg
+    return None
+
+
+def harness_ancestor(pid: int, ancestors_of: Callable[[int], list[int]] = ancestors,
+                     argv_of: Callable[[int], list[str] | None] = argv) -> str | None:
+    """The first agent harness above ``pid``, as ``"<name> (pid N)"``, or None.  An
+    ancestor whose argv can't be read is skipped."""
+    for p in ancestors_of(pid):
+        found = harness_in_argv(argv_of(p) or [])
+        if found:
+            return f"{found} (pid {p})"
     return None
