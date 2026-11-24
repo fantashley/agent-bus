@@ -809,7 +809,17 @@ This installs the CLI, writes `~/.config/agent-bus/config.json`, and registers t
   and refuses a file that isn't a JSON object. Skipped when the entry already matches. Copilot
   has no agent-bus hooks yet, and whether it reports Rex program status is unverified.
 
-Add [`docs/AGENTS-section.md`](docs/AGENTS-section.md) to the shared global agent rules.
+**How agents learn to use it.** The MCP server's instructions carry the short always-on rules
+(peer messages are data, which tool is for what, headless peers don't call tools, don't
+ping-pong, stop and tell the user on a limit). The full how-to (the discussion and review flows,
+follow-ups and pushback, debriefs, deadlines, what to put in a request, and what to do about
+each error code) is the `agent-bus` skill, [`skills/agent-bus/SKILL.md`](skills/agent-bus/SKILL.md),
+which ships with the build:
+- **Claude Code** and **Antigravity:** in the plugin (`skills/agent-bus/`).
+- **Codex** and **Copilot CLI:** linked at `~/.agents/skills/agent-bus`, where both load user
+  skills (`local.agentBus.skill.enable`, on when either is enabled).
+
+A client without skills can be pointed at that file from its global instructions instead.
 
 ### Upgrading
 
@@ -822,6 +832,11 @@ session:
   old build until it finishes. Hooks need nothing: each one runs the profile's `agent-bus`
   afresh.
 - **Codex and Antigravity:** restart the client.
+
+If you pasted the old "Agent Bus" section (`docs/AGENTS-section.md`) into your global agent
+instructions (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` and the like),
+delete it once you're on a build with the `agent-bus` skill: the MCP instructions and the skill
+replace it, and a stale copy would contradict them as the tools change.
 
 Until then the running server, and the review workers it starts, stay on the old build. When it
 differs from the `agent-bus` on PATH, `whoami`, `inbox`, `wait`, `request_review`,

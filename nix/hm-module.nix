@@ -22,6 +22,9 @@ self:
 #   Rex-aware interactive Codex sessions need `codex --no-daemon`. This module
 #   doesn't change how codex is launched or its features (see README).
 # - Antigravity: a plugin directory linked at ~/.gemini/config/plugins/agent-bus.
+# - The agent-bus skill (skills/agent-bus/SKILL.md, the how-to agents read) ships in the
+#   Claude Code and Antigravity plugins, and is linked at ~/.agents/skills/agent-bus, where
+#   Codex and Copilot CLI load user skills. The plugins are built by ./plugins.nix.
 # - Copilot CLI: `agent-bus setup-copilot` at activation, which adds or fixes only
 #   the agent-bus entry in ~/.copilot/mcp-config.json ($COPILOT_HOME), leaving
 #   every other server alone; a no-op when it already matches.
@@ -35,86 +38,13 @@ let
   claudeMarketplacePath = "${config.xdg.dataHome}/agent-bus/claude-marketplace";
   json = pkgs.formats.json { };
 
-  mcpEntry = agent: {
-    command = bin;
-    args = [ "mcp" "--agent" agent ];
+  plugins = import ./plugins.nix {
+    inherit lib pkgs profileBin;
+    package = cfg.package;
+    claudeHooks = cfg.claude.hooks.enable;
+    antigravityHooks = cfg.antigravity.hooks.enable;
   };
-
-  claudeMarketplace = pkgs.runCommand "agent-bus-claude-marketplace" { } (''
-    mkdir -p $out/.claude-plugin $out/plugins/agent-bus/.claude-plugin
-    cp ${json.generate "marketplace.json" {
-      name = "agent-bus";
-      owner.name = "agent-bus";
-      metadata.description = "Local agent-bus MCP server for Claude Code";
-      plugins = [{
-        name = "agent-bus";
-        source = "./plugins/agent-bus";
-        description = "Talk to Codex, Antigravity and Copilot CLI over the local agent bus";
-      }];
-    }} $out/.claude-plugin/marketplace.json
-    cp ${json.generate "plugin.json" {
-      name = "agent-bus";
-      version = cfg.package.version;
-      description = "Talk to Codex, Antigravity and Copilot CLI over the local agent bus";
-    }} $out/plugins/agent-bus/.claude-plugin/plugin.json
-    # The command is the profile's agent-bus, the same path in every build. `/reload-plugins`
-    # only restarts a plugin's MCP server when its entry changes (a new plugin version alone
-    # doesn't count), so AGENT_BUS_BUILD names the build to make each build's entry differ.
-    # Checked with Claude Code 2.1.331 (#92).
-    cp ${json.generate "mcp.json" {
-      mcpServers.agent-bus = mcpEntry "claude" // {
-        command = profileBin;
-        env.AGENT_BUS_BUILD = "${cfg.package}";
-      };
-    }} \
-      $out/plugins/agent-bus/.mcp.json
-  '' + lib.optionalString cfg.claude.hooks.enable ''
-    mkdir -p $out/plugins/agent-bus/hooks
-    cp ${claudeHooks} $out/plugins/agent-bus/hooks/hooks.json
-  '');
-
-  # Fixed-hint hooks (v1.5): a constant "you have agent-bus mail" line at prompt submit,
-  # and at most one Stop continuation per human turn. See README "Hooks".
-  hookCmd = event: {
-    type = "command";
-    command = "${lib.escapeShellArg profileBin} hook --client claude --event ${event}";
-    timeout = 5;
-  };
-  claudeHooks = json.generate "hooks.json" {
-    description = "agent-bus: fixed unread-mail hint at turn boundaries";
-    hooks = {
-      UserPromptSubmit = [{ hooks = [ (hookCmd "prompt") ]; }];
-      Stop = [{ hooks = [ (hookCmd "stop") ]; }];
-    };
-  };
-
-  # Antigravity has no prompt-submit event: PreInvocation runs before every model call,
-  # and `agent-bus hook` acts only on the first one of a turn (invocationNum 0). Native
-  # plugins must keep hooks.json at the plugin root; agy doesn't look in hooks/.
-  agyHookCmd = event: {
-    type = "command";
-    command = "${bin} hook --client antigravity --event ${event}";
-    timeout = 5;
-  };
-  antigravityHooks = json.generate "hooks.json" {
-    agent-bus = {
-      PreInvocation = [ (agyHookCmd "prompt") ];
-      Stop = [ (agyHookCmd "stop") ];
-    };
-  };
-
-  antigravityPlugin = pkgs.runCommand "agent-bus-antigravity-plugin" { } (''
-    mkdir -p $out
-    cp ${json.generate "plugin.json" {
-      name = "agent-bus";
-      version = cfg.package.version;
-      description = "Talk to Claude Code and Codex over the local agent bus";
-    }} $out/plugin.json
-    cp ${json.generate "mcp_config.json" { mcpServers.agent-bus = mcpEntry "antigravity"; }} \
-      $out/mcp_config.json
-  '' + lib.optionalString cfg.antigravity.hooks.enable ''
-    cp ${antigravityHooks} $out/hooks.json
-  '');
+  inherit (plugins) claudeMarketplace antigravityPlugin;
 
   hasDotfilesClaude = options ? local && options.local ? claude
     && options.local.claude ? enabledPlugins
@@ -416,6 +346,17 @@ in
       '';
     };
 
+    skill.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = cfg.codex.enable || cfg.copilot.enable;
+      defaultText = lib.literalExpression "codex.enable || copilot.enable";
+      description = ''
+        Link the agent-bus skill (how to start discussions, request reviews and debriefs, and
+        what each error code means) at ~/.agents/skills/agent-bus, where Codex and Copilot CLI
+        load user skills. The Claude Code and Antigravity plugins carry it themselves.
+      '';
+    };
+
     claudeMarketplace = lib.mkOption {
       type = lib.types.package;
       readOnly = true;
@@ -449,6 +390,10 @@ in
             // lib.optionalAttrs (participants != { }) { inherit participants; })
           cfg.settings);
     }
+
+    (lib.mkIf cfg.skill.enable {
+      home.file.".agents/skills/agent-bus".source = plugins.skill;
+    })
 
     (lib.mkIf cfg.antigravity.enable {
       home.file.".gemini/config/plugins/agent-bus".source = antigravityPlugin;

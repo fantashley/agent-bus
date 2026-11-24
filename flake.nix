@@ -24,6 +24,52 @@
         # make sure it parses (importing it does).
         package-git = self.packages.${pkgs.stdenv.hostPlatform.system}.agent-bus-git;
         hm-module = builtins.seq (import ./nix/hm-module.nix) (pkgs.runCommand "hm-module-parses" { } "touch $out");
+        # The plugin layouts the module installs, built the same way (nix/plugins.nix), with
+        # the skill in each of them.
+        plugins =
+          let
+            built = import ./nix/plugins.nix {
+              inherit pkgs;
+              inherit (pkgs) lib;
+              package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              profileBin = "/profile/bin/agent-bus";
+              claudeHooks = true;
+              antigravityHooks = true;
+            };
+            bare = import ./nix/plugins.nix {
+              inherit pkgs;
+              inherit (pkgs) lib;
+              package = pkgs.writeShellScriptBin "agent-bus" "" // { version = "0"; };
+              profileBin = "/profile/bin/agent-bus";
+            };
+          in
+          pkgs.runCommand "agent-bus-plugins-layout" { } ''
+            set -eu
+            check() { [ -f "$1" ] || { echo "missing: $1" >&2; exit 1; }; }
+            skill() {
+              check "$1/SKILL.md"
+              head -n 1 "$1/SKILL.md" | grep -qx -- '---'
+              grep -qx 'name: agent-bus' "$1/SKILL.md"
+              grep -q '^description: ' "$1/SKILL.md"
+            }
+            c=${built.claudeMarketplace}
+            check $c/.claude-plugin/marketplace.json
+            check $c/plugins/agent-bus/.claude-plugin/plugin.json
+            check $c/plugins/agent-bus/.mcp.json
+            check $c/plugins/agent-bus/hooks/hooks.json
+            skill $c/plugins/agent-bus/skills/agent-bus
+            a=${built.antigravityPlugin}
+            check $a/plugin.json
+            check $a/mcp_config.json
+            check $a/hooks.json
+            skill $a/skills/agent-bus
+            skill ${built.skill}
+            # A package without its own copy of the skill (an older or custom one) falls back
+            # to this tree's.
+            skill ${bare.skill}
+            skill ${bare.claudeMarketplace}/plugins/agent-bus/skills/agent-bus
+            touch $out
+          '';
       });
 
       devShells = forAll (pkgs: {
