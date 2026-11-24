@@ -20,6 +20,8 @@ from .db import HUMAN, SYSTEM, Bus, BusError, is_quiet, review_progress, wrap_pe
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # A label for the change under review: a jj change id, a git branch name, or e.g. "PR #12".
 CHANGE_RE = re.compile(r"[A-Za-z0-9#][A-Za-z0-9 ._/#:+-]{0,99}")
+# The longest testing note a review request may carry (#93).
+MAX_TESTING_NOTE = 4000
 BLIND_NOTE = ("Round 1 is blind: other participants' views stay hidden until you post "
               "your own with send(kind=\"proposal\").")
 
@@ -359,13 +361,19 @@ class Service:
                        change_id: str | None = None, prev_head_commit_id: str | None = None,
                        focus: str | None = None, model: str | None = None, effort: str | None = None,
                        reviewers: list[str] | None = None, peer_settings: dict | None = None,
-                       thread: str | None = None) -> dict:
+                       thread: str | None = None, testing: str | None = None) -> dict:
         """``model``/``effort`` override the config for this reviewer on this thread; a
         follow-up pass keeps the thread's settings unless it gives new ones.
+
+        ``testing`` is the author's note on how this head was tested (#93): shown to the
+        reviewers of this head, labelled as the author's unchecked claim.
 
         ``reviewers`` (instead of ``reviewer``) names several required reviewers: they review
         one at a time on one thread, and the change is ready once all approve the same head
         (#47).  Their model/effort go in ``peer_settings``, e.g. {"codex": {"effort": "high"}}."""
+        if testing is not None and (not isinstance(testing, str) or len(testing) > MAX_TESTING_NOTE):
+            raise ValueError(f"testing must be a note of at most {MAX_TESTING_NOTE} characters")
+        testing = (testing.strip() or None) if testing is not None else None
         if reviewers is not None:
             if reviewer is not None:
                 raise ValueError("give `reviewer` or `reviewers`, not both")
@@ -386,7 +394,7 @@ class Service:
                     model, effort = given.get("model"), given.get("effort")
             else:
                 return self._request_reviews(reviewers, repo, base_commit_id, head_commit_id, change_id,
-                                             prev_head_commit_id, focus, peer_settings, thread)
+                                             prev_head_commit_id, focus, peer_settings, thread, testing)
         elif peer_settings:
             raise ValueError("peer_settings goes with `reviewers`; use model/effort with a single `reviewer`")
         if thread is not None:
@@ -400,7 +408,7 @@ class Service:
         request = [base_commit_id, prev_head_commit_id, head_commit_id]
         refs = {"reviewer": reviewer, "repo": repo_path, "change_id": change_id,
                 "base_commit_id": base_commit_id, "head_commit_id": head_commit_id,
-                "prev_head_commit_id": prev_head_commit_id, "focus": focus,
+                "prev_head_commit_id": prev_head_commit_id, "focus": focus, "testing": testing,
                 "heads": [head_commit_id],  # every head this thread has been asked to review
                 **self._budget_refs()}
         if override:
@@ -458,6 +466,8 @@ class Service:
                     # The same head again after a request for changes is a pushback (#71).
                     mine = self.bus.last_verdict(t["id"], reviewer)
                     pushback = self._single_pushback(t, mine, base_commit_id, head_commit_id)
+                    if testing is None and (old.get("base_commit_id"), current) == (base_commit_id, head_commit_id):
+                        refs["testing"] = old.get("testing")  # the same head keeps its testing note
                     if pushback:
                         self._check_pushback(t, reviewer, mine, focus, (old.get("pushbacks") or {}).get(reviewer)
                                              == current)
@@ -663,7 +673,8 @@ class Service:
 
     def _request_reviews(self, reviewers: list[str], repo: str, base_commit_id: str, head_commit_id: str,
                          change_id: str | None, prev_head_commit_id: str | None, focus: str | None,
-                         peer_settings: dict | None, thread: str | None = None) -> dict:
+                         peer_settings: dict | None, thread: str | None = None,
+                         testing: str | None = None) -> dict:
         """Several required reviewers on one thread, one per round (#47).
 
         The first request starts the first reviewer in the list.  Each approval hands the
@@ -702,13 +713,14 @@ class Service:
                 t = self._previous_review_set(order, repo_path, prev_head_commit_id, base_commit_id, head_commit_id,
                                               change_id, thread)
                 if t:
-                    job_row, created = self._followup_reviews(t, order, request, settings, focus, goal, change_id)
+                    job_row, created = self._followup_reviews(t, order, request, settings, focus, goal, change_id,
+                                                              testing)
                 else:  # no lineage: a fresh review that happens to name a previous head
                     t, job_row, created = self._fresh_reviews(order, repo_path, request, settings, focus, goal,
-                                                              change_id)
+                                                              change_id, testing)
             else:
                 t, job_row, created = self._fresh_reviews(order, repo_path, request, settings, focus, goal,
-                                                          change_id)
+                                                          change_id, testing)
             t = self.bus.thread(t["id"])
             st = self.bus.review_standings(t["id"])
         if created:
@@ -722,7 +734,8 @@ class Service:
         return {"thread": thread_summary(t), "job": job, "review": st, "next": nxt}
 
     def _fresh_reviews(self, order: list[str], repo_path: str, request: list, settings: dict,
-                       focus: str | None, goal: str, change_id: str | None) -> tuple[dict, dict, bool]:
+                       focus: str | None, goal: str, change_id: str | None,
+                       testing: str | None = None) -> tuple[dict, dict, bool]:
         """Start a several-reviewer thread, or return the one this exact request started while
         it is still pinned to this diff (retrying its pass if that failed)."""
         base, prev, head = request
@@ -751,7 +764,8 @@ class Service:
         self._quota_check(first, "reviewer", settings.get(first))
         refs: dict[str, Any] = {"reviewers": order, "reviewer": first, "repo": repo_path, "change_id": change_id,
                                 "base_commit_id": base, "head_commit_id": head, "prev_head_commit_id": None,
-                                "focus": focus, "opening_focus": focus, "heads": [head], "revision": 0,
+                                "focus": focus, "opening_focus": focus, "testing": testing, "heads": [head],
+                                "revision": 0,
                                 "request": request, **self._budget_refs()}
         if settings:
             refs["peer_settings"] = settings
@@ -767,7 +781,8 @@ class Service:
         return t, job_row, created
 
     def _followup_reviews(self, t: dict, order: list[str], request: list, settings: dict,
-                          focus: str | None, goal: str, change_id: str | None) -> tuple[dict | None, bool]:
+                          focus: str | None, goal: str, change_id: str | None,
+                          testing: str | None = None) -> tuple[dict | None, bool]:
         base, prev, head = request
         old = t["refs"]
         current = old.get("head_commit_id")
@@ -812,7 +827,10 @@ class Service:
         merged = {a: {**kept.get(a, {}), **settings.get(a, {})} for a in order if kept.get(a) or settings.get(a)}
         heads = self._heads(t)
         revision = old.get("revision", 0) + new_revision
-        refs = {**old, "base_commit_id": base, "head_commit_id": head, "focus": focus, "prev_head_commit_id": None,
+        # A testing note describes a head: a pushback on the same one keeps it unless it brings its own.
+        testing = old.get("testing") if testing is None and not new_revision else testing
+        refs = {**old, "base_commit_id": base, "head_commit_id": head, "focus": focus, "testing": testing,
+                "prev_head_commit_id": None,
                 "change_id": change_id if change_id is not None else old.get("change_id"),
                 "revision": revision, "request": request,
                 "heads": heads if head in heads else [*heads, head]}

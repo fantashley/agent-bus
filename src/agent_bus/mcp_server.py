@@ -259,7 +259,8 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
                        reviewers: list[str] | None = None, change_id: str | None = None,
                        prev_head_commit_id: str | None = None, focus: str | None = None,
                        model: str | None = None, effort: str | None = None,
-                       peer_settings: dict | None = None, thread: str | None = None) -> dict[str, Any]:
+                       peer_settings: dict | None = None, thread: str | None = None,
+                       testing: str | None = None) -> dict[str, Any]:
         """Ask other agents for a read-only review of a pinned change in an allow-listed repo.
 
         Pin full commit ids (`git rev-parse HEAD`, or `jj log --no-graph -r @ -T commit_id` in a jj
@@ -286,11 +287,15 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         (prev_head_commit_id = head_commit_id): the reviewer that asked for changes reconsiders,
         once per head. REVIEW_LIMIT_REACHED means the review ran past its follow-up budget and
         waits for the human user.
+
+        `testing` is an optional short note on how you tested this head (commands run and their
+        results): reviewers can't run tests themselves, and see it as your unchecked claim.
         """
         return flag_stale(call(svc.request_review, reviewer=reviewer, repo=repo, change_id=change_id,
                                base_commit_id=base_commit_id, head_commit_id=head_commit_id,
                                prev_head_commit_id=prev_head_commit_id, focus=focus, model=model, effort=effort,
-                               reviewers=reviewers, peer_settings=peer_settings, thread=thread))
+                               reviewers=reviewers, peer_settings=peer_settings, thread=thread,
+                               testing=testing))
 
     @mcp.tool()
     def debrief(thread: str, question: str | None = None, peers: list[str] | None = None) -> dict[str, Any]:

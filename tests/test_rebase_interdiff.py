@@ -106,7 +106,7 @@ def test_pure_rebase_says_so_and_leaves_out_mains_changes(env, no_spawn, repo):
     p = last["prompt"]
     assert FOLLOWUP in p and f"you last reviewed {f1}" in p
     assert f"base moved from {repo.m1} to {m2}" in p and "pure rebase" in p
-    assert "Interdiff since the head you last reviewed (rebase-aware)" in p and "MAIN-CHANGE" not in p and "FEATURE" not in p
+    assert "Interdiff since the head you last reviewed (rebase-aware: old head" in p and "MAIN-CHANGE" not in p and "FEATURE" not in p
     assert repo.objects() == before  # the replay wrote nothing to the repository
     v = bus.last_verdict(tid, "codex")["data"]
     assert (v["head_commit_id"], v["base_commit_id"]) == (f2, m2)
@@ -119,7 +119,7 @@ def test_rebase_with_a_change_of_its_own_shows_only_that(env, no_spawn, repo):
     last = followup(env, claude, bus, tid, repo, m2, f2, f1)
     p = last["prompt"]
     assert last["argv"][:3] == ["exec", "resume", "--json"] and FOLLOWUP in p
-    assert "Interdiff since the head you last reviewed (rebase-aware)" in p and f"base moved from {repo.m1}" in p
+    assert "Interdiff since the head you last reviewed (rebase-aware: old head" in p and f"base moved from {repo.m1}" in p
     assert "-FEATURE\n+FEATURE-V2" in p and "MAIN-CHANGE" not in p and "pure rebase" not in p
 
 
