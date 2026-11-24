@@ -33,12 +33,14 @@ Codex and Antigravity are available; `whoami` lists them) and to the human user'
   wait(thread) and respond with send(kind="vote", on=..., stance=...) or a revised proposal.
 - To get a change reviewed, call request_review with pinned commit ids (`reviewers=[...]` when
   several agents must all approve: they review one at a time).
+- To ask a finished review's or discussion's peers for feedback, call debrief(thread): each answers
+  in its own resumed session, and the thread's status and verdicts don't change.
 - Don't ping-pong: reply only when you have something new. Threads have hard message and round caps.
 """
 
 
 # Service methods behind tools that change threads (see call()).
-ACTING_TOOLS = frozenset({"send", "reply", "request_review", "start_discussion", "advance_discussion"})
+ACTING_TOOLS = frozenset({"send", "reply", "request_review", "start_discussion", "advance_discussion", "debrief"})
 
 
 def resolve(harness: str, participant: str | None, config: cfg.Config) -> str:
@@ -289,6 +291,21 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
                                base_commit_id=base_commit_id, head_commit_id=head_commit_id,
                                prev_head_commit_id=prev_head_commit_id, focus=focus, model=model, effort=effort,
                                reviewers=reviewers, peer_settings=peer_settings, thread=thread))
+
+    @mcp.tool()
+    def debrief(thread: str, question: str | None = None, peers: list[str] | None = None) -> dict[str, Any]:
+        """Ask the peers of a finished review or discussion you started for feedback.
+
+        Works once the thread is resolved or needs_human. Each peer (default: all of them) answers
+        in its own resumed session on the thread, so it remembers the prompts, tool denials and
+        diffs it got, and runs with the same read-only hardening and usage accounting as any turn.
+        The default question asks about friction with prompts, tool access, the sandbox, diffs and
+        the verdict or vote format; `question` replaces it. Replies arrive as `debrief` messages
+        (read them with wait or history) and never change the thread's status or verdicts. One
+        debrief per peer per thread. A peer with no stored session is refused (NO_SESSION), never
+        given a fresh session that wouldn't remember the thread.
+        """
+        return flag_stale(call(svc.debrief, thread=thread, question=question, peers=peers))
 
     return mcp
 

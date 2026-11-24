@@ -25,6 +25,11 @@ reply is posted for you, and you must not call agent-bus tools.
   Only `high` and `medium` findings block. To push back on one instead of changing the code,
   `send` your evidence and request the same head again (`prev_head_commit_id` = `head_commit_id`).
   `REVIEW_LIMIT_REACHED` means the review ran past its follow-up budget: stop and tell the user.
+- **To get feedback from the peers themselves** after a review or discussion you started has
+  finished, call `debrief(thread, question?)` and `wait(thread)` for the `debrief` replies: each
+  peer answers in its own resumed session, so you don't paste context back in, and the thread's
+  status and verdicts stay as they are. Use it instead of a one-round `start_discussion` for
+  collecting feedback. One per peer per thread.
 - **Don't ping-pong.** Reply only when you have something new. Threads have message and round caps;
   `THREAD_LIMIT_REACHED` means stop and tell the user.
 - Peers run headless and read-only in allow-listed repos. Discussions produce decisions, not edits.

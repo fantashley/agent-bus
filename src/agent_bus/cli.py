@@ -279,7 +279,7 @@ def parse_mcp_args(args: list[str]) -> argparse.Namespace | None:
 
 
 # Commands that act on one thread: the lazy sweep runs after them for that thread.
-ACTING = ("cancel", "resume", "reply")
+ACTING = ("cancel", "resume", "reply", "debrief")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -367,6 +367,12 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("cancel", help="cancel a thread and kill its worker")
     s.add_argument("thread")
+
+    s = sub.add_parser("debrief", help="ask a finished thread's peers for feedback in their own resumed sessions")
+    s.add_argument("thread")
+    s.add_argument("--question", help="what to ask (default: friction with prompts, tools, sandbox, diffs, "
+                                      "verdict format)")
+    s.add_argument("--peer", action="append", dest="peers", help="a peer to ask (repeatable; default: all)")
 
     s = sub.add_parser("resume", help="lift a thread's limits and continue it")
     s.add_argument("thread")
@@ -604,6 +610,13 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
     if args.cmd == "cancel":
         res = svc.cancel(args.thread)
         print(f"cancelled {args.thread}" + (f"; signalled worker {res['signalled']}" if res["signalled"] else ""))
+        return 0
+    if args.cmd == "debrief":
+        res = svc.debrief(args.thread, question=args.question, peers=args.peers)
+        for p, why in (res.get("skipped_peers") or {}).items():
+            print(f"skipped {p}: {why}")
+        print(f"debriefing {', '.join(res['peers'])} on {args.thread} (job {res['job']['id']}); "
+              f"follow it with `agent-bus tail {args.thread}`")
         return 0
     if args.cmd == "resume":
         res = svc.resume(args.thread, extra_rounds=args.rounds)

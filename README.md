@@ -8,7 +8,7 @@ directly, instead of a human relaying messages between windows. Designed in
   stamps the sender from its launch command, so agents can't impersonate each other.
 - **SQLite (WAL) per host** at `$XDG_STATE_HOME/agent-bus/bus.db`, mode `0600`. History is never
   deleted; read state is a per-session, per-thread cursor.
-- **On-demand worker, no daemon.** Typed actions (`start_discussion`, `advance_discussion`,
+- **On-demand worker, no daemon.** Typed actions (`start_discussion`, `advance_discussion`, `debrief`,
   `request_review`) queue a job and spawn `agent-bus run-job <id>`, which holds an SQLite lease and
   runs the peers headless and read-only (`claude -p --permission-mode plan`,
   `codex exec` with a read-only sandbox, `agy --mode plan --sandbox`), resuming each peer's
@@ -144,6 +144,30 @@ If the repo doesn't have a pinned commit (base, head, or the previous head a fol
 against), the reviewer isn't started. The thread goes to `needs_human` with a notice naming the
 missing commit, and the job is marked failed. Make the commit available in the repo, then request
 the review again (a first pass) or run `agent-bus resume <thread>` (either pass).
+
+## Debriefs
+
+To hear from the peers themselves after a review or discussion (what got in their way: prompts,
+tool access and denials, the sandbox, diffs, the verdict or vote format), the thread's initiator
+calls `debrief(thread, question?, peers?)`, or the human runs `agent-bus debrief <thread>
+[--question …] [--peer codex]`:
+
+- It works on a finished thread (`resolved` or `needs_human`) with no job running. Agents can
+  debrief only threads they started; the human user can debrief any.
+- Each peer (default: every headless peer on the thread) gets **one turn in its own resumed
+  session** on the thread, so it answers from memory. It is an ordinary turn: the same
+  participant settings, env and `CODEX_HOME`, the same read-only hardening for each harness,
+  and the same usage accounting and out-of-usage blocks as a review or discussion pass.
+- The prompt says it's a debrief: plain text, no verdict, vote or code changes. The default
+  question asks about that friction; `question` replaces it.
+- Replies are `debrief` messages (`peer_data`, addressed to the initiator); read them with `wait`
+  or `history`. They never change the thread's status, round, verdicts or votes, and don't count
+  toward its message cap.
+- One debrief per peer per thread (`DEBRIEF_USED`), until the human user resumes the thread. A
+  peer whose debrief got no answer can be asked again.
+- A peer with no stored session is refused (`NO_SESSION`, or left out of a default roster), and
+  a resume that fails is reported on the thread. Neither starts a fresh session, which wouldn't
+  remember the thread.
 
 ## Model and effort
 
@@ -441,6 +465,7 @@ agent-bus tail t-1a2b3c [--peer codex|--events]
 agent-bus reply t-1a2b3c "Prefer the simpler option" [--to codex]
 agent-bus cancel t-1a2b3c
 agent-bus resume t-1a2b3c --rounds 2
+agent-bus debrief t-1a2b3c        # a finished thread's peers give feedback (see Debriefs)
 agent-bus watch t-1a2b3c          # inside Rex: open viewer panes
 agent-bus stream [t-1a2b3c …]     # one line per verdict / final / failure, as each arrives
 ```
