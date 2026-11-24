@@ -1378,29 +1378,35 @@ class Worker:
         if ad is not None and ad.shell:
             out += prompts.READ_TIP_SHELL
         if ad is not None and not ad.lists_files and diff and listing:
-            out += self.usages_note(refs, diff)
+            out += self.usages_note(refs, diff, snap)
         return out
 
-    def usages_note(self, refs: dict, diff: str) -> str:
+    def usages_note(self, refs: dict, diff: str, snap: snapshot.Snapshot | None = None) -> str:
         """The usages section for a reviewer with no search tool (#117); best effort, and
         searched once per head and diff (a follow-up's prompt and its fresh fallback share it)."""
-        key = (refs["repo"], refs["head_commit_id"], hashlib.sha256(diff.encode("utf-8", "surrogateescape")).hexdigest())
+        # The files the reviewer can read at the head: a full snapshot's are all of them; a
+        # sparse one holds some; with none, reads come from the working copy (none are sure).
+        readable = (None if snap is not None and snap.path and snap.mode == "full"
+                    else frozenset(snap.files) if snap is not None and snap.path else frozenset())
+        key = (refs["repo"], refs["head_commit_id"], hashlib.sha256(diff.encode("utf-8", "surrogateescape")).hexdigest(),
+               readable)
         cache = self.__dict__.setdefault("_usages", {})
         if key not in cache:
             try:
-                cache[key] = usages.note(refs["repo"], refs["head_commit_id"], diff)
+                cache[key] = usages.note(refs["repo"], refs["head_commit_id"], diff, readable)
             except Exception as e:  # noqa: BLE001 (never what fails a review)
-                cache[key] = ("", False)
+                cache[key] = ("", False, False)
                 self.event("usages", f"no usage search: {e!r}")
             else:
                 if cache[key][0]:
                     self.event("usages", f"usages at head {refs['head_commit_id'][:12]} of the names the diff "
                                f"touches: {len(cache[key][0])} characters")
-        hits, cut = cache[key]
+        hits, cut, outside = cache[key]
         if not hits:
             return ""
         return prompts.USAGES.format(head=refs["head_commit_id"], hits=hits,
-                                     capped=" (git grep's output was cut short, so some are missing)" if cut else "")
+                                     capped=prompts.USAGES_CUT if cut else "",
+                                     outside=prompts.USAGES_OUTSIDE if outside else "")
 
     def _reading_note(self, refs: dict, snap: snapshot.Snapshot | None, listing: bool) -> str:
         try:
