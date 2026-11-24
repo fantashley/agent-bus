@@ -112,17 +112,21 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
             others = [a for a, v in avail.items() if v["available"] and a != agent]
             blocks = quota.by_participant(conf, bus.quota_blocks())
             limits = quota.by_participant(conf, bus.usage_limits())
-            return {"agent": agent, "harness": harness, "session_id": session_id, "cwd": cwd,
-                    "available_agents": others,
-                    "unavailable_agents": {a: v["reason"] for a, v in avail.items() if not v["available"]},
-                    # Each other participant's harness, where it isn't the participant's own name.
-                    "harnesses": {a: conf.harness_of(a) for a in others if conf.harness_of(a) != a},
-                    "versions": {a: cli_version(bus, conf.harness_of(a), conf.peer_command(a)) for a in others},
-                    "out_of_usage": [{"agent": a, **quota.summary(b)}
-                                     for a in others for b in blocks.get(a, [])],
-                    # Usage-limit windows at or above usage_warn_at, by the last reading.
-                    "near_limit": [{"agent": a, **quota.limits_summary(w, conf.usage_warn_at)}
-                                   for a in others for w in limits.get(a, []) if w["used"] >= conf.usage_warn_at]}
+            out = {"agent": agent, "harness": harness, "session_id": session_id, "cwd": cwd,
+                   "available_agents": others,
+                   "unavailable_agents": {a: v["reason"] for a, v in avail.items() if not v["available"]},
+                   # Each other participant's harness, where it isn't the participant's own name.
+                   "harnesses": {a: conf.harness_of(a) for a in others if conf.harness_of(a) != a},
+                   "versions": {a: cli_version(bus, conf.harness_of(a), conf.peer_command(a)) for a in others},
+                   "out_of_usage": [{"agent": a, **quota.summary(b)}
+                                    for a in others for b in blocks.get(a, [])],
+                   # Usage-limit windows at or above usage_warn_at, by the last reading.
+                   "near_limit": [{"agent": a, **quota.limits_summary(w, conf.usage_warn_at)}
+                                  for a in others for w in limits.get(a, []) if w["used"] >= conf.usage_warn_at]}
+            stale = cfg.stale_build()
+            if stale:
+                out["stale_build"] = stale
+            return out
         return call(me)
 
     @mcp.tool()

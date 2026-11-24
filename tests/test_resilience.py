@@ -115,6 +115,53 @@ def test_agents_and_whoami_show_versions(env, no_spawn, capsys):
     assert payload["versions"]["codex"] == "fake-codex 0.0.0" and "claude" not in payload["versions"]
 
 
+def test_whoami_flags_a_server_older_than_path(env, no_spawn, monkeypatch, tmp_path):
+    """A server started before an upgrade runs (and spawns workers from) another build (#81)."""
+    import asyncio
+    import sys
+    from agent_bus import mcp_server
+
+    def install(name):
+        exe = tmp_path / name / "bin" / "agent-bus"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\n")
+        exe.chmod(0o755)
+        return exe
+
+    old, new = install("old"), install("new")
+    profile = tmp_path / "profile" / "bin"
+    profile.mkdir(parents=True)
+    link = profile / "agent-bus"
+    link.symlink_to(old)
+    monkeypatch.setenv("PATH", f"{profile}:{os.environ['PATH']}")
+    server = mcp_server.build("claude", bus=env["bus"])
+
+    def whoami():
+        return json.loads(asyncio.run(server.call_tool("whoami", {})).content[0].text)
+
+    def start(argv0):
+        monkeypatch.setattr(sys, "argv", [str(argv0), "mcp"])
+        monkeypatch.setattr(cfg, "_LAUNCHED_FROM", cfg._launched_from())
+
+    # Started through the profile link at the current build: not stale.
+    start(link)
+    assert "stale_build" not in whoami()
+    # An upgrade moves the link; this server still runs, and spawns workers from, the old build.
+    link.unlink()
+    link.symlink_to(new)
+    stale = whoami()["stale_build"]
+    assert stale["running"] == os.path.realpath(old) and stale["on_path"] == os.path.realpath(new)
+    assert "/reload-plugins" in stale["hint"]
+    monkeypatch.delenv("AGENT_BUS_BIN", raising=False)
+    assert cfg.self_command() == [os.path.realpath(old)]
+    # Once the old build is gone, workers start from the agent-bus on PATH instead.
+    old.unlink()
+    assert cfg.self_command() == [str(link)]
+    # Not an installed agent-bus script (python -m, tests): nothing to compare.
+    start("pytest")
+    assert "stale_build" not in whoami()
+
+
 # ------------------------------------------------- review fixes (t-a3faf1 pass 1)
 
 

@@ -575,9 +575,11 @@ local.agentBus = {
 
 This installs the CLI, writes `~/.config/agent-bus/config.json`, and registers the MCP server:
 
-- **Claude Code:** a local plugin from a directory marketplace in the store, enabled through
-  `local.claude.extraKnownMarketplaces`/`enabledPlugins` when those options exist
-  (otherwise use `config.local.agentBus.claudeMarketplace`).
+- **Claude Code:** a local plugin from a directory marketplace linked at
+  `~/.local/share/agent-bus/claude-marketplace`, enabled through
+  `local.claude.extraKnownMarketplaces`/`enabledPlugins` when those options exist (otherwise
+  register `config.local.agentBus.claudeMarketplacePath` as a directory marketplace yourself).
+  The plugin's MCP server and hooks run the `agent-bus` in your Home Manager profile.
 - **Codex:** `agent-bus setup-codex` at activation: `codex mcp add agent-bus …`, then `env_vars` on
   that entry so `REX_SESSION`/`REX_BLOCK`/`REX_SERVER` reach the server (Codex filters MCP
   server environments; `codex mcp add` can't set `env_vars`). Skipped when the entry already
@@ -586,6 +588,21 @@ This installs the CLI, writes `~/.config/agent-bus/config.json`, and registers t
   `local.antigravity.enable` is set).
 
 Add [`docs/AGENTS-section.md`](docs/AGENTS-section.md) to the shared global agent rules.
+
+### Upgrading
+
+After `home-manager switch` (or `nixos-rebuild switch`), each client picks up the new build when
+it next starts its MCP server: a new session, `/reload-plugins` in Claude Code, or a restart of
+Codex or Antigravity. A running server, and the review workers it starts, stay on the build they
+started with until then; the `whoami` tool reports a `stale_build` when they differ from the
+`agent-bus` on PATH. A Claude Code subagent started before `/reload-plugins` keeps its own
+server on the old build until it finishes.
+
+Claude Code records a marketplace's path when it first adds it and doesn't follow later changes
+to `settings.json`, which is why the plugin lives at a fixed path whose link each rebuild moves.
+Installs from before that registered a store path; activation moves the record to the fixed
+path with `claude plugin marketplace add` (or tells you to, when `claude` isn't on PATH). If you
+registered `claudeMarketplace` in your own settings, switch that to `claudeMarketplacePath`.
 
 ### Which agents
 
