@@ -28,7 +28,7 @@ from typing import Iterator
 
 from . import config as cfg
 from . import autoresume, prompts, quota, unvotable
-from .db import HUMAN, SYSTEM, Bus, BusError, review_progress
+from .db import HUMAN, SYSTEM, Bus, BusError, format_dissent, review_progress
 from .peers import ADAPTERS, Adapter, TurnResult, adapter, cli_version, extract_json, format_usage
 
 LEASE_S = 120
@@ -402,7 +402,6 @@ class Worker:
         resume_id = self.bus.peer_session(self.thread_id, agent) if resume else None
         if resume_only and resume_id is None:
             return TurnResult(ok=False, error=f"{agent} has no stored session on this thread to resume")
-        timeout = max(30.0, min(self.config.turn_timeout_s, self.deadline_left()))
         shown = "".join(f" · {k} {v}" for k, v in settings.items())
         # Which CLI build and adapter recipe ran this turn, so drift can be tied to an upgrade (#32).
         version = cli_version(self.bus, ad.agent, ad.command, cwd=cwd)
@@ -416,8 +415,15 @@ class Worker:
         emit = lambda kind, text: self.event(kind, text, agent)  # noqa: E731
         tag = self.job["id"]
         row = self.begin_usage(ad, model, resume_id)
-        res = ad.run(prompt, cwd, timeout, emit, resume_id=resume_id, add_dirs=add_dirs,
-                     cancelled=self.cancelled, peer_tag=tag)
+        # Checked last, just before the hand-off to the CLI: only a turn started in time may
+        # post past a discussion's deadline (#74).
+        left = self.deadline_left()
+        if left <= 0:
+            self.drop_usage(row)
+            self.event("turn_end", "failed: the discussion's deadline passed before the turn started", agent)
+            return TurnResult(ok=False, error="the discussion's deadline passed before the turn started")
+        res = ad.run(prompt, cwd, max(30.0, min(self.config.turn_timeout_s, left)), emit, resume_id=resume_id,
+                     add_dirs=add_dirs, cancelled=self.cancelled, peer_tag=tag)
         self.account(ad, model, res, resumed=bool(resume_id), row=row)
         # A fresh session can't fix running out of usage; it would only spend more.  Check
         # again first: another worker may have found this agent out of usage meanwhile.
@@ -427,7 +433,8 @@ class Worker:
         if resume_only and not res.ok and not res.quota:
             self.event("error", f"resume failed ({res.error}); not starting a fresh session", agent)
         elif (not res.ok and resume_id and not res.timed_out and not res.quota and not res.format_changed
-                and not res.incomplete and not res.config_error and not self.cancelled()):
+                and not res.incomplete and not res.config_error and not self.cancelled()
+                and self.deadline_left() > 0):  # no new CLI run past a discussion's deadline (#74)
             block = quota.block_for(self.bus, self.config, agent, settings)
             if block:
                 self.event("turn_end", f"failed: {res.error}" + tokens(res), agent)
@@ -435,9 +442,13 @@ class Worker:
             self.event("error", f"resume failed ({res.error}); starting a fresh session", agent)
             self.set_peer_session(agent, None)
             row = self.begin_usage(ad, model, None)
-            res = ad.run(fresh_prompt or prompt, cwd, timeout, emit, add_dirs=add_dirs,
-                         cancelled=self.cancelled, peer_tag=tag)
-            self.account(ad, model, res, resumed=False, row=row)
+            left = self.deadline_left()  # again just before the hand-off (#74)
+            if left > 0:
+                res = ad.run(fresh_prompt or prompt, cwd, max(30.0, min(self.config.turn_timeout_s, left)), emit,
+                             add_dirs=add_dirs, cancelled=self.cancelled, peer_tag=tag)
+                self.account(ad, model, res, resumed=False, row=row)
+            else:
+                self.drop_usage(row)
         self.event("turn_end", ("ok" if res.ok else f"failed: {res.error}") + tokens(res), agent)
         self.check()  # a worker that lost its lease records nothing
         if res.quota:
@@ -480,6 +491,15 @@ class Worker:
         if res.external_id:
             self.set_peer_session(agent, res.external_id)
         return res
+
+    def drop_usage(self, row: int | None) -> None:
+        """A turn marked as started (begin_usage) that never ran its CLI: close the row."""
+        if row is None:
+            return
+        try:
+            self.bus.close_usage(row)
+        except Exception as e:  # noqa: BLE001 - history must never fail a turn
+            self.event("error", f"could not record token usage: {e!r}")
 
     def begin_usage(self, ad: Adapter, model: str | None, resume_id: str | None) -> int | None:
         """For a CLI that reports running totals, mark the turn as started (Bus.begin_usage)."""
@@ -651,7 +671,7 @@ class Worker:
         mode = self.job["params"].get("mode", "start")
         t = self.thread()
         if mode in ("start", "start_later"):
-            if mode == "start":
+            if mode == "start" and self.deadline_left() > 0:  # a job that starts late runs no turn
                 self.round_one(t)
                 if not self.stalemate():
                     self.wait_for_initiator(round_no=1)
@@ -670,14 +690,17 @@ class Worker:
                 retry = False
                 if not self.later_round():
                     break  # no peer can move; wrap_up hands over to the initiator or the human
-        elif not self.done() and self.thread()["round"] < self.thread()["max_rounds"]:
+        elif (not self.done() and self.thread()["round"] < self.thread()["max_rounds"]
+              and self.deadline_left() > 0):
             self.set_thread(blind=0)
-            if not self.later_round():  # advance: at most one more round
+            if not self.later_round() and self.deadline_left() > 0:  # advance: at most one more round
                 # It spent no round, so the same advance must be able to run once the
-                # peers can move again.
+                # peers can move again (not past the deadline, which parks the thread).
                 with self.fenced():
                     self.bus.release_dedupe(self.job["id"])
-        if self.close_on_stalemate():
+        # Past the deadline, wrap_up parks it for the human: never a quota park, whose
+        # automatic resume would reopen it without one (#74).
+        if self.deadline_left() > 0 and self.close_on_stalemate():
             return
         self.wrap_up()
 
@@ -703,7 +726,7 @@ class Worker:
         with self.fenced():
             t = self.thread()
             snapshot = unvotable.stalemate(self.bus, self.config, t)
-            if not snapshot:
+            if not snapshot or self.deadline_left() <= 0:  # past the deadline wrap_up parks it (#74)
                 return False
             if not self.bus.transition(self.thread_id, "needs_human"):
                 return True  # something else closed it first
@@ -761,7 +784,7 @@ class Worker:
             # by another worker, or a vote that closed the thread, can't leave a round
             # with no peer turn.
             t = self.thread()
-            if t["status"] != "open" or t["round"] >= t["max_rounds"]:
+            if t["status"] != "open" or t["round"] >= t["max_rounds"] or self.deadline_left() <= 0:
                 return False
             s = unvotable.assess(self.bus, self.config, t)
             if not (s.stalemate or s.everyone):
@@ -828,7 +851,7 @@ class Worker:
             self.system(f"{agent} could not take its turn: {res.error}")
             return
         action = extract_json(res.text)
-        if not self.valid_action(action, blind):
+        if not self.valid_action(action, blind) and self.deadline_left() > 0:  # no repair turn past it (#74)
             self.event("repair", "asking again for the move: " + (
                 "no JSON object in the reply" if action is None else
                 f"the JSON object is not a valid {'proposal' if blind else 'proposal or vote'}"), agent)
@@ -856,10 +879,12 @@ class Worker:
                 if reasons:
                     body += f"\n\nReasons: {reasons.strip()}"
                 self.post(agent, body, kind="proposal", session_id=f"job:{self.job['id']}",
-                          data={"discussion": prose[-4000:]})
+                          data={"discussion": prose[-4000:]}, allow_past_deadline=True)
             else:
+                # A turn started before the deadline counts even if it ends after it (#74).
                 self.post(agent, reasons or action["stance"], kind="vote", session_id=f"job:{self.job['id']}",
-                          data={"on": action["on"], "stance": action["stance"], "reasons": reasons})
+                          data={"on": action["on"], "stance": action["stance"], "reasons": reasons},
+                          allow_past_deadline=True)
         except BusError as e:
             self.system(f"{agent}'s {action['action']} was rejected: {e.message}")
 
@@ -883,7 +908,7 @@ class Worker:
         """Give an interactive initiator a chance to move this round before going on."""
         t = self.thread()
         init = t["initiator"]
-        if init == HUMAN or init not in t["participants"] or self.done():
+        if init == HUMAN or init not in t["participants"] or self.done() or self.deadline_left() <= 0:
             return
         if self.initiator_posted(init, round_no):
             return
@@ -907,9 +932,16 @@ class Worker:
         if t["status"] != "open":
             return
         d = self.bus.dissent(self.thread_id)
-        out_of_budget = t["round"] >= t["max_rounds"] or self.deadline_left() <= 0
+        late = self.deadline_left() <= 0
+        out_of_budget = t["round"] >= t["max_rounds"] or late
         init = t["initiator"]
         to = None if init == HUMAN else init
+        if late:
+            # Past the deadline no vote counts any more, the initiator's included (#74).
+            if self.finish_thread("needs_human"):
+                self.system(f"No consensus (deadline reached). Needs the human user.\n{format_dissent(d)}",
+                            recipient=to)
+            return
         leader = d["leading_proposal"] if d["not_backing_leader"] == [init] else None
         s = unvotable.assess(self.bus, self.config, t)
         if s.everyone and not s.stalemate:
@@ -926,9 +958,9 @@ class Worker:
         if not out_of_budget:
             self.system(f"Round {t['round']} finished without consensus.\n{format_dissent(d)}", recipient=to)
             return
-        reason = "deadline reached" if self.deadline_left() <= 0 else f"{t['max_rounds']} rounds used"
         if self.finish_thread("needs_human"):
-            self.system(f"No consensus ({reason}). Needs the human user.\n{format_dissent(d)}", recipient=to)
+            self.system(f"No consensus ({t['max_rounds']} rounds used). Needs the human user.\n{format_dissent(d)}",
+                        recipient=to)
 
     # -------------------------------------------------------------------- review
 
@@ -1754,17 +1786,6 @@ def drift_reason(error: str) -> str:
 def strip_trailing_json(text: str) -> str:
     idx = text.rfind("{")
     return text[:idx].strip() if idx != -1 else text.strip()
-
-
-def format_dissent(d: dict) -> str:
-    lines = []
-    for pid, who in sorted(d["backing"].items()):
-        lines.append(f"- {pid} backed by {', '.join(who)}")
-    for o in d["objections"]:
-        lines.append(f"- {o['participant']} objects to {o['on']}")
-    if d["missing"]:
-        lines.append(f"- no position from: {', '.join(d['missing'])}")
-    return "\n".join(lines) or "- no positions recorded"
 
 
 def format_review(st: dict) -> str:

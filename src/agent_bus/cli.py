@@ -101,6 +101,7 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
     from . import worker
     try:
         while True:
+            bus.expire_discussion(args.thread)  # parked once its deadline passes (#74)
             worker.relaunch_stalled(bus)  # its job's worker may never have started (#64)
             for m in bus.history(args.thread, after_id=last_msg)["messages"]:
                 last_msg = m["id"]

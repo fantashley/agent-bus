@@ -593,17 +593,26 @@ class Bus:
 
     def post(self, thread_id: str, sender: str, body: str, kind: str = "message",
              session_id: str | None = None, recipient: str | None = None,
-             data: dict | None = None) -> dict:
-        """Append a message, applying protocol rules.  Returns the stored message."""
+             data: dict | None = None, allow_past_deadline: bool = False) -> dict:
+        """Append a message, applying protocol rules.  Returns the stored message.
+
+        An agent's proposal or vote after a discussion's deadline is refused (#74), except
+        with ``allow_past_deadline``: the move of a peer turn its worker started in time."""
         if kind not in KINDS:
             raise BusError("BAD_KIND", f"kind must be one of {', '.join(KINDS)}")
-        return self._post(thread_id, sender, body, kind, session_id, recipient, dict(data or {}))
+        return self._post(thread_id, sender, body, kind, session_id, recipient, dict(data or {}),
+                          allow_past_deadline)
 
     def _post(self, thread_id: str, sender: str, body: str, kind: str, session_id: str | None,
-              recipient: str | None, data: dict) -> dict:
+              recipient: str | None, data: dict, allow_past_deadline: bool = False) -> dict:
+        is_agent = sender not in (HUMAN, SYSTEM)
+        timed = is_agent and kind in ("proposal", "vote") and not allow_past_deadline
+        # Parked in its own transaction first, so the refusal below can't roll it back.
+        expired = timed and self.expire_discussion(thread_id)
         with self.tx():
             t = self.thread(thread_id)
-            is_agent = sender not in (HUMAN, SYSTEM)
+            if timed and (expired or past_deadline(t)):
+                raise BusError("DEADLINE_REACHED", deadline_message(t, parked=expired))
             if is_agent:
                 if t["status"] == "cancelled":
                     raise BusError("THREAD_CANCELLED", f"thread {thread_id} was cancelled")
@@ -712,6 +721,37 @@ class Bus:
              "peer_data", t["round"], body, json.dumps({"proposal_id": pid, "author": prop["sender"]}), _now()),
         )
         self.set_thread(thread_id, status="resolved", final_proposal=pid)
+
+    # ------------------------------------------------------------------ deadlines (#74)
+
+    def expire_discussion(self, thread_id: str) -> bool:
+        """Park an open discussion past its deadline as needs_human, unless a live worker is
+        still on it (it parks the thread itself in wrap_up).  A queued job that hasn't started
+        could take no turn any more: it is retired with the parking.  Returns whether this
+        call parked the thread.  A cheap read first: the common case takes no write lock."""
+        if not overdue(self.thread(thread_id)):
+            return False
+        self.reap()  # a dead worker's job doesn't keep the thread open
+        with self.tx():
+            t = self.thread(thread_id)
+            if not overdue(t) or self._one("SELECT 1 FROM jobs WHERE thread_id=? AND status='running'", thread_id):
+                return False
+            if not self.transition(thread_id, "needs_human"):
+                return False
+            self.conn.execute("UPDATE jobs SET status='cancelled', error='the discussion deadline passed before "
+                              "it started', updated_at=? WHERE thread_id=? AND status='queued'", (_now(), thread_id))
+            self.set_thread(thread_id, blind=0)
+            self._post(thread_id, SYSTEM, "No consensus (deadline reached). Needs the human user.\n"
+                       + format_dissent(self.dissent(thread_id)), "status", None,
+                       None if t["initiator"] == HUMAN else t["initiator"], {})
+        return True
+
+    def expire_discussions(self, exclude: frozenset = frozenset()) -> list[str]:
+        """Park every overdue open discussion (see expire_discussion), except those in
+        ``exclude``.  Returns the ids parked."""
+        rows = self._all("SELECT id FROM threads WHERE kind='discussion' AND status='open'"
+                         " AND deadline IS NOT NULL AND deadline<=?", _now())
+        return [r["id"] for r in rows if r["id"] not in exclude and self.expire_discussion(r["id"])]
 
     def dissent(self, thread_id: str) -> dict:
         """Summarise where a discussion stands: who backs what, objections, missing voices."""
@@ -1399,6 +1439,39 @@ class Bus:
 
 # The default when a review thread doesn't record its own budget (one from before #71).
 DEFAULT_FOLLOWUP_BUDGET = 3
+
+
+def overdue(t: dict) -> bool:
+    """An open discussion whose deadline has passed."""
+    return (t["kind"] == "discussion" and t["status"] == "open" and bool(t["deadline"])
+            and t["deadline"] <= _now())
+
+
+def past_deadline(t: dict) -> bool:
+    """A discussion past its deadline that is open or parked as needs_human: moves on it
+    get DEADLINE_REACHED, whichever call parked it."""
+    return (t["kind"] == "discussion" and t["status"] in ("open", "needs_human") and bool(t["deadline"])
+            and t["deadline"] <= _now())
+
+
+def deadline_message(t: dict, parked: bool, refused: str = "takes no more proposals or votes") -> str:
+    """Why an overdue discussion refused a move (DEADLINE_REACHED), and what moves it on."""
+    when = time.strftime("%H:%M:%S", time.localtime(t["deadline"]))
+    state = ("it is needs_human now" if parked or t["status"] == "needs_human"
+             else "its worker is wrapping up and will park it as needs_human")
+    return (f"the deadline of discussion {t['id']} passed at {when}, so it {refused}; "
+            f"{state}. The human user can run `agent-bus resume {t['id']}` to reopen it with a new deadline.")
+
+
+def format_dissent(d: dict) -> str:
+    lines = []
+    for pid, who in sorted(d["backing"].items()):
+        lines.append(f"- {pid} backed by {', '.join(who)}")
+    for o in d["objections"]:
+        lines.append(f"- {o['participant']} objects to {o['on']}")
+    if d["missing"]:
+        lines.append(f"- no position from: {', '.join(d['missing'])}")
+    return "\n".join(lines) or "- no positions recorded"
 
 
 def review_progress(t: dict) -> dict:
