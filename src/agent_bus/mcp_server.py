@@ -264,7 +264,12 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         """Ask other agents for a read-only review of a pinned change in an allow-listed repo.
 
         Pin full commit ids (`git rev-parse HEAD`, or `jj log --no-graph -r @ -T commit_id` in a jj
-        repo); change_id is an optional label (jj change id, branch name, "PR #12"). For a follow-up
+        repo). An unambiguous prefix of at least 7 hex digits is resolved to the full id, but never
+        extend a short id by hand. The commits are checked before anything is created: one the repo
+        doesn't have fails with REVISION_NOT_FOUND, a prefix matching several with
+        REVISION_AMBIGUOUS, and a base that isn't an ancestor of the head with REVISION_NOT_ANCESTOR.
+        change_id is an optional label: letters, digits, space and ._/#:+- (no parentheses), up to
+        100 characters, e.g. a jj change id (qpvuntsm), a branch name or "PR #12". For a follow-up
         pass, pass the thread's current head as prev_head_commit_id: the request
         continues the same review thread and resumes the reviewer's own conversation, so it keeps
         its earlier findings and sees only the interdiff plus any replies you posted on the thread.

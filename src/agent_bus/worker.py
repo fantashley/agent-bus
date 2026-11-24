@@ -100,6 +100,103 @@ class MissingRevision(Exception):
         super().__init__(f"{repo} has no commit " + ", ".join(f"{sha} ({label})" for label, sha in missing))
 
 
+def commit_tools(repo: str) -> list[str]:
+    """The tools that read commits in ``repo``, in the order the review diff tries them: jj
+    and then git in a colocated jj repo (jj's --ignore-working-copy doesn't import plain git
+    commits), jj alone in a jj repo without a .git, git in a git repo, none outside a repo."""
+    kind = cfg.vcs(repo)
+    if kind == "jj":
+        return ["jj", "git"] if os.path.exists(os.path.join(repo, ".git")) else ["jj"]
+    return ["git"] if kind == "git" else []
+
+
+def _probe(repo: str, argv: list[str], stdin: str | None = None) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(argv, cwd=repo, input=stdin, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _jj_log(repo: str, revset: str) -> subprocess.CompletedProcess | None:
+    """Commit ids in ``revset``, one per line (never colored, whatever ui.color says)."""
+    return _probe(repo, ["jj", "log", "--ignore-working-copy", "--no-graph", "--color=never", "-r", revset,
+                         "-T", 'commit_id ++ "\\n"'])
+
+
+def _resolve_with(repo: str, tool: str, rev: str) -> tuple[str, list[str]]:
+    """One tool's answer for :func:`resolve_commit`.  Both look the id up as an object id
+    only, never as a bookmark, branch or tag name that happens to look like one."""
+    if tool == "jj":
+        out = _jj_log(repo, f"commit_id({rev})")
+        if out is None:
+            return "unknown", []
+        if out.returncode != 0:
+            return ("ambiguous", []) if "ambiguous" in out.stderr else ("unknown", [])
+        ids = out.stdout.split()
+    else:
+        # `rev-parse --verify` says nothing about an ambiguous prefix (it just fails), so list
+        # every object with this prefix and keep the commits.
+        out = _probe(repo, ["git", "rev-parse", f"--disambiguate={rev}"])
+        if out is None or out.returncode != 0:
+            return "unknown", []
+        objs = out.stdout.split()
+        if not objs:
+            return "missing", []
+        out = _probe(repo, ["git", "cat-file", "--batch-check=%(objecttype) %(objectname)"], "\n".join(objs) + "\n")
+        if out is None or out.returncode != 0:
+            return "unknown", []
+        ids = [line.split()[1] for line in out.stdout.splitlines() if line.startswith("commit ")]
+    ids = [i for i in ids if i.startswith(rev)]
+    return ("found" if len(ids) == 1 else "ambiguous" if ids else "missing"), ids
+
+
+def resolve_commit(repo: str, tools: list[str], rev: str) -> tuple[str, list[str]]:
+    """Resolve a commit id, or a prefix of one, in ``repo`` with ``tools`` (#73).  Returns
+    ("found", [full id]), ("ambiguous", [matching ids, if known]), ("missing", []) when every
+    tool definitely has no such commit (a tree or blob id counts as missing), or
+    ("unknown", []) when no tool gave a definite answer.
+
+    Every tool is asked and their matches pooled: in a colocated repo jj may know one commit
+    with a prefix while git also has another that jj hasn't imported yet, so a prefix only
+    resolves when every tool answered."""
+    answers, ids = [], set()
+    for tool in tools:
+        state, found = _resolve_with(repo, tool, rev)
+        answers.append(state)
+        ids.update(found)
+    if "ambiguous" in answers or len(ids) > 1:
+        return "ambiguous", sorted(ids)
+    if len(rev) < 40 and "unknown" in answers:
+        return "unknown", []  # the tool that couldn't answer may hold another commit with this prefix
+    if ids:
+        return "found", list(ids)
+    return ("missing" if answers and all(a == "missing" for a in answers) else "unknown"), []
+
+
+def is_ancestor(repo: str, tools: list[str], base: str, head: str) -> bool | None:
+    """Whether commit ``base`` is ``head`` or one of its ancestors, None if unknown.  Git
+    answers first when the repo has it: a colocated jj repo's commits are all in its git
+    store, while jj there may not have imported a plain git commit yet.  In a shallow git
+    repo a "no" may only mean the history is cut off, so it doesn't count."""
+    if "git" in tools:
+        out = _probe(repo, ["git", "merge-base", "--is-ancestor", f"{base}^{{commit}}", f"{head}^{{commit}}"])
+        if out is not None and out.returncode == 0:
+            return True
+        if out is not None and out.returncode == 1:
+            shallow = _probe(repo, ["git", "rev-parse", "--is-shallow-repository"])
+            if shallow is not None and shallow.returncode == 0 and shallow.stdout.strip() == "false":
+                return False
+            return None
+    if "jj" in tools:
+        # Only when jj has both commits: one it lacks would look like "not an ancestor".
+        known = _jj_log(repo, f"commit_id({base}) | commit_id({head})")
+        if known is None or known.returncode != 0 or set(known.stdout.split()) != {base, head}:
+            return None
+        out = _jj_log(repo, f"commit_id({base}) ~ ::commit_id({head})")
+        return None if out is None or out.returncode != 0 else not out.stdout.strip()
+    return None
+
+
 class Worker:
     def __init__(self, bus: Bus, job_id: str, config: cfg.Config | None = None):
         self.bus = bus
@@ -1252,22 +1349,17 @@ class Worker:
         else:
             frm = refs["base_commit_id"]
             heading = f"Diff from base to head (base {frm[:12]} to head {head[:12]}), the whole change:"
-        kind = cfg.vcs(repo)
-        jj_argv = ["jj", "diff", "--ignore-working-copy", "--git", "--from", frm, "--to", refs["head_commit_id"]]
+        tools = commit_tools(repo)
+        jj_argv = ["jj", "diff", "--ignore-working-copy", "--color=never", "--git", "--from", frm, "--to", refs["head_commit_id"]]
         # ^{commit}: a tree or blob id is not a reviewable commit, even though git diff takes one.
         # The trailing "--" keeps an unresolvable id from being read as a path.
         git_argv = ["git", "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", *DIFF_PREFIXES,
                     f"{frm}^{{commit}}", f"{refs['head_commit_id']}^{{commit}}", "--"]
-        if kind == "jj":
-            # In a colocated repo, --ignore-working-copy skips importing plain git commits,
-            # so fall back to git diff if jj cannot resolve the pinned commit ids.
-            attempts = [("jj", jj_argv)]
-            if os.path.exists(os.path.join(repo, ".git")):
-                attempts.append(("git", git_argv))
-        elif kind == "git":
-            attempts = [("git", git_argv)]
-        else:
+        if not tools:
             raise RuntimeError(f"could not compute diff: {repo} is not a jj or git repository")
+        # In a colocated repo, --ignore-working-copy skips importing plain git commits,
+        # so fall back to git diff if jj cannot resolve the pinned commit ids.
+        attempts = [(tool, jj_argv if tool == "jj" else git_argv) for tool in tools]
         last_err = ""
         out = None
         for tool, argv in attempts:
@@ -1380,7 +1472,7 @@ class Worker:
         failure is treated as found, so the caller reports the original diff error instead
         of a wrong diagnosis."""
         for tool in tools:
-            argv = (["jj", "log", "--ignore-working-copy", "--no-graph", "-r", sha, "-T", "commit_id"]
+            argv = (["jj", "log", "--ignore-working-copy", "--no-graph", "--color=never", "-r", sha, "-T", "commit_id"]
                     if tool == "jj" else ["git", "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])
             try:
                 out = subprocess.run(argv, cwd=repo, capture_output=True, text=True, timeout=60)
