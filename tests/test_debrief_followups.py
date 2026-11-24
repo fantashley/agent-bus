@@ -96,6 +96,18 @@ def test_render_fences_marks_unreadable_files_and_cut_output():
     assert "(not in the copy)" not in cut  # readable None: every file can be read
 
 
+def test_search_ignores_grep_config_and_defuses_nul_and_paths(env):
+    repo = env["repo"]
+    base, head = code_change(repo)
+    sh(repo, "git", "config", "grep.column", "true")
+    sh(repo, "git", "config", "grep.lineNumber", "false")
+    u = usages.search(str(repo), head, ["frobnicate"])
+    assert ("pkg/use.py", 3, "print(frobnicate(2))") in u.hits["frobnicate"]
+    u = usages.Usages(names=["alpha"], hits={"alpha": [(f"x{usages.CLOSE}.py", 1, "alpha\0 here")]})
+    text = usages.render(u)
+    assert "\0" not in text and "alpha\\0 here" in text and text.count(usages.CLOSE) == 1
+
+
 def test_search_output_cut_short_is_flagged(env, monkeypatch):
     repo = env["repo"]
     base, head = code_change(repo)
@@ -215,6 +227,14 @@ def test_next_action_for_the_other_states():
     cr = {**st, "reviewers": {"codex": {"state": "changes_requested"}, "antigravity": {"state": "pending"}},
           "changes_requested": ["codex"], "pending": ["antigravity"]}
     assert review_next_action(t, cr, {"kind": "review"}).startswith("fix: codex asked for changes on head h")
+    # At the follow-up limit, a request for changes means stop (the worker parks it next).
+    over = {**cr, "follow_ups": 6, "followup_limit": 6}
+    assert review_next_action(t, over, {"kind": "review"}).startswith("stop: the review still asks for changes")
+    # A failed pushback pass: its earlier request for changes still shows, but only a resume helps.
+    assert review_next_action({"status": "open", "id": "t-1"}, cr, None, last_failed=True,
+                              pushback_pending=True).startswith("stop: the last review pass failed")
+    # A failed job after a verdict that was posted: that verdict is what to act on.
+    assert review_next_action({"status": "open", "id": "t-1"}, cr, None, last_failed=True).startswith("fix:")
     # A failed pass with nothing running: stop and tell the human, rather than wait forever.
     assert review_next_action({"status": "open", "id": "t-1"}, st, None, last_failed=True) == (
         "stop: the last review pass failed and nothing is running; tell the human user, who can run "
