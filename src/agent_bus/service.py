@@ -67,6 +67,32 @@ def thread_summary(t: dict, goal: bool = True) -> dict:
     return out
 
 
+def review_next_action(t: dict, st: dict, job: dict | None) -> str:
+    """A one-line hint for a review's initiator (#117): keep waiting, fix, done, or stop.
+    ``st`` is the thread's review_standings, ``job`` its active job (or None)."""
+    head = st.get("head_commit_id") or ""
+    if job is not None and job["kind"] == "debrief":
+        return "wait: debrief replies are on their way"
+    if t["status"] == "cancelled":
+        return "stop: the review was cancelled"
+    if t["status"] == "needs_human":
+        return ("stop: the thread waits for the human user; read the latest system notice and tell them "
+                "what it says (agent-bus resume is theirs to run)")
+    if st["complete"]:
+        several = len(st["reviewers"]) > 1
+        return f"done: {'every required reviewer' if several else next(iter(st['reviewers']))} approved head {head}"
+    if job is not None:
+        who = [r for r, v in st["reviewers"].items() if v["state"] == "reviewing"] or st["pending"]
+        return f"wait: {', '.join(who) or 'a reviewer'} is reviewing head {head}"
+    if st["changes_requested"]:
+        return (f"fix: {', '.join(st['changes_requested'])} asked for changes on head {head}. Address the blocking "
+                "findings, send a note on each, then request_review again with the new head and "
+                f"prev_head_commit_id={head} (or send evidence and request the same head to push back)")
+    if st["pending"]:
+        return f"wait: {', '.join(st['pending'])} still to review head {head}"
+    return "wait"
+
+
 class Service:
     def __init__(self, bus: Bus, agent: str, session_id: str | None = None, config: cfg.Config | None = None):
         self.bus = bus
@@ -173,6 +199,8 @@ class Service:
         if thread:
             t = self.bus.thread(thread)
             res["thread"] = thread_summary(t, goal=False)
+            if t["kind"] == "review":
+                res.update(self.review_state(t))  # every wake-up says where the review stands (#117)
             # The last message in this batch (or, with none, the last one read on the
             # thread): pass it to wait(after_message_id=...) to replay anything after it,
             # e.g. a reply lost when the connection dropped, or the next page (#72).
@@ -270,7 +298,7 @@ class Service:
         h = self.bus.history(thread, viewer=None if self.agent == HUMAN else self.agent, limit=limit)
         res = {"thread": thread_summary(h["thread"]), "messages": [present(m) for m in h["messages"]]}
         if h["thread"]["kind"] == "review":
-            res["review"] = self.bus.review_standings(thread)
+            res.update(self.review_state(h["thread"]))
         if h["blind"]:
             res["blind"] = "Round 1 is blind until you post your own proposal."
         return res
@@ -295,9 +323,14 @@ class Service:
             job = self.bus.active_job(thread)
             res["worker"] = job["status"] if job else "idle"
         elif t["kind"] == "review":
-            self.bus.reap()  # a dead worker's reviewer is no longer "reviewing"
-            res["review"] = self.bus.review_standings(thread)
+            res.update(self.review_state(t))
         return res
+
+    def review_state(self, t: dict) -> dict:
+        """A review thread's standings and what its initiator should do next (#117)."""
+        job = self.bus.active_job(t["id"])  # reaps first: a dead worker's reviewer is no longer "reviewing"
+        st = self.bus.review_standings(t["id"])
+        return {"review": st, "next_action": review_next_action(t, st, job)}
 
     # ------------------------------------------------------------- coordination
 

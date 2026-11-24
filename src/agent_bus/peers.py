@@ -1183,7 +1183,9 @@ class AntigravityAdapter(Adapter):
     # harness's agent-bus tools and file:// links (#110).
     # 7: a review turn also gets its pinned head's read-only snapshot with --add-dir, and the
     # guidance says the prompt lists its files (#111).
-    recipe = "7"
+    # 8: the guidance says a review shows where the change's names are used, and to read long
+    # files by line range (#117).
+    recipe = "8"
     # agy 1.5.13 in plan mode declares search_web (Google-grounded search, run server side) but
     # no page fetch.  `search_web(*)` and `read_url(*)` deny rules are ignored, but a custom
     # agent's `tools` list removes it (live probes, 2026-11-23): see peer_agent.
@@ -1202,7 +1204,9 @@ class AntigravityAdapter(Adapter):
     # can start without run_command) and the MCP tools (agent-bus only, see check_isolation).
     # agy 1.5.13's registry also has list_dir, grep_search and find_by_name (an agent may list
     # them), but no mode declares them to the model, plan mode or not (live probes 2026-11-24,
-    # issue #93); search would need run_command, which stays denied.
+    # issues #93 and #117: listed in the agent's tools, the model still sees only read_file);
+    # search would need run_command, which stays denied.  So agent-bus searches for it: a
+    # review prompt shows where the names the change touches are used (usages.py).
     agent_tools = ("read_file",)
     lists_files = False
     web_tool_names = ("search_web",)

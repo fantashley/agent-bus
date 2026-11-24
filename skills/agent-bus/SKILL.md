@@ -128,14 +128,16 @@ prev_head_commit_id?, focus?, testing?, thread?, model?, effort?, peer_settings?
   ready once every one of them has approved the **same** base..head: any new head (or base) makes
   earlier approvals stale. The result's `review` object lists `approved`, `changes_requested`
   and `pending`.
-- Then `wait(thread)` until a `review_verdict` arrives. With several reviewers, an approval
-  hands the head to the next one: keep waiting while the thread is still `open` (a wait that
-  wakes on a verdict has no `review` object; a timeout or `history` shows `review.pending`).
-  The pass is over when a verdict asks for changes, or when the thread is `resolved`: for
-  several reviewers that means every one approved the same head; for a single reviewer it
-  just means its verdict is in, so read it. If the thread goes to `needs_human` with no verdict (a
-  reviewer out of usage, a CLI format change, a missing commit, an unusable verdict), stop and
-  tell the user what the bus's notice says; `agent-bus resume` is theirs to run.
+- Then `wait(thread)` until a `review_verdict` arrives. Every `wait` on a review thread (a
+  wake-up or a timeout) carries `review` (each reviewer's state at the current head, plus
+  `approved`, `changes_requested` and `pending`) and a one-line `next_action`: `wait: ...`
+  (a reviewer is on it), `fix: ...` (someone asked for changes: the thread can still be
+  `open` with several reviewers, but stop waiting and fix), `done: ...` (every required
+  reviewer approved the same head) or `stop: ...` (it waits for the human). With several
+  reviewers an approval hands the head to the next one, so keep waiting while it says `wait`.
+  If the thread goes to `needs_human` with no verdict (a reviewer out of usage, a CLI format
+  change, a missing commit, an unusable verdict), stop and tell the user what the bus's notice
+  says; `agent-bus resume` is theirs to run.
 
 **Severity.** Only `high` and `medium` findings block; `low` never does. Fix the blocking ones;
 low ones are optional (defer them to a follow-up issue if they're real work).

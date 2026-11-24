@@ -76,3 +76,18 @@ def test_mcp_instructions_keep_the_core_rules():
                    "request_review", "debrief", "Don't ping-pong", "THREAD_LIMIT_REACHED",
                    "REVIEW_LIMIT_REACHED", "stop and tell the user", "`agent-bus` skill"):
         assert phrase in text, phrase
+
+
+def test_skill_explains_every_next_action_a_review_wait_returns():
+    """#117: every wait on a review thread carries `review` and `next_action`; the skill
+    says so and names each kind of hint the service gives."""
+    import inspect
+
+    from agent_bus import service
+    text = skill_text()
+    assert "Every `wait` on a review thread" in text and "`next_action`" in text
+    assert "has no `review` object" not in text  # the old caveat no longer holds
+    kinds = set(re.findall(r'"(wait|fix|done|stop):', inspect.getsource(service.review_next_action)))
+    assert kinds == {"wait", "fix", "done", "stop"}
+    for k in kinds:
+        assert f"`{k}: ...`" in text, k
