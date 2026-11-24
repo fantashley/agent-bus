@@ -139,7 +139,7 @@ def test_turn_gets_the_env_and_agent_bus_owned_settings(env, monkeypatch):
     monkeypatch.setenv("FAKE_LOG_ENV", "AWS_PROFILE,AWS_REGION,CLAUDE_CODE_USE_BEDROCK")
     conf = cfg.Config.load()
     ad = adapter("claude", conf)
-    assert ad.recipe == "4"
+    assert ad.recipe == "5"
     res = ad.run("hello", str(env["repo"]), 30, lambda k, t: None)
     assert res.ok, res.error
     call = calls(env, "claude")[-1]

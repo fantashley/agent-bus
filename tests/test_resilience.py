@@ -425,7 +425,7 @@ def test_agy_reply_after_a_denial_is_a_normal_turn(env, monkeypatch):
 def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     from agent_bus.prompts import AGY_HEADLESS
     ad = adapter("antigravity", cfg.Config.load())
-    assert ad.recipe == "6" and "run_command" in AGY_HEADLESS and "search_web" in AGY_HEADLESS
+    assert ad.recipe == "7" and "run_command" in AGY_HEADLESS and "search_web" in AGY_HEADLESS
     assert "do not use search_web" not in AGY_HEADLESS.lower()  # no contradiction with the preamble
     for resume_id in (None, "conv-1"):
         argv = ad.invocation("PROMPT-BODY", resume_id, str(env["repo"]), []).argv
@@ -450,7 +450,7 @@ def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     assert not any(AGY_HEADLESS.strip() in c["prompt"] for c in calls(env, "codex"))
     starts = [e["text"] for e in env["bus"]._all(
         "SELECT * FROM events WHERE thread_id=? AND kind='turn_start' AND agent='antigravity'", tid)]
-    assert starts and all("recipe antigravity/6" in s for s in starts)
+    assert starts and all("recipe antigravity/7" in s for s in starts)
 
 
 def test_incomplete_agy_discussion_turn_is_reported_without_a_drift_notice(env, no_spawn, monkeypatch):

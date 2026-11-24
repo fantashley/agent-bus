@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from . import config as cfg
-from . import autoresume, prompts, quota, unvotable
+from . import autoresume, prompts, quota, snapshot, unvotable
 from .db import HUMAN, SYSTEM, Bus, BusError, format_dissent, review_progress
 from .peers import ADAPTERS, Adapter, TurnResult, adapter, cli_version, extract_json, format_usage
 
@@ -136,13 +136,14 @@ def _resolve_with(repo: str, tool: str, rev: str) -> tuple[str, list[str]]:
     else:
         # `rev-parse --verify` says nothing about an ambiguous prefix (it just fails), so list
         # every object with this prefix and keep the commits.
-        out = _probe(repo, ["git", "rev-parse", f"--disambiguate={rev}"])
+        out = _probe(repo, ["git", "--no-replace-objects", "rev-parse", f"--disambiguate={rev}"])
         if out is None or out.returncode != 0:
             return "unknown", []
         objs = out.stdout.split()
         if not objs:
             return "missing", []
-        out = _probe(repo, ["git", "cat-file", "--batch-check=%(objecttype) %(objectname)"], "\n".join(objs) + "\n")
+        out = _probe(repo, ["git", "--no-replace-objects", "cat-file", "--batch-check=%(objecttype) %(objectname)"],
+                     "\n".join(objs) + "\n")
         if out is None or out.returncode != 0:
             return "unknown", []
         ids = [line.split()[1] for line in out.stdout.splitlines() if line.startswith("commit ")]
@@ -179,7 +180,9 @@ def is_ancestor(repo: str, tools: list[str], base: str, head: str) -> bool | Non
     store, while jj there may not have imported a plain git commit yet.  In a shallow git
     repo a "no" may only mean the history is cut off, so it doesn't count."""
     if "git" in tools:
-        out = _probe(repo, ["git", "merge-base", "--is-ancestor", f"{base}^{{commit}}", f"{head}^{{commit}}"])
+        # Replacement objects ignored, as in every read of the pinned ids (#111).
+        out = _probe(repo, ["git", "--no-replace-objects", "merge-base", "--is-ancestor", f"{base}^{{commit}}",
+                            f"{head}^{{commit}}"])
         if out is not None and out.returncode == 0:
             return True
         if out is not None and out.returncode == 1:
@@ -215,7 +218,22 @@ class Worker:
         if not self.bus.claim_job(self.job["id"], self.owner, LEASE_S):
             print(f"job {self.job['id']} is not claimable (status {self.bus.job(self.job['id'])['status']})")
             return 1
+        try:
+            return self._run()
+        finally:
+            self.sweep_snapshots(self.thread_id)  # after finish_job: this one, if it is done
+
+    def sweep_snapshots(self, only: str | None) -> None:
+        try:
+            snapshot.sweep(self.bus, only)
+        except Exception as e:  # housekeeping: never what fails a job
+            print(f"snapshot sweep failed: {e!r}")
+
+    def _run(self) -> int:
         threading.Thread(target=self._heartbeat, daemon=True).start()
+        # Snapshots of threads that no longer need them, a crashed worker's included (#111):
+        # with the lease kept alive, however long that takes.
+        self.sweep_snapshots(None)
         if threading.current_thread() is threading.main_thread():
             signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
         try:
@@ -377,18 +395,21 @@ class Worker:
         return str(scratch), []
 
     def turn(self, agent: str, prompt: str, resume: bool = True, fresh_prompt: str | None = None,
-             resume_only: bool = False) -> TurnResult:
+             resume_only: bool = False, read_dirs: list[str] | None = None) -> TurnResult:
         """Run one headless turn, resuming the peer's conversation when possible.
 
         If the resume fails, the turn is retried in a fresh session with
         ``fresh_prompt`` (a self-contained prompt that restates the rules), or the
         same prompt when the caller passes none.  ``resume_only`` (a debrief, #91): never
         a fresh session; with no stored session, or a resume that fails, the turn fails.
+        ``read_dirs``: more directories the peer may read (a review's snapshot, #111), after
+        the scratch directory.
         """
         self.check()
         self.config.require_available(agent, "peer")
         t = self.thread()
         cwd, add_dirs = self.workdir(t)
+        add_dirs = add_dirs + list(read_dirs or [])
         settings = self.config.peer_settings(agent, ((t["refs"] or {}).get("peer_settings") or {}).get(agent))
         model = quota.effective_model(self.config, agent, settings)
         # Out of usage: don't spend a turn finding that out again.  Blocks belong to the
@@ -1112,6 +1133,7 @@ class Worker:
             # reviewer seeing it for the first time: only `agent-bus resume` retries it.
             self.report_missing(t, e, followup or bool(refs.get("revision")) or len(refs.get("heads") or []) > 1)
             raise
+        snap = self.pin_snapshot(t, refs)
         # The self-contained prompt (first pass, retry, or a follow-up whose session can't be
         # resumed) always has the full base..head diff, the reviewer's earlier verdicts and
         # every note on the thread, so a fresh session never reviews a partial view.
@@ -1133,11 +1155,12 @@ class Worker:
         else:
             why_full = "your earlier session can't be resumed, so this pass starts a fresh one"
         fresh = self.review_prompt(t, refs, full_diff, f"{full_heading.rstrip(':')}, because {why_full}:",
-                                   notes(everything), earlier, approved=approved, pushback=pushback)
+                                   notes(everything), earlier, approved=approved, pushback=pushback, snap=snap)
         replies = "\n\n".join(prompts.render_message(m) for m in notes([m for m in everything
                                                                        if m["id"] > since])) or "(no replies)"
         if resume and pushback:
             prompt = prompts.REVIEW_PUSHBACK.format(head=refs["head_commit_id"], replies=replies,
+                                                    reading=self.reading_note(refs, snap, listing=False),
                                                     severity=prompts.SEVERITY, budget=budget_note(t),
                                                     time_limit=self.time_limit_note(),
                                                     testing=("\n" + self.testing_note(t, refs) + "\n"
@@ -1148,7 +1171,8 @@ class Worker:
                                            if approved else "")
             prompt = prompts.REVIEW_FOLLOWUP.format(
                 head=refs["head_commit_id"], prev=refs["prev_head_commit_id"], replies=replies,
-                rebase=rebase_note, converge=converge, severity=prompts.SEVERITY, budget=budget_note(t),
+                rebase=rebase_note, reading=self.reading_note(refs, snap), converge=converge,
+                severity=prompts.SEVERITY, budget=budget_note(t),
                 time_limit=self.time_limit_note(), overview=self.review_overview(t, refs, inter, "interdiff"),
                 diff_heading=inter_heading, diff=inter, verdict_format=prompts.VERDICT_FORMAT)
         else:
@@ -1158,7 +1182,8 @@ class Worker:
         what = "pushback " if pushback else "follow-up " if followup or mode == "followup" else ""
         self.system(f"Review {what}{'(retry) ' if mode == 'retry' else ''}"
                     f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.{fallback}", quiet=True)
-        res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh)
+        read_dirs = [snap.path] if snap.path else []
+        res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh, read_dirs=read_dirs)
         if res.quota or res.format_changed or res.config_error:
             # Head, reviewer and session stay pinned for `agent-bus resume` after the reset
             # (or once the adapter handles the new format).  A reset can resume it by itself.
@@ -1179,7 +1204,7 @@ class Worker:
             ask = (f"Your verdict is inconsistent: {problem}. Reply again with only the corrected JSON "
                    "verdict object described above." if problem else
                    "Reply again with only the JSON verdict object described above.")
-            res2 = self.turn(reviewer, ask, fresh_prompt=fresh + "\n\n" + ask)
+            res2 = self.turn(reviewer, ask, fresh_prompt=fresh + "\n\n" + ask, read_dirs=read_dirs)
             if res2.quota or res2.format_changed or res2.config_error:
                 if res2.quota:
                     self.park_on_quota(reviewer)
@@ -1257,7 +1282,8 @@ class Worker:
             self.event("error", f"review not started: {e}")
 
     def review_prompt(self, t: dict, refs: dict, diff: str, heading: str, replies: list[dict],
-                      earlier: list[dict] | None = None, approved: bool = False, pushback: bool = False) -> str:
+                      earlier: list[dict] | None = None, approved: bool = False, pushback: bool = False,
+                      snap: snapshot.Snapshot | None = None) -> str:
         focus = refs.get("focus")
         # A reviewer with an earlier verdict converges on it rather than starting over (#71).
         converge = ""
@@ -1284,7 +1310,7 @@ class Worker:
                   + ("." if earlier else " and look for problems not already raised.")
                   if refs.get("reviewers") else ""),
             focus=self.review_notes(t, refs, notes, focus),
-            overview=self.review_overview(t, refs, diff, "change"), reading=self.reading_note(refs),
+            overview=self.review_overview(t, refs, diff, "change"), reading=self.reading_note(refs, snap),
             time_limit=self.time_limit_note(),
             severity=prompts.SEVERITY, converge=converge,
             diff_heading=heading, diff=diff, verdict_format=prompts.VERDICT_FORMAT)
@@ -1295,22 +1321,54 @@ class Worker:
         minutes = max(1, int(timeout // 60))
         return prompts.TIME_LIMIT.format(limit=f"{minutes} minute{'s' if minutes != 1 else ''}")
 
-    def reading_note(self, refs: dict) -> str:
-        """How the reviewer can read the pinned head (#93): copyable read-only git commands
-        for a reviewer with a shell, in a repository git can read, and jj ones that work in
-        a read-only sandbox in a jj repository (#76); else a note that files on disk may not
-        match the head."""
+    def pin_snapshot(self, t: dict, refs: dict) -> snapshot.Snapshot:
+        """The read-only snapshot of the pinned head the reviewer reads files from (#111),
+        made now or reused from an earlier turn on the same head.  Best effort: without one,
+        the prompt says files on disk may not match the head."""
         try:
-            shell = ADAPTERS[self.config.harness_of(refs["reviewer"])].shell
+            snap = snapshot.ensure(refs["repo"], t["id"], refs["base_commit_id"], refs["head_commit_id"],
+                                   self.config.max_snapshot_bytes)
+        except Exception as e:  # noqa: BLE001 (never what fails a review)
+            snap = snapshot.Snapshot(head=refs["head_commit_id"], reason=f"it could not be made ({e!r})")
+        # A non-UTF-8 file name in it would fail the event's insert and a strict prompt encode.
+        snap.reason = snap.reason.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+        if snap.path:
+            self.event("snapshot", f"{snap.mode} snapshot of head {snap.head[:12]}: {len(snap.files)} of "
+                       f"{snap.tree_files} files, at {snap.path}")
+        else:
+            self.event("snapshot", f"no snapshot of head {snap.head[:12]}: {snap.reason}")
+        return snap
+
+    def reading_note(self, refs: dict, snap: snapshot.Snapshot | None = None, listing: bool = True) -> str:
+        """How the reviewer can read the pinned head: the snapshot's path (#111), with its
+        file list for a reviewer that can't list directories or search; copyable read-only git
+        commands for a reviewer with a shell, in a repository git can read, and jj ones that
+        work in a read-only sandbox in a jj repository (#93, #76); with neither, a note that
+        files on disk may not match the head."""
+        try:
+            ad = ADAPTERS[self.config.harness_of(refs["reviewer"])]
         except (KeyError, ValueError):
-            shell = False
+            ad = None
+        shell, lists = (ad.shell, ad.lists_files) if ad else (False, True)
         kind = cfg.vcs(refs["repo"])
         commands = ((prompts.READ_HEAD_GIT if git_readable(refs["repo"], kind) else "")
                     + (prompts.READ_HEAD_JJ if kind == "jj" else ""))
-        if not (shell and commands):
-            return prompts.READ_HEAD_FILES
         ids = {"repo": shlex.quote(refs["repo"]), "base": refs["base_commit_id"], "head": refs["head_commit_id"]}
-        return prompts.READ_HEAD_SHELL.format(commands=commands.format(**ids))
+        if snap is None or not snap.path:
+            reason = snap.reason.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace") \
+                if snap and snap.reason else ""
+            out = prompts.SNAPSHOT_NONE.format(reason=reason) if reason else ""
+            if not (shell and commands):
+                return out + prompts.READ_HEAD_FILES
+            return out + prompts.READ_HEAD_SHELL.format(commands=commands.format(**ids))
+        out = prompts.SNAPSHOT.format(path=snap.path, head=snap.head)
+        if snap.mode == "sparse":
+            out += prompts.SNAPSHOT_SPARSE.format(n=len(snap.files), total=snap.tree_files)
+        if listing and not lists:
+            out += prompts.SNAPSHOT_LIST.format(n=len(snap.files), files=snapshot.listing(snap))
+        if shell and commands:
+            out += prompts.SNAPSHOT_HISTORY.format(commands=commands.format(**ids))
+        return out
 
     def review_overview(self, t: dict, refs: dict, diff: str, what: str) -> str:
         """What comes before the diff (#93): the changed files, the change's commit messages
@@ -1346,8 +1404,9 @@ class Worker:
         if git_readable(repo, kind):
             # UTF-8 whatever i18n.logOutputEncoding says, and no signature check (log.showSignature
             # would run the configured verifier, outside any sandbox).
-            attempts.append(["git", "-c", "i18n.logOutputEncoding=UTF-8", "log", "--no-color", "--no-show-signature",
-                             "--no-mailmap", f"--max-count={MAX_COMMITS + 1}", "--format=%H%n%B%x00",
+            # Replacement objects ignored, as in every read of the pinned ids (#111).
+            attempts.append(["git", "--no-replace-objects", "-c", "i18n.logOutputEncoding=UTF-8", "log", "--no-color",
+                             "--no-show-signature", "--no-mailmap", f"--max-count={MAX_COMMITS + 1}", "--format=%H%n%B%x00",
                              f"{base}^{{commit}}..{head}^{{commit}}", "--"])
         if kind == "jj":
             attempts.append(["jj", "log", "--ignore-working-copy", "--no-graph", "--color=never",
@@ -1392,8 +1451,8 @@ class Worker:
         jj_argv = ["jj", "diff", "--ignore-working-copy", "--color=never", "--git", "--from", frm, "--to", refs["head_commit_id"]]
         # ^{commit}: a tree or blob id is not a reviewable commit, even though git diff takes one.
         # The trailing "--" keeps an unresolvable id from being read as a path.
-        git_argv = ["git", "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", *DIFF_PREFIXES,
-                    f"{frm}^{{commit}}", f"{refs['head_commit_id']}^{{commit}}", "--"]
+        git_argv = ["git", "--no-replace-objects", "diff", "--no-ext-diff", "--no-textconv",
+                    "--ignore-submodules=none", *DIFF_PREFIXES, f"{frm}^{{commit}}", f"{refs['head_commit_id']}^{{commit}}", "--"]
         if not tools:
             raise RuntimeError(f"could not compute diff: {repo} is not a jj or git repository")
         # In a colocated repo, --ignore-working-copy skips importing plain git commits,
@@ -1448,8 +1507,8 @@ class Worker:
 
         def git(*argv: str) -> subprocess.CompletedProcess | None:
             try:
-                return subprocess.run(["git", *argv], cwd=repo, env=env, capture_output=True, text=True,
-                                      timeout=120)
+                return subprocess.run(["git", "--no-replace-objects", *argv], cwd=repo, env=env,
+                                      capture_output=True, text=True, timeout=120)
             except (OSError, subprocess.TimeoutExpired):
                 return None
 
@@ -1512,7 +1571,8 @@ class Worker:
         of a wrong diagnosis."""
         for tool in tools:
             argv = (["jj", "log", "--ignore-working-copy", "--no-graph", "--color=never", "-r", sha, "-T", "commit_id"]
-                    if tool == "jj" else ["git", "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])
+                    if tool == "jj" else ["git", "--no-replace-objects", "rev-parse", "--verify", "--quiet",
+                                                f"{sha}^{{commit}}"])
             try:
                 out = subprocess.run(argv, cwd=repo, capture_output=True, text=True, timeout=60)
             except (OSError, subprocess.TimeoutExpired):
