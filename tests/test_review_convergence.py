@@ -183,6 +183,7 @@ def test_single_reviewer_pushback_and_budget(env, no_spawn):
     ({"verdict": "approve", "findings": [{"severity": "medium"}]}, "blocks approval"),
     ({"verdict": "approve", "findings": [{"severity": "low"}]}, None),
     ({"verdict": "request_changes", "findings": [{"severity": "high"}, {"severity": "low"}]}, None),
+    ({"verdict": "approve", "findings": [{"severity": "?"}]}, "needs a severity"),
 ])
 def test_verdict_must_match_its_severities(verdict, problem):
     found = verdict_problem(verdict)
@@ -231,3 +232,55 @@ def test_review_progress_shows_passes_not_max_rounds(env, no_spawn, capsys):
     assert "review pass 2, follow-ups 1/3:" in out and "r2/" not in out
     assert cli.main(["threads"]) == 0
     assert "pass2,fu1/3" in capsys.readouterr().out
+
+
+def test_hard_stop_holds_even_if_the_worker_died_before_parking(env, no_spawn):
+    set_config(env, review_followup_budget=1)
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review(None, str(repo), base, h1, reviewers=BOTH)["thread"]["id"]
+    run_job(bus, tid)
+    prev = h1
+    for text in ("two\n", "three\n"):
+        h = commit(text)
+        claude.request_review(None, str(repo), base, h, prev_head_commit_id=prev, reviewers=BOTH)
+        run_job(bus, tid)
+        prev = h
+    # As if the worker died after the verdict, before it parked the thread.
+    refs = {k: v for k, v in bus.thread(tid)["refs"].items() if k != "budget_parked"}
+    bus.set_thread(tid, status="open", refs=json.dumps(refs))
+    with pytest.raises(BusError) as e:
+        claude.request_review(None, str(repo), base, commit("four\n"), prev_head_commit_id=prev, reviewers=BOTH)
+    assert e.value.code == "REVIEW_LIMIT_REACHED"
+
+
+def test_single_reviewer_failed_pushback_keeps_the_request_for_changes(env, no_spawn, monkeypatch):
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(repo), base, h1)["thread"]["id"]
+    run_job(bus, tid)
+    claude.request_review("codex", str(repo), base, h1, prev_head_commit_id=h1, focus="evidence")
+    assert bus.review_standings(tid)["reviewers"]["codex"]["state"] == "reviewing"
+    monkeypatch.setenv("FAKE_EXHAUSTED", "codex")
+    run_job(bus, tid)
+    assert bus.thread(tid)["status"] == "needs_human"
+    assert bus.review_standings(tid)["changes_requested"] == ["codex"]
+
+
+def test_single_reviewer_note_after_approval_is_not_a_pushback(env, no_spawn, monkeypatch):
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(repo), base, h1)["thread"]["id"]
+    run_job(bus, tid)
+    first = claude.request_review("codex", str(repo), base, h1, prev_head_commit_id=h1, focus="evidence")
+    monkeypatch.setenv("FAKE_APPROVE", "codex")
+    run_job(bus, tid)  # the pushback convinced it
+    claude.send("thanks", thread=tid)
+    again = claude.request_review("codex", str(repo), base, h1, prev_head_commit_id=h1)
+    assert again["job"]["id"] == first["job"]["id"] and again["thread"]["follow_ups"] == 1

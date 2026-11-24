@@ -1257,8 +1257,11 @@ class Bus:
             # Single-reviewer verdicts carry no revision or base; they count for the thread's,
             # in the round they were given (a thread can return to an earlier round's head).
             on_base = m["data"].get("base_commit_id", base) if m else None
+            # A single reviewer's pushback pass (#71) is a new round on the same head: its
+            # request for changes stands until that pass gives a new verdict.
+            rounds = (t["round"], t["round"] - 1) if refs.get("pushback_round") == t["round"] else (t["round"],)
             current = (m["data"].get("revision") == refs.get("revision", 0) if "reviewers" in refs
-                       else at == head and m["round"] == t["round"]) if m else False
+                       else at == head and m["round"] in rounds) if m else False
             if m is None:
                 state = "pending"
             elif not current:

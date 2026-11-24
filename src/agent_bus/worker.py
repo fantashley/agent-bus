@@ -939,7 +939,10 @@ class Worker:
         # The self-contained prompt (first pass, retry, or a follow-up whose session can't be
         # resumed) always has the full base..head diff, the reviewer's earlier verdicts and
         # every note on the thread, so a fresh session never reviews a partial view.
-        approved = mine is not None and mine["data"].get("verdict") == "approve"
+        # It approved, and the head moved only because another reviewer asked for changes since.
+        approved = (mine is not None and mine["data"].get("verdict") == "approve" and bool(refs.get("reviewers"))
+                    and any(m["kind"] == "review_verdict" and m["id"] > mine["id"] and m["sender"] != reviewer
+                            and m["data"].get("verdict") == "request_changes" for m in everything))
         fresh = self.review_prompt(t, refs, full_diff, full_heading, notes(everything), earlier,
                                    approved=approved, pushback=pushback)
         replies = "\n\n".join(prompts.render_message(m) for m in notes([m for m in everything
@@ -1065,7 +1068,7 @@ class Worker:
                 converge += prompts.PUSHBACK_NOTE
             elif approved and refs.get("prev_head_commit_id"):
                 converge += prompts.ALREADY_APPROVED.format(prev=refs["prev_head_commit_id"])
-            converge += budget_note(t)
+        converge += budget_note(t)  # every pass, a reviewer's first one too
         notes = "\n\n".join(prompts.render_message(m) for m in replies)
         if earlier:
             notes = ("Your earlier verdicts on this change (from a session that could not be resumed):\n\n"
@@ -1273,6 +1276,8 @@ BLOCKING = ("high", "medium")
 def verdict_problem(v: dict) -> str | None:
     """Why a verdict breaks the severity rule (#71), or None: it requests changes if and
     only if a finding is high or medium."""
+    if any(f["severity"] not in (*BLOCKING, "low") for f in v["findings"]):
+        return "every finding needs a severity of high, medium or low"
     blocking = any(f["severity"] in BLOCKING for f in v["findings"])
     if v["verdict"] == "request_changes" and not blocking:
         return "request_changes needs at least one high or medium finding; with none, approve"

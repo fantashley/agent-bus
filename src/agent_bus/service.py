@@ -333,10 +333,13 @@ class Service:
                 repeat = self._pinned_request(t) == request
                 same = self._revision_pass(t) if repeat else None
                 if same and same["status"] == "done" and prev_head_commit_id == head_commit_id:
-                    # A note since the last verdict makes the same-head request a new
-                    # pushback (#71), not a retry of the one that pinned this pass.
+                    # Evidence since this pass asked for changes makes the same-head request a
+                    # new pushback (#71), not a retry of the one that pinned this pass: a note
+                    # since the verdict, or a focus if it hasn't been pushed back on yet.
                     mine = self.bus.last_verdict(t["id"], reviewer)
-                    if mine and self._note_since(t, mine["id"]) is not None:
+                    fresh = (old.get("pushbacks") or {}).get(reviewer) != current
+                    if self._single_pushback(t, mine, base_commit_id, head_commit_id) and (
+                            self._note_since(t, mine["id"]) is not None or (fresh and focus and focus.strip())):
                         repeat, same = False, None
                 if repeat and same is None:
                     # Pinned to this request with no pass for it (a thread #59 left without
@@ -364,9 +367,7 @@ class Service:
                     self._check_budget_park(t)
                     # The same head again after a request for changes is a pushback (#71).
                     mine = self.bus.last_verdict(t["id"], reviewer)
-                    pushback = (head_commit_id == current and base_commit_id == old.get("base_commit_id")
-                                and mine is not None and mine["data"].get("verdict") == "request_changes"
-                                and mine["data"].get("head_commit_id") == current)
+                    pushback = self._single_pushback(t, mine, base_commit_id, head_commit_id)
                     if pushback:
                         self._check_pushback(t, reviewer, mine, focus, (old.get("pushbacks") or {}).get(reviewer)
                                              == current)
@@ -441,15 +442,26 @@ class Service:
         b = self.config.review_followup_budget
         return {"follow_ups": 0, "followup_budget": b, "followup_limit": 2 * b}
 
-    @staticmethod
-    def _check_budget_park(t: dict) -> None:
-        """Refuse a follow-up on a review parked for the human by its follow-up limit."""
-        if t["status"] == "needs_human" and (t["refs"] or {}).get("budget_parked"):
-            p = review_progress(t)
+    def _check_budget_park(self, t: dict) -> None:
+        """Refuse a follow-up on a review past its follow-up limit that still asks for changes
+        (parked for the human, or about to be: a worker can die before parking it)."""
+        p = review_progress(t)
+        parked = t["status"] == "needs_human" and (t["refs"] or {}).get("budget_parked")
+        if parked or (p["follow_ups"] >= p["followup_limit"]
+                      and self.bus.review_standings(t["id"])["changes_requested"]):
             raise BusError("REVIEW_LIMIT_REACHED", f"{t['id']} still had changes requested after "
                            f"{p['follow_ups']} follow-up requests, so it waits for the human user: ask them to "
                            f"settle the open findings or run `agent-bus resume {t['id']}` to allow more "
                            "follow-ups, then request review again")
+
+    @staticmethod
+    def _single_pushback(t: dict, mine: dict | None, base: str, head: str) -> bool:
+        """Whether a single-reviewer request is a same-head pushback (#71): the reviewer's
+        verdict in the current pass asked for changes on this very base and head."""
+        refs = t["refs"] or {}
+        return (mine is not None and mine["round"] == t["round"] and mine["data"].get("verdict") == "request_changes"
+                and head == refs.get("head_commit_id") == mine["data"].get("head_commit_id")
+                and base == refs.get("base_commit_id") == mine["data"].get("base_commit_id", base))
 
     def _note_since(self, t: dict, after: int) -> int | None:
         """The requester's (or the human user's) newest note on ``t`` after message ``after``."""
