@@ -207,6 +207,50 @@ def test_whoami_flags_a_stale_nix_wrapped_server(env, no_spawn, monkeypatch, tmp
     assert "stale_build" not in whoami()
 
 
+def test_stale_build_shows_in_everyday_replies(env, no_spawn, monkeypatch, tmp_path):
+    """#92: a stale server is flagged in inbox, wait and the tools that start peers, not only
+    whoami, so an agent notices during normal use and tells the human."""
+    import asyncio
+    import sys
+    from agent_bus import mcp_server
+
+    def install(name):
+        exe = tmp_path / name / "bin" / "agent-bus"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\n")
+        exe.chmod(0o755)
+        return exe
+
+    old, new = install("old"), install("new")
+    profile = tmp_path / "profile" / "bin"
+    profile.mkdir(parents=True)
+    link = profile / "agent-bus"
+    link.symlink_to(old)
+    monkeypatch.setenv("PATH", f"{profile}:{os.environ['PATH']}")
+    monkeypatch.setattr(sys, "argv", [str(link), "mcp"])
+    monkeypatch.setattr(cfg, "_LAUNCHED_FROM", cfg._launched_from())
+    server = mcp_server.build("claude", bus=env["bus"])
+
+    def tool(name, **args):
+        return json.loads(asyncio.run(server.call_tool(name, args)).content[0].text)
+
+    tid = tool("send", body="hi", to="codex")["thread"]["id"]
+    from agent_bus import service
+    service.Service(env["bus"], agent="codex").send(body="hello", thread=tid)
+    replies = lambda: [tool("inbox"), tool("wait", thread=tid, timeout_s=1),  # noqa: E731
+                       tool("wait", thread=tid, after_message_id=0, timeout_s=1)]
+    first = replies()
+    assert not any("stale_build" in r for r in first)
+    assert first[2]["messages"]  # the replay returned early, not through the timeout
+    link.unlink()
+    link.symlink_to(new)
+    for r in replies():
+        assert r["stale_build"]["on_path"] == os.path.realpath(new)
+        assert "Tell the user" in r["stale_build"]["hint"]
+    # Also on a refused request: the agent can't fix that by retrying.
+    assert "stale_build" in tool("advance_discussion", thread=tid)
+
+
 # ------------------------------------------------- review fixes (t-a3faf1 pass 1)
 
 

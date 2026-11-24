@@ -634,12 +634,29 @@ Add [`docs/AGENTS-section.md`](docs/AGENTS-section.md) to the shared global agen
 
 ### Upgrading
 
-After `home-manager switch` (or `nixos-rebuild switch`), each client picks up the new build when
-it next starts its MCP server: a new session, `/reload-plugins` in Claude Code, or a restart of
-Codex or Antigravity. A running server, and the review workers it starts, stay on the build they
-started with until then; the `whoami` tool reports a `stale_build` when they differ from the
-`agent-bus` on PATH. A Claude Code subagent started before `/reload-plugins` keeps its own
-server on the old build until it finishes.
+After `home-manager switch` (or `nixos-rebuild switch`), restart the MCP server in each open
+session:
+- **Claude Code:** run `/reload-plugins` (or start a new session). It restarts a plugin's MCP
+  server only when the server's entry in `.mcp.json` has changed, so the plugin's entry carries
+  `AGENT_BUS_BUILD` (the build's store path) and every build looks different. The old server is
+  stopped, not left running. A subagent started before the reload keeps its own server on the
+  old build until it finishes. Hooks need nothing: each one runs the profile's `agent-bus`
+  afresh.
+- **Codex and Antigravity:** restart the client.
+
+Until then the running server, and the review workers it starts, stay on the old build. When it
+differs from the `agent-bus` on PATH, `whoami`, `inbox`, `wait`, `request_review`,
+`start_discussion` and `advance_discussion` replies carry a `stale_build` with both paths, and
+agents are asked to tell you. To check by hand, compare the store paths of the running servers
+with the installed one:
+
+```sh
+pgrep -af 'agent-bus.* mcp'            # one line per server, with its /nix/store/...-agent-bus-*/bin path
+readlink -f "$(command -v agent-bus)"  # the installed build
+```
+
+A server on another store path belongs to a session that hasn't reloaded yet. Closing a session
+stops its server.
 
 Claude Code records a marketplace's path when it first adds it and doesn't follow later changes
 to `settings.json`, which is why the plugin lives at a fixed path whose link each rebuild moves.

@@ -54,7 +54,16 @@ let
       version = cfg.package.version;
       description = "Talk to Codex and Antigravity over the local agent bus";
     }} $out/plugins/agent-bus/.claude-plugin/plugin.json
-    cp ${json.generate "mcp.json" { mcpServers.agent-bus = mcpEntry "claude" // { command = profileBin; }; }} \
+    # The command is the profile's agent-bus, the same path in every build. `/reload-plugins`
+    # only restarts a plugin's MCP server when its entry changes (a new plugin version alone
+    # doesn't count), so AGENT_BUS_BUILD names the build to make each build's entry differ.
+    # Checked with Claude Code 2.1.331 (#92).
+    cp ${json.generate "mcp.json" {
+      mcpServers.agent-bus = mcpEntry "claude" // {
+        command = profileBin;
+        env.AGENT_BUS_BUILD = "${cfg.package}";
+      };
+    }} \
       $out/plugins/agent-bus/.mcp.json
   '' + lib.optionalString cfg.claude.hooks.enable ''
     mkdir -p $out/plugins/agent-bus/hooks

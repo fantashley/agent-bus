@@ -665,4 +665,5 @@ def stale_build() -> dict | None:
     return {"running": _LAUNCHED_FROM, "on_path": on_path,
             "hint": "This agent-bus MCP server is a different build from the agent-bus on PATH "
                     "(likely started before an upgrade), and the review workers it starts use it "
-                    "too. Restart it: /reload-plugins in Claude Code, or restart the client."}
+                    "too. Tell the user to restart it: /reload-plugins in Claude Code, or restart "
+                    "the client."}
