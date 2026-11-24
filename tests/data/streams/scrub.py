@@ -5,7 +5,9 @@
 Keeps every event, key and the event order; replaces ids (in values and keys) with
 stable placeholders, local paths with /repo and /home/user, thinking signatures with
 "redacted", account-specific values (quota utilization, reset times, credit balances,
-credential expiry, socket paths) with synthetic ones, and trims long lists to three entries.
+credential expiry, socket paths) with synthetic ones, a Claude init event's lists of installed
+commands, skills, plugins, MCP servers and agents with fixed placeholders, and trims long
+lists to three entries.
 
 It works one string at a time, so text a CLI streams in fragments (Antigravity's
 text_delta) can still spell out a path once joined.  Capture with prompts whose
@@ -18,7 +20,7 @@ import os
 import re
 
 UUID = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
-PREFIXED = re.compile(r"\b(msg|toolu|req|call|item)_[A-Za-z0-9]{6,}\b")
+PREFIXED = re.compile(r"\b(msg|toolu|req|call|item)_(?:bdrk_)?[A-Za-z0-9]{6,}\b")
 
 # Account-specific values, replaced with synthetic ones of the same type.
 SYNTHETIC = {
@@ -32,6 +34,25 @@ SYNTHETIC = {
     "credential_expires_at": "2099-01-01T00:00:00.000Z",
     "messaging_socket_path": "/run/user/1000/agent.sock",
 }
+
+
+# What a Claude Code init event lists of the capturing machine's own tooling (commands,
+# skills, plugins, MCP servers, agents) says nothing the parser needs and can name private
+# or employer-internal tools: replaced with the same neutral placeholders in every fixture.
+INIT_PLACEHOLDERS = {
+    "slash_commands": ["example-command"],
+    "skills": ["example-skill"],
+    "plugins": [{"name": "example-plugin", "path": "builtin", "source": "example-plugin@builtin"}],
+    "mcp_servers": [],
+    "agents": ["general-purpose"],
+}
+
+
+def neutral_init(obj: dict) -> dict:
+    """``obj`` with a Claude init event's tooling lists replaced by INIT_PLACEHOLDERS."""
+    if obj.get("type") == "system" and obj.get("subtype") == "init":
+        return {k: (INIT_PLACEHOLDERS[k] if k in INIT_PLACEHOLDERS else v) for k, v in obj.items()}
+    return obj
 
 
 def main() -> None:
@@ -74,7 +95,7 @@ def main() -> None:
         for line in src:
             line = line.strip()
             if line:
-                dst.write(json.dumps(scrub(json.loads(line)), ensure_ascii=False) + "\n")
+                dst.write(json.dumps(scrub(neutral_init(json.loads(line))), ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":

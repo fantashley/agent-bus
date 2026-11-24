@@ -41,12 +41,34 @@ RESERVED_NAMES = frozenset({"human", "system"})
 # What a participant entry may set.  Launch settings (everything but ``harness``) default
 # to the harness's own ``peers.<harness>`` entry.
 PARTICIPANT_KEYS = frozenset({"harness", "model", "effort", "command", "args", "web_search", "allow_mcp", "account",
-                              "codex_home"})
+                              "codex_home", "env"})
 # The account a participant's usage counts against, when it isn't the harness's default
 # one (a wrapper command or args that sign in elsewhere).  Scopes usage blocks (#26, #43).
 _ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}")
 
-_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,99}")
+# Up to 256 characters: a Bedrock inference-profile ARN with a long model id runs past 100
+# (arn:aws:bedrock:<region>:<account>:inference-profile/global.anthropic.…-v1:0), #36.
+_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,255}")
+
+# A peer's own environment variables (``env`` in a peers or participants entry, #36): non-secret
+# settings such as AWS_PROFILE, AWS_REGION and CLAUDE_CODE_USE_BEDROCK.  config.json is not a
+# place for credentials (Home Manager puts it in the Nix store), so obvious secrets are refused:
+# this catches common mistakes, it is not a guarantee.
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SECRET_NAMES = frozenset({
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY", "CODEX_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"})
+_SECRET_NAME = re.compile(r"(?:^|_)(?:SECRET|PASSWORD|PASSWD|TOKEN|API_?KEY|ACCESS_KEY|PRIVATE_KEY)(?:_|$)",
+                          re.IGNORECASE)
+_SECRET_VALUE = re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{12,}|sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}"
+                           r"|-----BEGIN ")
+# A configured value that is safe to quote in a notice (an AWS profile name).
+ENV_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}")
+_AWS_REGION = re.compile(r"[a-z]{2}(?:-[a-z]+)+-\d+")
+# Set by agent-bus itself, or by a launch setting of its own.  PATH too: agent-bus finds and
+# fingerprints the CLI on its own PATH, so the turn must launch the same one (use `command`).
+_RESERVED_ENV = re.compile(r"AGENT_BUS_.*|CODEX_HOME|PATH")
 
 
 @dataclass(frozen=True)
@@ -104,6 +126,8 @@ def _check_launch(where: str, harness: str, entry: dict, who: str) -> None:
     account = entry.get("account")
     if account is not None and not (isinstance(account, str) and _ACCOUNT.fullmatch(account)):
         raise ValueError(f"{where}.account must be a short label (letters, digits and ._@+-), got {account!r}")
+    if "env" in entry:
+        _check_env(where, entry["env"])
     if "codex_home" in entry:
         home = entry["codex_home"]
         if harness != "codex":
@@ -112,10 +136,49 @@ def _check_launch(where: str, harness: str, entry: dict, who: str) -> None:
             raise ValueError(f"{where}.codex_home must be an absolute path (or start with ~), got {home!r}")
 
 
+def _check_env(where: str, env: object) -> None:
+    """A launch setting's ``env``: names and string values, no secrets.  Errors name the
+    variable, never its value."""
+    if not isinstance(env, dict):
+        raise ValueError(f"{where}.env must be an object of variable names to string values")
+    for name, value in env.items():
+        if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
+            raise ValueError(f"{where}.env: invalid variable name {name!r}")
+        if _RESERVED_ENV.fullmatch(name):
+            hint = {"CODEX_HOME": " (use codex_home)", "PATH": " (set command to the CLI's path)"}.get(name, "")
+            raise ValueError(f"{where}.env.{name} is set by agent-bus itself{hint}")
+        if name.upper() in _SECRET_NAMES or _SECRET_NAME.search(name):
+            raise ValueError(f"{where}.env.{name} looks like a credential: config.json must not hold secrets. "
+                             "Point at a profile instead (AWS_PROFILE, an SSO session or credential_process)")
+        if not isinstance(value, str) or "\0" in value:
+            raise ValueError(f"{where}.env.{name} must be a string")
+        if _SECRET_VALUE.search(value):
+            raise ValueError(f"{where}.env.{name} looks like it holds a credential: config.json must not hold "
+                             "secrets")
+        if name in ("AWS_REGION", "AWS_DEFAULT_REGION") and not _AWS_REGION.fullmatch(value):
+            raise ValueError(f"{where}.env.{name} is not an AWS region name like us-east-1")
+
+
+def _truthy(value: str | None) -> bool:
+    """How Claude Code reads a switch such as CLAUDE_CODE_USE_BEDROCK."""
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _home(path: str | None) -> str | None:
     """A configured ``codex_home`` as Codex is given it: only ``~`` expanded, since a lexical
     cleanup of ``..`` could pick another directory than a symlinked path really is."""
     return os.path.expanduser(path) if path else None
+
+
+# Claude Code's own config directory holds its first-party login.
+_CREDENTIAL_FILES = ("AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "CLAUDE_CONFIG_DIR", "HOME")
+
+
+def _credential_key(env: dict) -> tuple:
+    """What picks a Claude participant's credentials, as configured: Bedrock or not, which
+    AWS profile, the AWS files that define it, and Claude Code's config directory."""
+    return (_truthy(env.get("CLAUDE_CODE_USE_BEDROCK")), env.get("AWS_PROFILE") or None,
+            *(env.get(k) or None for k in _CREDENTIAL_FILES))
 
 
 def _same_home(path: str | None) -> str | None:
@@ -212,6 +275,7 @@ class Config:
                 _check_launch(f"peers.{agent}", agent, entry, agent)
         named = conf._resolve_participants()
         conf._check_codex_homes(named)
+        conf._check_claude_credentials(named)
         for key in conf.peers:
             if key not in HARNESS_INFO and key in named:
                 raise ValueError(f"peers.{key}: `peers` is keyed by harness; set {key}'s launch settings "
@@ -254,7 +318,11 @@ class Config:
         _check_launch(where, harness, entry, name)
         base = self.peers.get(harness) if isinstance(self.peers.get(harness), dict) else {}
         own = {k: v for k, v in entry.items() if k != "harness"}
-        return Participant(name, harness, {**base, **own})
+        merged = {**base, **own}
+        if isinstance(base.get("env"), dict) or isinstance(own.get("env"), dict):
+            # Variable by variable: a participant adds to (or overrides) its harness's env.
+            merged["env"] = {**(base.get("env") or {}), **(own.get("env") or {})}
+        return Participant(name, harness, merged)
 
     def _check_codex_homes(self, named: dict[str, Participant]) -> None:
         """Usage readings come from a participant's CODEX_HOME but are kept per harness and
@@ -289,6 +357,32 @@ class Config:
             if home is not None:
                 account_of.setdefault(home, (name, account))
             home_of.setdefault(account, (name, home))
+
+    def _check_claude_credentials(self, named: dict[str, Participant]) -> None:
+        """Like codex homes (#66): which provider and AWS profile a Claude participant uses
+        tells logins apart (#36), and blocks (out of usage, expired credentials) are kept per
+        harness and account.  So a participant whose configured CLAUDE_CODE_USE_BEDROCK or
+        AWS_PROFILE differs from its harness's needs an account of its own, and one account
+        label never names two credential selections."""
+        base = self.peers.get("claude") if isinstance(self.peers.get("claude"), dict) else {}
+        default = _credential_key(base.get("env") or {})
+        harness_account = base.get("account") or None
+        seen: dict[str | None, tuple[str, tuple]] = {}  # account -> (participant, credentials)
+        for name, p in named.items():
+            if p.harness != "claude":
+                continue
+            creds = _credential_key(p.settings.get("env") or {})
+            account = p.settings.get("account") or None
+            if creds != default and (account is None or account == harness_account):
+                raise ValueError(f"participants.{name}.env selects other credentials than the claude harness's "
+                                 f"(CLAUDE_CODE_USE_BEDROCK, AWS_PROFILE, AWS config files, CLAUDE_CONFIG_DIR or HOME), so set participants.{name}.account to a "
+                                 "label of its own (usage limits and expired credentials are tracked per account)")
+            if account in seen and seen[account][1] != creds:
+                raise ValueError(f"participants {seen[account][0]} and {name} use different credentials "
+                                 f"(CLAUDE_CODE_USE_BEDROCK, AWS_PROFILE, AWS config files, CLAUDE_CONFIG_DIR or HOME) but "
+                                 "the same account "
+                                 f"{account or '(the default)'}: give each its own account label")
+            seen.setdefault(account, (name, creds))
 
     def participant_map(self) -> dict[str, Participant]:
         # Resolved on every call (it's a handful of entries): tests and callers may change
@@ -389,6 +483,26 @@ class Config:
         """The CODEX_HOME ``agent``'s turns run with, if configured (#66); None leaves the
         child the worker's own (``$CODEX_HOME``, else ``~/.codex``)."""
         return _home(self.launch(agent).get("codex_home"))
+
+    def peer_env(self, agent: str) -> dict[str, str]:
+        """The environment variables ``agent``'s turns get on top of the worker's own (#36)."""
+        return dict(self.launch(agent).get("env") or {})
+
+    def effective_env(self, agent: str, name: str) -> str | None:
+        """``name`` as ``agent``'s CLI is given it: its configured env, else the worker's.
+        (A CLI may still set it from its own settings, which agent-bus doesn't read.)"""
+        env = self.peer_env(agent)
+        return env[name] if name in env else os.environ.get(name)
+
+    def bedrock(self, agent: str) -> bool:
+        """Whether ``agent`` runs Claude Code on Amazon Bedrock, as far as agent-bus can tell."""
+        return self.harness_of(agent) == "claude" and _truthy(self.effective_env(agent, "CLAUDE_CODE_USE_BEDROCK"))
+
+    def aws_region(self, agent: str) -> str | None:
+        return self.effective_env(agent, "AWS_REGION") or self.effective_env(agent, "AWS_DEFAULT_REGION") or None
+
+    def aws_profile(self, agent: str) -> str | None:
+        return self.effective_env(agent, "AWS_PROFILE") or None
 
     def _repo_entries(self) -> list[dict]:
         """``repos`` as {"path", "web_search"?} entries: a bare string is a path."""

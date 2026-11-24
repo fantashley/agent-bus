@@ -228,6 +228,18 @@ in
               a home other than the harness's needs an `account` of its own.
             '';
           };
+          env = lib.mkOption {
+            type = lib.types.nullOr (lib.types.attrsOf lib.types.str);
+            default = null;
+            example = { AWS_PROFILE = "bedrock-work"; };
+            description = ''
+              Environment variables for its headless turns, on top of its harness's
+              `peerSettings.<harness>.env` (variable by variable). Non-secret settings only:
+              agent-bus refuses credential-looking names and values. A Claude participant whose
+              `CLAUDE_CODE_USE_BEDROCK` or `AWS_PROFILE` differs from its harness's needs an
+              `account` of its own. See README "Running peers on Amazon Bedrock".
+            '';
+          };
           command = lib.mkOption {
             type = lib.types.nullOr lib.types.str;
             default = null;
@@ -280,13 +292,25 @@ in
               entry can also turn it off for every agent in that repo.
             '';
           };
+          env = lib.mkOption {
+            type = lib.types.nullOr (lib.types.attrsOf lib.types.str);
+            default = null;
+            example = { CLAUDE_CODE_USE_BEDROCK = "1"; AWS_PROFILE = "bedrock"; AWS_REGION = "us-east-2"; };
+            description = ''
+              Environment variables for this agent's headless turns, applied to every turn
+              whichever client queued it (null: none beyond the worker's own). For Claude Code
+              they're also passed as `--settings` env, so they beat ~/.claude/settings.json.
+              Never put credentials here (the file is in the Nix store, and agent-bus refuses
+              credential-looking names and values): point at an AWS profile instead.
+            '';
+          };
         };
       });
       default = { };
       example = lib.literalExpression ''{ codex.effort = "high"; claude.model = "opus"; }'';
       description = ''
-        Per-agent model, reasoning effort and web search for the headless peers agent-bus
-        runs in discussions and reviews. A discussion or review can override model and effort
+        Per-agent model, reasoning effort, web search and environment for the headless peers
+        agent-bus runs in discussions and reviews. A discussion or review can override model and effort
         per thread.
       '';
     };

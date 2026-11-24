@@ -110,7 +110,7 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
                 for e in bus.events(args.thread, after_id=last_ev, agent=args.peer):
                     last_ev = e["id"]
                     if e["kind"] in ("text", "tool", "thinking", "turn_start", "turn_end", "error", "format",
-                                       "relaunch"):
+                                       "relaunch", "api_retry"):
                         who = e["agent"] or "worker"
                         print(_color(SYSTEM, f"  · {who} {e['kind']}: {e['text']}", color), flush=True)
             st = peer_status(bus, args.thread, args.peer) if args.peer else thread_status(bus, args.thread)
@@ -535,9 +535,15 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
                 near = any(w["used"] >= conf.usage_warn_at for w in limits[a])
                 print(f"       usage limits{' (NEAR THE LIMIT)' if near else ''}: "
                       + "; ".join(map(quota.describe_window, limits[a])))
+            if conf.bedrock(a):
+                print(f"       Amazon Bedrock: AWS_PROFILE {conf.aws_profile(a) or '(default)'}, "
+                      f"AWS_REGION {conf.aws_region(a) or '(default)'}")
             for b in blocks.get(a, []):
                 when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(b["until"]))
-                print(f"       out of usage{' for model ' + b['scope'] if b['scope'] else ''} until {when}"
+                if quota.is_auth(b):
+                    print(f"       AUTH_REQUIRED: {quota.describe(a, b)}; to fix it, {quota.auth_hint(conf, a)}")
+                    continue
+                print(f"       {'throttled' if b['source'] == 'throttle' else 'out of usage'}{' for model ' + b['scope'] if b['scope'] else ''} until {when}"
                       f"{' (estimated)' if b['estimated'] else ''}: {b['reason'] or 'usage limit reached'}")
         return 0
     if args.cmd == "usage":

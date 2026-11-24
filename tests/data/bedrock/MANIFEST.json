@@ -1,0 +1,41 @@
+{
+  "_doc": "Scrubbed real Claude Code streams from Amazon Bedrock failures (issue #36), captured 2026-11-23 with Claude Code 2.1.330 on an SSO profile in us-east-2 using `claude -p --output-format stream-json --verbose --permission-mode plan --strict-mcp-config --max-turns 1 --model <id>` with the prompt on stdin; scrubbed with tests/data/streams/scrub.py, account ids redacted, reviewed by hand. `exit` is the CLI's exit status; `expect` is how agent-bus must classify the failed turn. Throttling, service-quota and AccessDenied errors were not captured (they need load or another account): tests/test_bedrock.py covers their documented wording with synthetic errors.",
+  "fixtures": [
+    {
+      "file": "claude-sso-token-missing.jsonl",
+      "exit": 1,
+      "expect": "auth",
+      "scenario": "AWS_PROFILE's SSO session has no cached token (a renamed SSO session in a temporary AWS config; the same path as an expired one): two api_retry events with error cloud_credential_error, then an is_error result"
+    },
+    {
+      "file": "claude-invalid-model-id.jsonl",
+      "exit": 1,
+      "expect": "config",
+      "scenario": "--model us.anthropic.claude-nonexistent-9-v1:0: 400 The provided model identifier is invalid (error model_not_found)"
+    },
+    {
+      "file": "claude-base-model-id.jsonl",
+      "exit": 1,
+      "expect": "config",
+      "scenario": "--model anthropic.claude-haiku-4-5-20251001-v1:0 (a base model id, no inference profile): 400 on-demand throughput isn't supported"
+    },
+    {
+      "file": "claude-wrong-region.jsonl",
+      "exit": 1,
+      "expect": "config",
+      "scenario": "a us.* inference profile with AWS_REGION=eu-west-1 (user settings off): the same 400 as an invalid id"
+    },
+    {
+      "file": "claude-foreign-application-profile.jsonl",
+      "exit": 1,
+      "expect": "config",
+      "scenario": "--model arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/abcdef123456 (a made-up account's application inference profile): the same 400"
+    },
+    {
+      "file": "claude-unresolvable-region.jsonl",
+      "exit": 124,
+      "expect": "retrying",
+      "scenario": "AWS_REGION=us-nowhere-1: api_retry events with error unknown (up to 10) and no result before `timeout 120` killed it"
+    }
+  ]
+}

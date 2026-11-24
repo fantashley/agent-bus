@@ -3,6 +3,10 @@
 A peer can't take another turn in a discussion, until something outside it changes, when:
 
 - ``quota``: its agent is out of usage (see quota.py; the block is shared and expires), or
+- ``auth``: its CLI couldn't load or refresh its credentials (#36): a block like ``quota``'s,
+  but one that lasts until the human signs it in again and retries, and never auto-resumes, or
+- ``config``: its model provider refused the model or region it asked for (#36), recorded like
+  ``format`` drift, or
 - ``format``: its CLI exited normally with output agent-bus can't use (PEER_FORMAT_CHANGED).
   That is recorded per discussion and lasts until `agent-bus resume` clears it.
 
@@ -13,7 +17,7 @@ turn the CLI stopped partway through (PEER_TURN_INCOMPLETE), are not covered: th
 asked again.
 
 Shared by the service (admission) and the worker (rounds).  Each reason is a dict with
-``why`` ("quota" or "format") and the block or drift row it came from.
+``why`` ("quota", "auth" or "format") and the block or drift row it came from.
 """
 
 from __future__ import annotations
@@ -23,15 +27,20 @@ from dataclasses import dataclass
 from . import config as cfg
 from . import quota
 
-CODES = {"quota": "USAGE_EXHAUSTED", "format": "PEER_FORMAT_CHANGED"}
+CODES = {"quota": "USAGE_EXHAUSTED", "auth": "AUTH_REQUIRED", "format": "PEER_FORMAT_CHANGED",
+         "config": "PEER_MISCONFIGURED"}
+# A peer_drift row with this version records a model or region its provider refused (#36),
+# kept like format drift: per discussion, until `agent-bus resume`.
+CONFIG_MARK = "(misconfigured)"
 
 
 def peers(bus, config: cfg.Config, t: dict) -> dict[str, dict]:
     """{peer: reason} for this discussion's headless peers that can't vote again.  Out of
     usage wins over format drift: it says when the peer may be back."""
-    out = {p: {"why": "format", **d} for p, d in bus.peer_drift(t["id"]).items()
-           if p in t["participants"] and p != t["initiator"]}
-    out.update({p: {"why": "quota", "block": b} for p, b in quota.blocked_peers(bus, config, t).items()})
+    out = {p: {"why": "config" if d["version"] == CONFIG_MARK else "format", **d}
+           for p, d in bus.peer_drift(t["id"]).items() if p in t["participants"] and p != t["initiator"]}
+    out.update({p: {"why": "auth" if quota.is_auth(b) else "quota", "block": b}
+                for p, b in quota.blocked_peers(bus, config, t).items()})
     return out
 
 
@@ -78,13 +87,17 @@ def code(stuck: dict[str, dict]) -> str:
     return CODES[whys.pop()] if len(whys) == 1 else "PEERS_CANNOT_VOTE"
 
 
-def describe(peer: str, reason: dict, thread: str) -> str:
+def describe(peer: str, reason: dict, thread: str, config: cfg.Config | None = None) -> str:
     """Fixed wording, plus the CLI version the drift notice also names."""
-    if reason["why"] == "quota":
-        return quota.message(peer, "peer", reason["block"])
+    if reason["why"] in ("quota", "auth"):
+        return quota.message(peer, "peer", reason["block"], config)
+    if reason["why"] == "config":
+        return (f"peer {peer}'s model provider refused its model or region. Fix its configuration, then run "
+                f"`agent-bus resume {thread}`; a model set for this thread only stays with it, so for that cancel "
+                "the thread and start a new one with a corrected model.")
     return (f"peer {peer} ({reason['version']}) exited normally {reason['reason']}, so its output format has "
             f"probably changed. Run `agent-bus resume {thread}` once it's fixed.")
 
 
-def explain(stuck: dict[str, dict], thread: str) -> str:
-    return " ".join(describe(p, r, thread) for p, r in stuck.items())
+def explain(stuck: dict[str, dict], thread: str, config: cfg.Config | None = None) -> str:
+    return " ".join(describe(p, r, thread, config) for p, r in stuck.items())

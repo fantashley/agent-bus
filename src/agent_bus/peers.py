@@ -61,6 +61,9 @@ class TurnResult:
     limits: list[dict] | None = None
     # ``usage`` counts only the steps reported before the turn stopped without its final report.
     partial_usage: bool = False
+    # The provider refused the model or region (a wrong model id or inference profile, a
+    # region without it, no access to it; #36): retrying or repairing can't help.
+    config_error: bool = False
 
 
 @dataclass
@@ -88,6 +91,8 @@ class StreamState:
     pending: dict = field(default_factory=dict)  # step index -> tool name, for tool steps with no end state
     failed_tools: set = field(default_factory=set)  # names of tool steps that ended in an error
     denied: list = field(default_factory=list)  # actions the CLI reported denying (sanitised labels)
+    api_error: str | None = None  # Claude: the last API error's own type ("model_not_found", ...)
+    api_status: int | None = None  # and its HTTP status, if it gave one
 
 
 Emit = Callable[[str, str], None]  # (kind, text)
@@ -149,11 +154,16 @@ class Adapter:
         # set, so a participant without one keeps the evidence it had (#66).
         if launch.get("codex_home"):
             material["codex_home"] = self.config.codex_home(self.participant)
+        # Its own environment can point the CLI at another config (CLAUDE_CONFIG_DIR, ...): only
+        # when set, likewise (#36).
+        if self.config.peer_env(self.participant):
+            material["env"] = self.config.peer_env(self.participant)
         return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
     def child_env(self) -> dict[str, str]:
-        """Environment variables the participant's launch settings give its CLI."""
-        return {}
+        """Environment variables the participant's launch settings give its CLI: its
+        configured ``env`` (#36), on top of the worker's own."""
+        return self.config.peer_env(self.participant)
 
     def setting_args(self) -> list[str]:
         """This CLI's flags for the configured model and effort (none: its defaults)."""
@@ -200,6 +210,10 @@ class Adapter:
     # Kept narrow on purpose: a bare 429, "overloaded", or RESOURCE_EXHAUSTED without
     # quota wording stays an ordinary error.
     quota_patterns: tuple[str, ...] = ()
+
+    def misconfigured(self, st: StreamState, error: str) -> bool:
+        """Whether a failed turn was refused because of the model or region it asked for."""
+        return False
 
     def classify(self, st: StreamState, error: str) -> dict | None:
         """Whether a failed turn ran out of usage: structured evidence first, then text."""
@@ -314,13 +328,18 @@ class Adapter:
                               timed_out=True, usage=st.usage, partial_usage=partial, limits=limits)
         if rc != 0 or st.error:
             err = st.error or f"exit {rc}: {''.join(stderr_tail)[-800:]}"
+            # err already ends with the stderr tail unless the stream reported its own error.
+            full = err + "\n" + "".join(stderr_tail)[-800:] if st.error else err
             try:
-                # err already ends with the stderr tail unless the stream reported its own error.
-                quota = self.classify(st, err + "\n" + "".join(stderr_tail)[-800:] if st.error else err)
+                quota = self.classify(st, full)
             except Exception:  # noqa: BLE001 - classification is best-effort
                 quota = None
+            try:
+                config_error = not quota and self.misconfigured(st, full)
+            except Exception:  # noqa: BLE001
+                config_error = False
             return TurnResult(ok=False, text=text, external_id=st.external_id, error=err, usage=st.usage,
-                              partial_usage=partial, limits=limits, quota=quota)
+                              partial_usage=partial, limits=limits, quota=quota, config_error=config_error)
         # Exited normally: the reply and a session id to resume are both required.
         missing = [what for what, ok in (("a reply", text.strip()), ("a session id", st.external_id)) if not ok]
         # Only the reply missing: the stream itself may show why the turn stopped early.  A
@@ -730,7 +749,8 @@ def _strip_flags(args: list[str], flags: set[str], config_keys: set[str] = froze
 class ClaudeAdapter(Adapter):
     agent = "claude"
     # 2: --tools limits the built-in tool inventory, not just what is pre-approved (issue #46).
-    recipe = "2"
+    # 3: one --settings of agent-bus's own: awsAuthRefresh off, and the configured env (#36).
+    recipe = "3"
     known_events = frozenset({"system", "assistant", "user", "result", "rate_limit_event", "stream_event"})
     default_command = cfg.AGENT_INFO["claude"]["cli"]
     # Read-only tools only. No Bash at all: `jj`/`git` accept flags (--tool, --output,
@@ -757,14 +777,33 @@ class ClaudeAdapter(Adapter):
         else:
             sid = new_uuid()
             argv += ["--session-id", sid]
-        argv += _strip_flags(self.extra_args(), {"--tools"})  # ours is the whole inventory
+        argv += ["--settings", json.dumps(self.flag_settings(), sort_keys=True)]
+        # Ours is the whole inventory, and the only flag settings (a second --settings could
+        # turn the credential refresh back on).
+        argv += _strip_flags(self.extra_args(), {"--tools", "--settings"})
         return Invocation(argv=argv, stdin=prompt, external_id=sid)
+
+    def flag_settings(self) -> dict:
+        """Settings passed with --settings, which outrank the user's and project's own
+        (Claude Code 2.1.330, live probe 2026-11-23; only managed settings outrank them):
+        - ``awsAuthRefresh`` off: with expired AWS credentials Claude Code runs it even in
+          print mode, and it is typically an interactive `aws sso login` (#36);
+        - the configured env, since a settings file's ``env`` beats the process env, so
+          AWS_REGION or AWS_PROFILE from ~/.claude/settings.json would win otherwise."""
+        out: dict = {"awsAuthRefresh": ""}
+        env = self.config.peer_env(self.participant)
+        if env:
+            out["env"] = env
+        return out
 
     def parse_line(self, obj, st, emit):
         typ = obj.get("type")
         if obj.get("session_id"):
             st.external_id = obj["session_id"]
         if typ == "assistant":
+            if isinstance(obj.get("error"), str):  # an API error the CLI turned into a message
+                st.api_error = obj["error"]
+                st.api_status = _num(obj.get("api_error_status"))
             for block in obj.get("message", {}).get("content", []) or []:
                 if block.get("type") == "text" and block.get("text"):
                     st.text_parts.append(block["text"])
@@ -774,10 +813,17 @@ class ClaudeAdapter(Adapter):
                     hint = (inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("query")
                             or inp.get("url") or "")
                     emit("tool", _short(f"{block.get('name')} {hint}".strip()))
+        elif typ == "system" and obj.get("subtype") == "api_retry":
+            # The CLI retrying a failed API call itself: worth seeing when a turn hangs (a
+            # region that doesn't resolve retries 10 times).  Its own fields only, checked.
+            kind = obj.get("error") if isinstance(obj.get("error"), str) and _WORD.fullmatch(obj["error"]) else "?"
+            emit("api_retry", f"api retry {_num(obj.get('attempt'))}/{_num(obj.get('max_retries'))}: {kind}")
         elif typ == "rate_limit_event" and isinstance(obj.get("rate_limit_info"), dict):
             st.rate_limit = obj["rate_limit_info"]
             st.rate_limit_at = time.time()  # when the reading arrived, not when the turn ends
         elif typ == "result":
+            if obj.get("is_error") and _num(obj.get("api_error_status")) is not None:
+                st.api_status = obj["api_error_status"]
             st.usage = usage_from(obj.get("usage"), CLAUDE_USAGE)
             thinking = (obj.get("usage") or {}).get("output_tokens_details") if isinstance(obj.get("usage"), dict) else None
             if isinstance(thinking, dict) and _num(thinking.get("thinking_tokens")) is not None:
@@ -801,6 +847,10 @@ class ClaudeAdapter(Adapter):
         return [{**w, "observed_at": st.rate_limit_at} for w in out if w] or None
 
     def classify(self, st, error):
+        # Credentials (#36): Claude Code's own error type, else the AWS SDK's wording.  First:
+        # an earlier step's "allowed" rate-limit status says nothing about them.
+        if st.api_error in _CLAUDE_AUTH_ERRORS or any(re.search(p, error) for p in _AWS_AUTH):
+            return {"resets_at": None, "source": "auth"}
         # Structured: the effective rate-limit status says this request was rejected, and
         # no overage covers it.  Seen live on Claude Code 2.1.x as status allowed/rejected.
         info = st.rate_limit
@@ -812,8 +862,39 @@ class ClaudeAdapter(Adapter):
                 return {"resets_at": float(reset) if isinstance(reset, (int, float)) and reset > 0 else None,
                         "source": "structured"}
             return None
+        if self.config.bedrock(self.participant):
+            # Bedrock sends no rate_limit_event (live probe 2026-11-23); its limits come as
+            # errors once the CLI's own retries are spent.  Wording from the AWS docs.
+            if any(re.search(p, error, re.IGNORECASE) for p in _BEDROCK_QUOTA):
+                return {"resets_at": _reset_from_text(error), "source": "heuristic"}
+            if st.api_status == 429 or any(re.search(p, error) for p in _BEDROCK_THROTTLE):
+                return {"resets_at": _reset_from_text(error), "source": "throttle"}
         return super().classify(st, error)
 
+    def misconfigured(self, st, error):
+        # A wrong model id or inference profile, a region without it, or no access to it:
+        # Bedrock answers all of them alike (live probes 2026-11-23, tests/data/bedrock).
+        return st.api_error == "model_not_found" or any(re.search(p, error) for p in _BEDROCK_CONFIG)
+
+
+_WORD = re.compile(r"[a-z0-9_]{1,40}")
+# Claude Code's API error types for credentials it couldn't load or that were refused.  Seen
+# live: cloud_credential_error (missing SSO token, 2.1.330).
+_CLAUDE_AUTH_ERRORS = frozenset({"cloud_credential_error", "authentication_failed"})
+# AWS SDK credential failures (the first one seen live, the rest as AWS documents them).
+# AccessDeniedException is not one: the credentials worked, the model isn't allowed.
+_AWS_AUTH = (r"Could not load AWS credentials", r"SSO session .{0,80}(?:not found|expired|invalid)",
+             r"\bExpiredToken(?:Exception)?\b", r"security token included in the request is (?:expired|invalid)",
+             r"\bUnrecognizedClientException\b", r"\bInvalidSignatureException\b")
+# Bedrock's account quotas (ServiceQuotaExceededException; "Too many tokens per day" for the
+# daily token quota): a usage block for that model and region.
+_BEDROCK_QUOTA = (r"\bServiceQuotaExceededException\b", r"too many tokens per day")
+# Request-rate throttling (ThrottlingException, HTTP 429): a short cooldown.
+_BEDROCK_THROTTLE = (r"\bThrottlingException\b", r"\bToo many requests\b", r"\b429 Too many")
+# The model or region refused: Bedrock's ValidationException wording (seen live) and an
+# AccessDeniedException for a model the account or region has no access to (documented).
+_BEDROCK_CONFIG = (r"provided model identifier is invalid", r"with on-demand throughput isn.t supported",
+                   r"\bAccessDeniedException\b", r"(?:don't|do not) have access to the model")
 
 CLAUDE_USAGE = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cache_read_input_tokens",
                 "cache_write": "cache_creation_input_tokens"}
@@ -915,7 +996,8 @@ class CodexAdapter(Adapter):
         self.home = Path(home) if home else None
 
     def child_env(self) -> dict[str, str]:
-        return {"CODEX_HOME": str(self.home)} if self.home else {}
+        env = super().child_env()
+        return {**env, "CODEX_HOME": str(self.home)} if self.home else env
 
     def setting_args(self) -> list[str]:
         args = []
@@ -1095,14 +1177,24 @@ class AntigravityAdapter(Adapter):
             return
         base = self.config.peers.get(self.agent) if isinstance(self.config.peers.get(self.agent), dict) else {}
         if (self.command != os.path.expanduser(base.get("command", self.default_command))
-                or self.extra != list(base.get("args", []))):
+                or self.extra != list(base.get("args", []))
+                or self.config.peer_env(self.participant) != (base.get("env") or {})):
             # A participant with its own command or args (say, a wrapper or flag for another
             # account) may run agy with another config directory, which this check can't see (#43).
             raise PeerSetupError(
-                f"{self.participant} runs Antigravity with its own command or args, so agent-bus can't check "
+                f"{self.participant} runs Antigravity with its own command, args or env, so agent-bus can't check "
                 f"which MCP servers it loads; set participants.{self.participant}.allow_mcp = true to run it "
                 "anyway")
-        base = Path(os.environ.get("AGY_CONFIG_DIR") or Path.home() / ".gemini" / "config")
+        # Where the child will look: its own env first (#36).  A relative directory would be
+        # resolved from the turn's working directory, which this check can't stand in for.
+        # The child doesn't expand ~ in them, so neither does this check.
+        conf_dir = self.config.effective_env(self.participant, "AGY_CONFIG_DIR")
+        home = self.config.effective_env(self.participant, "HOME")
+        home = str(Path.home()) if home is None else home
+        if (conf_dir and not os.path.isabs(conf_dir)) or not os.path.isabs(home):
+            raise PeerSetupError("AGY_CONFIG_DIR and HOME must be absolute paths for agent-bus to check "
+                                 "Antigravity's MCP servers")
+        base = Path(conf_dir) if conf_dir else Path(home) / ".gemini" / "config"
         files = [base / "mcp_config.json", *sorted(base.glob("plugins/*/mcp_config.json"))]
         live = []
         for f in files:

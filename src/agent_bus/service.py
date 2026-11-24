@@ -150,7 +150,7 @@ class Service:
         """Fail fast, before any job is queued, when ``agent`` is known to be out of usage."""
         block = self._quota_block(agent, override)
         if block:
-            raise BusError("USAGE_EXHAUSTED", quota.message(agent, role, block))
+            raise BusError(quota.code(block), quota.message(agent, role, block, self.config))
 
     def start_discussion(self, question: str, peers: list[str] | None = None, repo: str | None = None,
                          context_refs: list[str] | None = None, max_rounds: int | None = None,
@@ -182,11 +182,14 @@ class Service:
                 peers.remove(p)
                 settings.pop(p, None)
             elif block:
-                raise BusError("USAGE_EXHAUSTED", quota.message(p, "peer", block))
+                raise BusError(quota.code(block), quota.message(p, "peer", block, self.config))
         if not peers:
             if skipped:
-                raise BusError("USAGE_EXHAUSTED", "no peer has usage left: "
-                               + " ".join(quota.message(p, "peer", b) for p, b in skipped.items()))
+                codes = {quota.code(b) for b in skipped.values()}
+                raise BusError(next(iter(codes)) if len(codes) == 1 else "PEERS_CANNOT_VOTE",
+                               ("no peer has usage left: " if codes == {"USAGE_EXHAUSTED"}
+                                else "no peer can take a turn: ")
+                               + " ".join(quota.message(p, "peer", b, self.config) for p, b in skipped.items()))
             if defaulted:
                 which = "no agent" if self.agent == HUMAN else "no other agent"
                 raise ValueError(f"a discussion needs at least one peer ({which} is available on this machine)")
@@ -208,7 +211,7 @@ class Service:
             self.bus.post(t["id"], self.agent, question.strip(), session_id=self.session_id)
         self.bus.post(t["id"], SYSTEM, f"Discussion started by {'the human user' if self.agent == HUMAN else self.agent} "
                       f"with {', '.join(participants)}; up to {rounds} rounds."
-                      + "".join(f" Left out: {quota.message(p, 'peer', b)}" for p, b in skipped.items()),
+                      + "".join(f" Left out: {quota.message(p, 'peer', b, self.config)}" for p, b in skipped.items()),
                       kind="status")
         job = self._dispatch(t["id"], "discussion", {"mode": "start"}, f"{t['id']}:start")
         res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(t["id"])), "job": job}
@@ -245,7 +248,7 @@ class Service:
         s = unvotable.assess(self.bus, self.config, t)
         if s.stalemate:
             raise BusError(unvotable.code(s.stuck), "no consensus is possible until these peers can vote again: "
-                           + unvotable.explain(s.stuck, thread))
+                           + unvotable.explain(s.stuck, thread, self.config))
         if s.everyone:
             # No headless peer can move, so a round would only be spent (issue #39); the
             # initiator can still settle it by voting on the proposal they all back.
@@ -253,7 +256,7 @@ class Service:
                    f"vote on it with send(thread=\"{thread}\", kind=\"vote\", on=\"{s.backs}\", "
                    "stance=\"agree\"|\"object\")")
             raise BusError(unvotable.code(s.stuck), "no peer can take another round: "
-                           + unvotable.explain(s.stuck, thread)
+                           + unvotable.explain(s.stuck, thread, self.config)
                            + f" Every peer backs {s.backs}: {how}, or retry once they can vote again.")
         job = self._dispatch(thread, "discussion", {"mode": "advance"}, f"{thread}:advance:{t['round'] + 1}")
         return {"thread": thread_summary(t), "job": job}

@@ -102,6 +102,15 @@
       "tools": [
         "run_command"
       ]
+    },
+    {
+      "file": "claude-bedrock-start.jsonl",
+      "agent": "claude",
+      "cli": "Claude Code 2.1.330",
+      "captured": "2026-11-23",
+      "scenario": "first turn on Amazon Bedrock (CLAUDE_CODE_USE_BEDROCK=1, SSO profile, us-east-2, us.anthropic.claude-haiku-4-5): a text reply; no rate_limit_event, modelUsage provider bedrock (issue #36)",
+      "final": "OK",
+      "recipe": "probe: claude -p --output-format stream-json --verbose --permission-mode plan --strict-mcp-config --max-turns 1 --model <id>, prompt on stdin (not the adapter's own invocation)"
     }
   ]
 }
