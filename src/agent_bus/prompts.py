@@ -104,8 +104,9 @@ is a newly substantiated high-severity defect; anything else goes in as low."""
 
 # When the reviewer's last verdict approved and only another reviewer's fix made it stale.
 ALREADY_APPROVED = """
-You approved {prev}. This head changed only to address other reviewers' findings, so check
-that the interdiff fixes them without introducing a new blocking problem."""
+You approved {prev}. Since then other reviewers asked for changes: check that the interdiff
+addresses their findings, and review any other behavior it introduces, without re-opening
+code you already approved."""
 
 # Once the author has used the soft follow-up budget (#71).
 BUDGET_SPENT = """

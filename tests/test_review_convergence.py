@@ -314,3 +314,24 @@ def test_single_reviewer_note_after_approval_is_not_a_pushback(env, no_spawn, mo
     claude.send("thanks", thread=tid)
     again = claude.request_review("codex", str(repo), base, h1, prev_head_commit_id=h1)
     assert again["job"]["id"] == first["job"]["id"] and again["thread"]["follow_ups"] == 1
+
+
+def test_pushback_at_the_limit_that_hits_quota_is_retried_not_lifted(env, no_spawn, monkeypatch):
+    set_config(env, review_followup_budget=1)
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(repo), base, h1)["thread"]["id"]
+    run_job(bus, tid)
+    h2 = commit("two\n")
+    claude.request_review("codex", str(repo), base, h2, prev_head_commit_id=h1)
+    run_job(bus, tid)
+    claude.request_review("codex", str(repo), base, h2, prev_head_commit_id=h2, focus="evidence")
+    assert bus.thread(tid)["refs"]["follow_ups"] == 2  # at the limit
+    monkeypatch.setenv("FAKE_EXHAUSTED", "codex")
+    run_job(bus, tid)
+    assert bus.thread(tid)["status"] == "needs_human"
+    monkeypatch.delenv("FAKE_EXHAUSTED")
+    res = Service(bus, HUMAN).resume(tid)
+    assert res.get("job") and res["thread"]["followup_limit"] == 2  # the pushback reruns as it was

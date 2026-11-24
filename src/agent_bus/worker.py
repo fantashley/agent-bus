@@ -871,13 +871,17 @@ class Worker:
     def park_over_budget(self, t: dict, what: str) -> bool:
         """Park a review that still asks for changes after its follow-up limit for the human
         user (#71), with the open findings.  True if parked (or no longer open)."""
-        p = review_progress(t)
-        if p["follow_ups"] < p["followup_limit"]:
+        if review_progress(t)["follow_ups"] < review_progress(t)["followup_limit"]:
             return False
         to = None if t["initiator"] == HUMAN else t["initiator"]
         with self.fenced():
+            # Judged again inside the write: a human resume may have raised the limit since.
+            now = self.bus.thread(self.thread_id)
+            p = review_progress(now)
+            if p["follow_ups"] < p["followup_limit"]:
+                return False
             if self.bus.transition(self.thread_id, "needs_human"):
-                refs = self.bus.thread(self.thread_id)["refs"] or {}
+                refs = now["refs"] or {}
                 self.bus.set_thread(self.thread_id, refs=json.dumps({**refs, "budget_parked": True}))
                 self.bus.post(self.thread_id, SYSTEM,
                               f"{what}\nThis review still asks for changes after {p['follow_ups']} follow-up "

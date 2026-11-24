@@ -452,7 +452,15 @@ class Service:
         if t["status"] == "needs_human" and refs.get("budget_parked"):
             return True
         p = review_progress(t)
-        return p["follow_ups"] >= p["followup_limit"] and bool(self.bus.review_standings(t["id"])["changes_requested"])
+        if p["follow_ups"] < p["followup_limit"]:
+            return False
+        if refs.get("pushback_round") == t["round"] and not any(
+                m["round"] == t["round"] for m in self._verdicts(t)):
+            return False  # a pushback still to give its verdict: let it finish (a quota resume retries it)
+        return bool(self.bus.review_standings(t["id"])["changes_requested"])
+
+    def _verdicts(self, t: dict) -> list[dict]:
+        return [m for m in self.bus.history(t["id"])["messages"] if m["kind"] == "review_verdict"]
 
     def _check_budget_park(self, t: dict) -> None:
         """Refuse a follow-up on a review held for the human by its follow-up limit."""
