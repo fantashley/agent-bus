@@ -545,10 +545,14 @@ class Service:
         p = review_progress(t)
         if p["follow_ups"] < p["followup_limit"]:
             return False
-        if resuming and refs.get("pushback_round") == t["round"] and not any(
-                m["round"] == t["round"] for m in self._verdicts(t)):
+        if resuming and self._pushback_pending(t):
             return False  # a pushback still to give its verdict: let it finish (a quota resume retries it)
         return bool(self.bus.review_standings(t["id"])["changes_requested"])
+
+    def _pushback_pending(self, t: dict) -> bool:
+        """Whether the current pass is a pushback still due its verdict (#71)."""
+        return (t["refs"] or {}).get("pushback_round") == t["round"] and not any(
+            m["round"] == t["round"] for m in self._verdicts(t))
 
     def _verdicts(self, t: dict) -> list[dict]:
         return [m for m in self.bus.history(t["id"])["messages"] if m["kind"] == "review_verdict"]
@@ -557,6 +561,13 @@ class Service:
         """Refuse a follow-up on a review held for the human by its follow-up limit."""
         if self._over_budget(t):
             p = review_progress(t)
+            if self._pushback_pending(t):
+                # A resume reruns that pushback at the same limit; it doesn't raise it (#87).
+                raise BusError("REVIEW_LIMIT_REACHED", f"{t['id']} is at its limit of {p['followup_limit']} "
+                               "follow-up requests and its pushback pass is still due its verdict: wait for "
+                               f"that verdict (if the pass stopped, ask the human user to run `agent-bus resume "
+                               f"{t['id']}` to rerun it). If it still asks for changes, the review waits for the "
+                               "human user before another revision")
             raise BusError("REVIEW_LIMIT_REACHED", f"{t['id']} still had changes requested after "
                            f"{p['follow_ups']} follow-up requests, so it waits for the human user: ask them to "
                            f"settle the open findings or run `agent-bus resume {t['id']}` to allow more "

@@ -162,6 +162,51 @@ def test_whoami_flags_a_server_older_than_path(env, no_spawn, monkeypatch, tmp_p
     assert "stale_build" not in whoami()
 
 
+def test_whoami_flags_a_stale_nix_wrapped_server(env, no_spawn, monkeypatch, tmp_path):
+    """#89: under Nix's wrapProgram, argv[0] is bin/.agent-bus-wrapped and the wrapper puts
+    the build's own bin directory first on PATH.  Neither may hide an upgrade."""
+    import asyncio
+    import sys
+    from agent_bus import mcp_server
+
+    def install(name):
+        bin_dir = tmp_path / name / "bin"
+        bin_dir.mkdir(parents=True)
+        for exe in ("agent-bus", ".agent-bus-wrapped"):
+            (bin_dir / exe).write_text("#!/bin/sh\n")
+            (bin_dir / exe).chmod(0o755)
+        return bin_dir
+
+    old, new = install("old"), install("new")
+    profile = tmp_path / "profile" / "bin"
+    profile.mkdir(parents=True)
+    link = profile / "agent-bus"
+    link.symlink_to(old / "agent-bus")
+    monkeypatch.setenv("PATH", f"{old}:{profile}:{os.environ['PATH']}")  # as the old wrapper left it
+    monkeypatch.setattr(sys, "argv", [str(old / ".agent-bus-wrapped"), "mcp"])
+    monkeypatch.setattr(cfg, "_LAUNCHED_FROM", cfg._launched_from())
+    assert cfg._LAUNCHED_FROM == os.path.realpath(old / "agent-bus")
+    server = mcp_server.build("claude", bus=env["bus"])
+
+    def whoami():
+        return json.loads(asyncio.run(server.call_tool("whoami", {})).content[0].text)
+
+    assert "stale_build" not in whoami()
+    link.unlink()
+    link.symlink_to(new / "agent-bus")
+    stale = whoami()["stale_build"]
+    assert stale["running"] == os.path.realpath(old / "agent-bus")
+    assert stale["on_path"] == os.path.realpath(new / "agent-bus")
+    monkeypatch.delenv("AGENT_BUS_BIN", raising=False)
+    assert cfg.self_command() == [os.path.realpath(old / "agent-bus")]  # the wrapper, not the wrapped
+
+    # An unwrapped launch takes PATH as it is: its own directory first is not stale.
+    monkeypatch.setenv("PATH", f"{old}:{new}:{os.environ['PATH']}")
+    monkeypatch.setattr(sys, "argv", [str(old / "agent-bus"), "mcp"])
+    monkeypatch.setattr(cfg, "_LAUNCHED_FROM", cfg._launched_from())
+    assert "stale_build" not in whoami()
+
+
 # ------------------------------------------------- review fixes (t-a3faf1 pass 1)
 
 

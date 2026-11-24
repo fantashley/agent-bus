@@ -135,7 +135,9 @@ config (default 3). Once it is spent, reviewers are told the review has run long
 changes-requested notices suggest deferring non-blocking findings to a follow-up issue. A review
 that still asks for changes after twice the budget goes to `needs_human` and refuses follow-ups
 with `REVIEW_LIMIT_REACHED` until the human runs `agent-bus resume <thread>`, which allows
-another budget's worth. Reviews report `passes`, `follow_ups` and `followup_budget` instead of a
+another budget's worth. A pushback at the limit that is still due its verdict (say it hit a usage
+limit) is the exception: the error says to wait for that verdict, because a resume reruns the
+pushback without raising the limit. Reviews report `passes`, `follow_ups` and `followup_budget` instead of a
 discussion's `max_rounds` (`agent-bus threads` shows e.g. `pass5,fu2/3`).
 
 If the repo doesn't have a pinned commit (base, head, or the previous head a follow-up diffs

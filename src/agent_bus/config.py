@@ -606,8 +606,28 @@ def repo_root(path: str | os.PathLike) -> str:
 def _launched_from() -> str | None:
     """The resolved path of the installed `agent-bus` script this process started as, if any."""
     argv0 = sys.argv[0] if sys.argv else ""
-    if os.path.basename(argv0).startswith("agent-bus") and os.access(argv0, os.X_OK):
-        return os.path.realpath(argv0)
+    name = os.path.basename(argv0)
+    if name == ".agent-bus-wrapped":
+        # Nix's wrapProgram: bin/agent-bus sets PATH and execs bin/.agent-bus-wrapped, which
+        # is what argv[0] names (#89).  The wrapper is the installed script.
+        argv0 = os.path.join(os.path.dirname(argv0), "agent-bus")
+    elif not name.startswith("agent-bus"):
+        return None
+    return os.path.realpath(argv0) if os.access(argv0, os.X_OK) else None
+
+
+def _on_path() -> str | None:
+    """The `agent-bus` a new shell would run, resolved.  When started through a Nix wrapper,
+    skips this build's own bin directory: the wrapper put it first on this process's PATH,
+    which would hide an upgrade (#89).  Any other launch takes PATH as it is."""
+    wrapped = bool(sys.argv) and os.path.basename(sys.argv[0]) == ".agent-bus-wrapped"
+    own = os.path.dirname(_LAUNCHED_FROM) if _LAUNCHED_FROM and wrapped else None
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d or (own and os.path.realpath(d) == own):
+            continue
+        exe = os.path.join(d, "agent-bus")
+        if os.path.isfile(exe) and os.access(exe, os.X_OK):
+            return os.path.realpath(exe)
     return None
 
 
@@ -639,11 +659,8 @@ def stale_build() -> dict | None:
     they match or either can't be told (not started as an installed `agent-bus` script, or
     none on PATH).
     """
-    found = shutil.which("agent-bus")
-    if not _LAUNCHED_FROM or not found:
-        return None
-    on_path = os.path.realpath(found)
-    if _LAUNCHED_FROM == on_path:
+    on_path = _on_path() if _LAUNCHED_FROM else None
+    if not on_path or _LAUNCHED_FROM == on_path:
         return None
     return {"running": _LAUNCHED_FROM, "on_path": on_path,
             "hint": "This agent-bus MCP server is a different build from the agent-bus on PATH "
