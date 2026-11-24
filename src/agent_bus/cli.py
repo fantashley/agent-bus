@@ -1,9 +1,11 @@
-"""The ``agent-bus`` command: MCP server, worker, and the human's CLI."""
+"""The ``agent-bus`` command: the human's CLI, plus the MCP server, worker and hooks
+entry points that client configs start (left out of the top-level help, #84)."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -12,7 +14,7 @@ import time
 
 from . import config as cfg
 from . import hooks, rex
-from .db import HUMAN, SYSTEM, Bus, BusError, format_progress
+from .db import HUMAN, SYSTEM, Bus, BusError, format_progress, is_quiet
 from .service import Service, present, thread_summary
 from .worker import format_review
 
@@ -239,6 +241,63 @@ def cmd_ask(bus: Bus, args: argparse.Namespace) -> int:
     return 0
 
 
+def needs_you(bus: Bus, ts: list[dict]) -> dict[str, str]:
+    """Why each of ``ts`` waits for the human, and what they can do, by thread id (#84).
+
+    A thread parked as needs_human says why from its state where that is recorded (a
+    planned automatic resume, the review's follow-up budget), otherwise from the bus's
+    latest notice on it, leaving out routine ones and a later debrief's.  An open thread
+    with nothing running needs the human when its last job failed, or when an idle
+    interactive session has mail there: only a nudge wakes it (#20)."""
+    from . import autoresume
+    planned = {r["thread_id"]: r for r in autoresume.pending(bus)}
+    bus.reap()  # once, rather than in an active_job() per thread
+    active = {r["thread_id"] for r in bus._all("SELECT thread_id FROM jobs WHERE status IN ('queued','running')")}
+    out = {}
+    for t in ts:
+        tid = t["id"]
+        if t["status"] == "needs_human":
+            if tid in planned:
+                agents = ", ".join(json.loads(planned[tid]["agents"]))
+                due = time.localtime(planned[tid]["due"])
+                when = time.strftime("%H:%M" if due[:3] == time.localtime()[:3] else "%a %d %b %H:%M", due)
+                out[tid] = (f"waiting for {agents} to have usage again; resumes by itself about {when} "
+                            f"(or `agent-bus resume` / `agent-bus cancel` {tid})")
+                continue
+            if (t["refs"] or {}).get("budget_parked"):
+                out[tid] = ("the review still asks for changes after its follow-up budget: settle the findings, "
+                            f"`agent-bus resume {tid}` to allow more follow-ups, or `agent-bus cancel {tid}`")
+                continue
+            notices = (bus.message(r["id"]) for r in bus._all(
+                "SELECT id FROM messages WHERE thread_id=? AND sender=? AND kind='status' ORDER BY id DESC",
+                tid, SYSTEM))
+            # A debrief's notices are tagged; older builds' aren't, but fall inside its job's run.
+            debriefs = [(j["created_at"], j["updated_at"] if j["status"] not in ("queued", "running") else math.inf)
+                        for j in bus.jobs(tid) if j["kind"] == "debrief"]
+            why = next((m["body"] for m in notices if not is_quiet(m) and not m["data"].get("debrief")
+                        and not any(a <= m["created_at"] <= b for a, b in debriefs)), "")
+            out[tid] = (f"{_one_line(why) or 'parked for the human user'} "
+                        f"(`agent-bus resume {tid}` to retry, `agent-bus cancel {tid}` to dismiss)")
+        elif t["status"] == "open" and tid not in active:
+            jobs = [j for j in bus.jobs(tid) if j["kind"] != "debrief"]
+            if jobs and jobs[-1]["status"] == "failed":
+                out[tid] = (f"its last job failed: {_one_line(jobs[-1]['error'] or 'no reason recorded')} "
+                            f"(`agent-bus resume {tid}` to retry, `agent-bus cancel {tid}` to dismiss)")
+    idle = [t["id"] for t in ts if t["status"] == "open" and t["id"] not in active]
+    if idle:
+        for w in hooks.mail_waiting(bus, set(idle)):
+            for tid in w["threads"]:
+                note = f"{w['agent']} has unread mail here in an idle session ({w['session']}); nudge it"
+                out[tid] = f"{out[tid]}; {note}" if tid in out else note
+    return out
+
+
+def _one_line(text: str, n: int = 160) -> str:
+    """A notice's first line, whitespace collapsed, at most ``n`` characters."""
+    line = " ".join((text.strip().splitlines() or [""])[0].split())
+    return line if len(line) <= n else line[:n - 3] + "..."
+
+
 def _print_history(bus: Bus, thread: str, color: bool) -> None:
     h = bus.history(thread)
     t = h["thread"]
@@ -280,21 +339,175 @@ def parse_mcp_args(args: list[str]) -> argparse.Namespace | None:
         return None
 
 
-# Commands that act on one thread: the lazy sweep runs after them for that thread.
+# Commands that act on threads: the lazy sweep runs after them for those threads.
 ACTING = ("cancel", "resume", "reply", "debrief")
+
+EPILOG = """\
+common tasks:
+  agent-bus ask "SQLite or JSON for a small CLI?" --wait
+                                   ask your agents and wait for their answer
+  agent-bus threads                see what's open, and what needs you
+  agent-bus tail t-1a2b3c          follow a discussion or review live
+  agent-bus reply t-1a2b3c "Keep it simple"
+                                   weigh in
+  agent-bus resume t-1a2b3c        unstick a thread (out of rounds, failed)
+  agent-bus cancel t-1a2b3c t-4d5e6f
+                                   dismiss threads you no longer need
+
+Commands for wiring up clients (mcp, hook, setup-codex, setup-copilot, run-job,
+auto-resume, stream, rex-check) are left out of this list: see "Wiring up
+clients" in the README.
+"""
+
+# The CLI's internal entry points, started by client configs, hooks and the worker.  A
+# headless peer may still reach them: `mcp` refuses its calls itself, `hook` stays quiet.
+INTERNAL = ("mcp", "hook", "run-job")
+# Commands that act as the human user: posting with trust "human", or changing a thread
+# or an agent's state on their behalf (also `agents --clear-quota`, see acts_as_human).
+HUMAN_ONLY = ("ask", "reply", "resume", "cancel", "debrief")
+# Set in the shells agent harnesses run commands in.  Session markers only, never config
+# or auth variables a human may export in their own shell too.
+HARNESS_ENV = ("AI_AGENT", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_CI")
+
+
+def acts_as_human(args: argparse.Namespace) -> bool:
+    return args.cmd in HUMAN_ONLY or (args.cmd == "agents" and bool(args.clear_quota))
+
+
+def agent_shell() -> str | None:
+    """Why this process looks like an agent harness's shell tool ran it, or None."""
+    for var in HARNESS_ENV:
+        if os.environ.get(var):
+            return f"${var} is set"
+    found = harness_ancestor()
+    return f"it runs under {found}" if found else None
+
+
+def harness_ancestor() -> str | None:
+    from . import procinfo
+    return procinfo.harness_ancestor(os.getpid())
+
+
+def guard(args: argparse.Namespace) -> str | None:
+    """Keep agents off the human's commands (#84, agreed on agent-bus thread t-fc8b3b).
+
+    A seatbelt against an agent posting as the human by mistake or because some text told
+    it to, not a security boundary: any process running as this user can unset the
+    markers, detach from its harness, or write the database directly.  The README says
+    so, and how a human typing inside an agent's shell gets past it.
+    """
+    if os.environ.get("AGENT_BUS_PEER") and args.cmd not in INTERNAL:
+        # history and tail would show a peer the blind proposals its MCP tools hide.
+        return ("PEER_READ_ONLY: you are running as a headless agent-bus peer; your reply is posted for you. "
+                "The agent-bus CLI is disabled in this session.")
+    if acts_as_human(args) and os.environ.get("AGENT_BUS_ALLOW_HUMAN") != "1":
+        why = agent_shell()
+        if why:
+            return (f"HUMAN_ONLY: `agent-bus {args.cmd}` acts as the human user, and this looks like an agent's "
+                    f"shell ({why}). Agents: use the agent-bus MCP tools, which speak as you. Humans: run it "
+                    "from your own terminal.")
+    return None
+
+
+def _targets(args: argparse.Namespace) -> list[str]:
+    """The threads an ACTING command acts on (cancel takes several)."""
+    return args.thread if isinstance(args.thread, list) else [args.thread]
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="agent-bus", description="Local message bus for coding agents.")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p = argparse.ArgumentParser(
+        prog="agent-bus", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=EPILOG,
+        description="Let your coding agents (Claude Code, Codex, Antigravity, Copilot CLI) talk to\n"
+                    "each other, and step in when they need you.")
+    # Only the human's commands are listed (#84).  The rest are started by client configs,
+    # hooks, the worker and Rex: they keep their names, but have no help line here.
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND", title="commands")
 
-    add_mcp_args(sub.add_parser("mcp", help="run the stdio MCP server for one agent"))
+    s = sub.add_parser("ask", help="ask your agents a question and let them agree on an answer",
+                       description="Start a discussion: each agent answers on its own first, then they vote "
+                                   "until they agree or run out of rounds.")
+    s.add_argument("prompt", help="the question")
+    s.add_argument("--with", dest="with_", help="comma-separated agents (default: every available agent)")
+    s.add_argument("--repo", help="an allow-listed repo the agents may read")
+    s.add_argument("--rounds", type=int, help="max rounds (default from config, 4)")
+    s.add_argument("--deadline", type=int, help="deadline in minutes (default from config, 30)")
+    s.add_argument("--watch", action="store_true", help="inside Rex: open panes following each agent")
+    s.add_argument("--set", dest="settings", action="append", default=[], metavar="AGENT.KEY=VALUE",
+                   help="per-agent model/effort for this discussion, e.g. codex.effort=high (repeatable)")
+    s.add_argument("--wait", action="store_true", help="wait for the outcome, then print the thread")
 
-    s = sub.add_parser("hook", help="(called by client hooks) print a fixed unread-mail hint at turn boundaries")
+    s = sub.add_parser("threads", help="what's going on, and which threads need you",
+                       description="Open discussions and reviews, the ones waiting for you first, with why "
+                                   "they need you and what you can do about it.")
+    s.add_argument("--all", action="store_true", help="include resolved and cancelled threads")
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("history", help="read a thread from the start")
+    s.add_argument("thread")
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("tail", help="follow a thread live",
+                       description="Print a thread's messages as they arrive.  Inside Rex the pane also shows "
+                                   "the thread's state (working, done, needs you).")
+    s.add_argument("thread")
+    s.add_argument("--peer", help="also show what this agent is doing (tools, thinking)")
+    s.add_argument("--events", action="store_true", help="also show what every agent is doing")
+    s.add_argument("--once", action="store_true", help="print what's there now and exit")
+    s.add_argument("--no-status", action="store_true", help="don't report the thread's state to Rex (OSC 7501)")
+    s.add_argument("--no-color", action="store_true")
+    s.add_argument("--notify", action="store_true",
+                   help="desktop notification when an idle agent session has mail on this thread")
+
+    s = sub.add_parser("reply", help="say something on a thread as yourself",
+                       description="Post to a thread as the human user.  Agents see it as coming from you.")
+    s.add_argument("thread")
+    s.add_argument("body")
+    s.add_argument("--to", help="the agent to address")
+
+    s = sub.add_parser("resume", help="unstick a thread: give it more rounds or retry what failed")
+    s.add_argument("thread")
+    s.add_argument("--rounds", type=int, default=2, help="extra rounds to allow (default 2)")
+
+    s = sub.add_parser("cancel", help="stop threads and dismiss them",
+                       description="Cancel threads, stopping any agent still working on them.  Use it to "
+                                   "dismiss threads you no longer need, including ones stuck waiting for you.")
+    s.add_argument("thread", nargs="+")
+
+    s = sub.add_parser("debrief", help="ask the agents of a finished thread what got in their way")
+    s.add_argument("thread")
+    s.add_argument("--question", help="what to ask (default: friction with prompts, tools, sandbox, diffs, "
+                                      "verdict format)")
+    s.add_argument("--peer", action="append", dest="peers", help="an agent to ask (repeatable; default: all)")
+
+    s = sub.add_parser("agents", help="which agents you have, and whether they're out of usage")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--clear-quota", metavar="AGENT",
+                   help="forget that AGENT is out of usage (e.g. after upgrading a plan); this lifts it for "
+                        "every participant sharing its harness and account")
+
+    s = sub.add_parser("usage", help="how many tokens your agents' turns used, per agent and per thread")
+    s.add_argument("--hours", type=float, default=24, help="how far back to look (default 24)")
+    s.add_argument("--thread", help="only this thread")
+    s.add_argument("--agent", help="only this agent")
+    s.add_argument("--limit", type=int, default=20, help="most threads to list (default 20)")
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("watch", help="inside Rex: open panes following a thread and each agent on it")
+    s.add_argument("thread")
+    s.add_argument("--no-peers", action="store_true", help="only the thread, not each agent")
+
+    # ---- Not listed: client wiring, the worker, and integrations (see the README's
+    # "Wiring up clients").  Keep these names stable: configs, hooks and agents use them.
+    add_mcp_args(sub.add_parser("mcp", description="Run the stdio MCP server for one agent (started by the "
+                                                   "client's MCP config)."))
+
+    s = sub.add_parser("hook", description="Print a fixed unread-mail hint at turn boundaries (called by "
+                                           "client hooks).")
     s.add_argument("--client", required=True)
     s.add_argument("--event", required=True)
 
-    s = sub.add_parser("setup-codex", help="register agent-bus with Codex, forwarding Rex variables")
+    s = sub.add_parser("setup-codex", description="Register agent-bus with Codex, forwarding Rex variables "
+                                                  "(run by the Home Manager module).")
     s.add_argument("--bin", help="agent-bus executable Codex should run (default: this one)")
     grp = s.add_mutually_exclusive_group()
     grp.add_argument("--hooks", action="store_true",
@@ -305,59 +518,19 @@ def main(argv: list[str] | None = None) -> int:
                    help="only update Codex's hooks.json; leave config.toml untouched")
     s.add_argument("--hooks-bin", help="stable agent-bus path for hooks.json (default: --bin)")
 
-    s = sub.add_parser("setup-copilot", help="register agent-bus with GitHub Copilot CLI")
+    s = sub.add_parser("setup-copilot", description="Register agent-bus with GitHub Copilot CLI (run by the "
+                                                    "Home Manager module).")
     s.add_argument("--bin", help="agent-bus executable Copilot should run (default: this one)")
 
-    s = sub.add_parser("run-job", help="(internal) run a queued job")
+    s = sub.add_parser("run-job", description="Run a queued job (started by the MCP server or CLI).")
     s.add_argument("job")
 
-    s = sub.add_parser("ask", help="start a discussion between agents")
-    s.add_argument("prompt")
-    s.add_argument("--with", dest="with_", help="comma-separated agents (default: every available agent)")
-    s.add_argument("--repo", help="allow-listed repo the agents may read")
-    s.add_argument("--rounds", type=int, help="max rounds (default from config, 4)")
-    s.add_argument("--deadline", type=int, help="deadline in minutes (default from config, 30)")
-    s.add_argument("--watch", action="store_true", help="open Rex viewer panes")
-    s.add_argument("--set", dest="settings", action="append", default=[], metavar="AGENT.KEY=VALUE",
-                   help="per-peer model/effort for this discussion, e.g. codex.effort=high (repeatable)")
-    s.add_argument("--wait", action="store_true", help="block until the worker finishes, then print the thread")
-
-    s = sub.add_parser("agents", help="list the agents available on this machine, and why")
-    s.add_argument("--json", action="store_true")
-    s.add_argument("--clear-quota", metavar="AGENT",
-                   help="forget that AGENT is out of usage (e.g. after upgrading a plan); this lifts it for "
-                        "every participant sharing its harness and account")
-
-    s = sub.add_parser("usage", help="tokens headless turns used recently, per agent and per thread")
-    s.add_argument("--hours", type=float, default=24, help="how far back to look (default 24)")
-    s.add_argument("--thread", help="only this thread")
-    s.add_argument("--agent", help="only this agent")
-    s.add_argument("--limit", type=int, default=20, help="most threads to list (default 20)")
-    s.add_argument("--json", action="store_true")
-
-    s = sub.add_parser("auto-resume", help="resume threads parked by a usage limit that has reset "
-                                           "(runs by itself; this shows what's planned)")
+    s = sub.add_parser("auto-resume", description="Resume threads parked by a usage limit that has reset. "
+                                                  "Runs by itself; this shows what's planned.")
     s.add_argument("--wait", action="store_true", help="(used internally) keep sweeping until none is planned")
 
-    s = sub.add_parser("threads", help="list threads")
-    s.add_argument("--all", action="store_true", help="include resolved and cancelled threads")
-    s.add_argument("--json", action="store_true")
-
-    s = sub.add_parser("history", help="print a thread")
-    s.add_argument("thread")
-    s.add_argument("--json", action="store_true")
-
-    s = sub.add_parser("tail", help="follow a thread (Rex-friendly: emits OSC 7501 status)")
-    s.add_argument("thread")
-    s.add_argument("--peer", help="show one peer's progress events")
-    s.add_argument("--events", action="store_true", help="show every peer's progress events")
-    s.add_argument("--once", action="store_true", help="print and exit")
-    s.add_argument("--no-status", action="store_true", help="don't emit OSC 7501 status")
-    s.add_argument("--no-color", action="store_true")
-    s.add_argument("--notify", action="store_true",
-                   help="desktop notification (OSC 777/9) when an interactive session has mail on this thread")
-
-    s = sub.add_parser("stream", help="print one line per verdict/final/status change (for notifications)")
+    s = sub.add_parser("stream", description="Print one line per verdict, final answer, status change, failed "
+                                             "job or idle session with mail, for notification hooks.")
     s.add_argument("threads", nargs="*", help="only these threads; exit once they're all closed")
     s.add_argument("--kinds", default="review_verdict,final,mail",
                    help="message kinds to report, plus `mail` for interactive sessions with unread mail "
@@ -365,36 +538,19 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--from-start", action="store_true", help="also report existing messages")
     s.add_argument("--interval", type=float, default=2.0)
 
-    s = sub.add_parser("reply", help="post to a thread as the human user")
-    s.add_argument("thread")
-    s.add_argument("body")
-    s.add_argument("--to", help="the participant to address")
-
-    s = sub.add_parser("cancel", help="cancel a thread and kill its worker")
-    s.add_argument("thread")
-
-    s = sub.add_parser("debrief", help="ask a finished thread's peers for feedback in their own resumed sessions")
-    s.add_argument("thread")
-    s.add_argument("--question", help="what to ask (default: friction with prompts, tools, sandbox, diffs, "
-                                      "verdict format)")
-    s.add_argument("--peer", action="append", dest="peers", help="a peer to ask (repeatable; default: all)")
-
-    s = sub.add_parser("resume", help="lift a thread's limits and continue it")
-    s.add_argument("thread")
-    s.add_argument("--rounds", type=int, default=2, help="extra rounds to allow (default 2)")
-
-    s = sub.add_parser("rex-check", help="report what Rex shows about an agent session's block (read-only)")
+    s = sub.add_parser("rex-check", description="Report what Rex shows about an agent session's block "
+                                                "(read-only diagnostics).")
     s.add_argument("--session", help="session id (default: the latest session of each agent)")
     s.add_argument("--block", help="Rex block to check instead of a session's")
     s.add_argument("--agent", help="harness expected in --block; alone, only that participant's (or "
                                    "harness's) latest session")
     s.add_argument("--json", action="store_true")
 
-    s = sub.add_parser("watch", help="open Rex viewer panes for a thread")
-    s.add_argument("thread")
-    s.add_argument("--no-peers", action="store_true", help="only the thread watcher")
-
     args = p.parse_args(argv)
+    refused = guard(args)
+    if refused:
+        print(f"agent-bus: {refused}", file=sys.stderr)
+        return 2
 
     if args.cmd == "mcp":
         from . import mcp_server
@@ -457,8 +613,11 @@ def main(argv: list[str] | None = None) -> int:
         return worker.main(args.job)
 
     bus = Bus()
+    done = False
     try:
-        return _dispatch(bus, args)
+        rc = _dispatch(bus, args)
+        done = True
+        return rc
     except BusError as e:
         print(f"agent-bus: {e.code}: {e.message}", file=sys.stderr)
         return 2
@@ -468,9 +627,10 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if args.cmd in ACTING:
             # After a command acting on a thread (which _dispatch's sweep left out), sweep
-            # that thread too: resuming one whose job never started relaunches it (#64).
+            # that thread too: resuming one whose job never started relaunches it (#64).  A
+            # command that failed leaves its threads out: `cancel a typo` must not resume a.
             from . import autoresume
-            autoresume.sweep_quietly(bus)
+            autoresume.sweep_quietly(bus, exclude=frozenset() if done else frozenset(_targets(args)))
         bus.close()
 
 
@@ -493,7 +653,7 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
     # (cancel, resume, reply): the explicit action goes first.
     acting = args.cmd in ACTING
     if args.cmd != "stream":  # which sweeps in its own loop
-        autoresume.sweep_quietly(bus, exclude=frozenset({args.thread} if acting else ()))
+        autoresume.sweep_quietly(bus, exclude=frozenset(_targets(args) if acting else ()))
     svc = Service(bus, HUMAN)
     color = rex.stdout_is_tty()
     if args.cmd == "ask":
@@ -581,9 +741,19 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         return 0
     if args.cmd == "threads":
         ts = bus.threads(include_closed=args.all)
+        # Threads that need the human are listed however many newer ones there are.
+        seen = {t["id"] for t in ts}
+        older = [bus.thread(r["id"]) for r in bus._all(
+            "SELECT id FROM threads WHERE status IN ('open','needs_human') ORDER BY updated_at DESC")
+            if r["id"] not in seen]
+        attention = needs_you(bus, ts + older)
+        ts += [t for t in older if t["id"] in attention]
+        # The threads waiting for the human come first (#84); otherwise most recent first.
+        ts.sort(key=lambda t: t["id"] not in attention)
         if args.json:
-            print(json.dumps([{**thread_summary(t), **({"review": bus.review_standings(t["id"])}
-                                                       if t["kind"] == "review" else {})} for t in ts], indent=2))
+            print(json.dumps([{**thread_summary(t), "needs_you": attention.get(t["id"]),
+                               **({"review": bus.review_standings(t["id"])} if t["kind"] == "review" else {})}
+                              for t in ts], indent=2))
             return 0
         if not ts:
             print("no threads" if args.all else "no open threads (use --all to include closed ones)")
@@ -597,6 +767,10 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
                       if t["kind"] == "review" else f"{t['round']}/{t['max_rounds']}")
             rows.append((t["id"], t["status"], t["kind"], rounds,
                          job["status"] if job else "-", ",".join(t["participants"]), t["goal"]))
+        if attention:
+            n = len(attention)
+            print(f"{n} thread{'' if n == 1 else 's'} need{'s' if n == 1 else ''} you; "
+                  "`agent-bus history <thread>` for the details\n")
         head = ("THREAD", "STATUS", "KIND", "ROUND", "WORKER", "PARTICIPANTS")
         widths = [max(len(head[i]), *(len(r[i]) for r in rows)) for i in range(5)]
         line = lambda cols: "  ".join(c.ljust(w) for c, w in zip(cols, widths)) + "  " + cols[5]
@@ -609,6 +783,8 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
                 st = bus.review_standings(r[0])
                 print(indent + "; ".join(f"{who} {v['state'].replace('_', ' ')}"
                                          for who, v in st["reviewers"].items()))
+            if r[0] in attention:
+                print(_color(HUMAN, f"{indent}needs you: {attention[r[0]]}", color))
         return 0
     if args.cmd == "history":
         if args.json:
@@ -625,8 +801,12 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         print(f"posted to {args.thread}")
         return 0
     if args.cmd == "cancel":
-        res = svc.cancel(args.thread)
-        print(f"cancelled {args.thread}" + (f"; signalled worker {res['signalled']}" if res["signalled"] else ""))
+        targets = list(dict.fromkeys(args.thread))
+        for tid in targets:  # all or nothing: a typo cancels none of them
+            bus.thread(tid)
+        for tid in targets:
+            res = svc.cancel(tid)
+            print(f"cancelled {tid}" + (f"; signalled worker {res['signalled']}" if res["signalled"] else ""))
         return 0
     if args.cmd == "debrief":
         res = svc.debrief(args.thread, question=args.question, peers=args.peers)

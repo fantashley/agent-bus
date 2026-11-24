@@ -31,6 +31,27 @@ directly, instead of a human relaying messages between windows. Designed in
   allowlist decides which repos requests may target and where peers run; reads are bounded by
   each CLI's read-only mode, not by the allowlist.
 
+This README has two parts. **Using agent-bus** (from here to "Watching and stepping in") is
+what you do with it: ask your agents, follow and unstick threads. **Wiring up clients** is how
+it's installed and hooked into Claude Code, Codex, Antigravity, Copilot CLI and Rex.
+
+# Using agent-bus
+
+`agent-bus --help` lists the commands you use; the ones client configs, hooks and the worker
+run are left out of it (see [Wiring up clients](#wiring-up-clients)).
+
+| Command | What you get |
+|---|---|
+| `ask` | your agents' agreed answer to a question (see Discussions) |
+| `threads` | what's open, the threads that need you first, with why and what to run |
+| `history`, `tail` | a thread from the start, or live |
+| `reply` | your say on a thread, as the human user |
+| `resume` | a stuck thread moving again: more rounds, or a retry of what failed |
+| `cancel` | threads stopped and dismissed, several at once |
+| `debrief` | a finished thread's agents on what got in their way |
+| `agents`, `usage` | which agents you have, whether they're out of usage, and tokens used |
+| `watch` | inside Rex: panes following a thread and each agent on it |
+
 ## Discussions
 
 ```sh
@@ -530,11 +551,40 @@ agent-bus cancel t-1a2b3c
 agent-bus resume t-1a2b3c --rounds 2
 agent-bus debrief t-1a2b3c        # a finished thread's peers give feedback (see Debriefs)
 agent-bus watch t-1a2b3c          # inside Rex: open viewer panes
-agent-bus stream [t-1a2b3c …]     # one line per verdict / final / failure, as each arrives
 ```
 
-`stream` is meant for notifications: each event is one stdout line, so a harness that turns
-lines into alerts (or a plain `while read`) hears about each reviewer as it finishes.
+`threads` lists the threads that need you first, however many newer ones there are. Each gets a
+`needs you:` line saying why and what to run (`resume` to retry, `cancel` to dismiss): an agent
+out of usage (and when it resumes by itself), a review past its follow-up budget, otherwise the
+bus's latest notice on a parked thread (no consensus, a commit that isn't there...), an open
+thread whose last job failed, or an idle session with mail there. `threads --json` gives it as `needs_you`. A thread that is dead for good, say a review
+requested with a commit id that doesn't exist and since redone on another thread, is one
+`agent-bus cancel <thread>` away.
+
+`agent-bus stream [t-1a2b3c …]` (for notification hooks, see
+[Notifications](#notifications-agent-bus-stream)) prints one line per verdict, final answer or
+failure as each arrives.
+
+### Commands only you can run
+
+`ask`, `reply`, `resume`, `cancel`, `debrief` and `agents --clear-quota` act as you: what
+`reply` posts carries `trust: "human"`. So they refuse to run (`HUMAN_ONLY`, exit 2) in what
+looks like an agent's shell: one of `AI_AGENT`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
+`CODEX_THREAD_ID`, `CODEX_SANDBOX` or `CODEX_CI` is set, or a parent process is `claude`,
+`codex`, `agy` or `copilot`. Agents use their MCP tools instead, which speak as themselves.
+Reading (`threads`, `history`, `tail`, `agents`, `usage`) stays open to them. A headless peer
+(`AGENT_BUS_PEER` set) gets no CLI at all, reading included, since `history` would show it the
+blind round's proposals (`PEER_READ_ONLY`); only `mcp`, `hook` and `run-job` still start.
+
+If you're typing in an agent's shell yourself (Claude Code's `!` prompt, a terminal an agent
+launched), set `AGENT_BUS_ALLOW_HUMAN=1` for that command. It doesn't lift the headless-peer
+refusal, and the refusal message doesn't mention it.
+
+This is a seatbelt against an agent posting as you by mistake or because some text told it to,
+not a security boundary. Anything running as your user can unset the variables, detach from its
+harness, set the override, or write `bus.db` directly. A real boundary needs the database out of
+agents' reach and a separate channel for you (agreed on agent-bus thread t-fc8b3b; see
+[#108](https://github.com/fantashley/agent-bus/issues/108)).
 
 `tail` emits [OSC 7501 program status](https://www.superlogical.com/rex/docs/build/program-status)
 (`working`, `done`, `blocked/question` on `needs_human`), so Rex shows discussion state on any
@@ -559,6 +609,33 @@ process is still running: same pid and start time. Sessions registered by an age
 version that didn't record this are never announced; restart that client. Each watcher announces a session at most once
 per read position: after a notice, it speaks up again only once the session has read something
 and has mail again. Nothing is ever typed into a terminal, and no mail is marked read.
+
+# Wiring up clients
+
+These commands are left out of `agent-bus --help` because client configs, hooks, the worker
+and Rex run them, not you. Their names are stable: configs written by older builds, the Home
+Manager module and agents' own instructions keep working. `agent-bus <command> --help` still
+documents each.
+
+| Command | Run by |
+|---|---|
+| `mcp --agent <harness> [--participant <name>]` | each client's MCP config (the Claude Code plugin's `.mcp.json`, Codex, Antigravity, Copilot CLI) |
+| `hook --client <client> --event <event>` | client hooks (see Hooks) |
+| `setup-codex`, `setup-copilot` | Home Manager activation (see Install) |
+| `run-job <job>` | the MCP server or CLI, to run a queued job |
+| `auto-resume [--wait]` | itself, after a usage limit resets (see Out of usage); without `--wait`, shows what's planned |
+| `stream [thread …]` | notification hooks (see below) |
+| `rex-check` | you or an agent, diagnosing Rex status (see Rex sessions) |
+
+`tail <thread> --events --once` is also what agents run to see whether a peer is still working.
+
+## Notifications: `agent-bus stream`
+
+`stream` is meant for notifications: each event is one stdout line, so a harness that turns
+lines into alerts (or a plain `while read`) hears about each reviewer as it finishes. It reports
+verdicts and final answers (`--kinds`), threads changing status, failed jobs and idle sessions
+with mail (`MAIL`, see "When an idle session has mail"). With thread ids it exits once they're
+all closed; `--from-start` also reports messages from before it started.
 
 ## Rex sessions and wake-ups
 
@@ -830,6 +907,8 @@ rules:
 Existing configs and databases need no changes. Stored threads, messages and blocks use
 the built-in names, which are still participants. Threads that name a participant you
 later remove keep their history, but can't be resumed until it's configured again.
+
+# Development and releases
 
 ## Releases
 

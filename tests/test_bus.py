@@ -170,7 +170,8 @@ def test_threads_cli_widens_columns_and_shows_workers(env, no_spawn, capsys):
     bus.create_job(t2["id"], "review", {}, "k")  # a queued worker
     assert cli.main(["threads"]) == 0
     lines = capsys.readouterr().out.splitlines()
-    head = lines[0]
+    assert lines[0].startswith("1 thread needs you")
+    head = next(ln for ln in lines if ln.startswith("THREAD"))
     cols = [head.index(h) for h in ("STATUS", "KIND", "ROUND", "WORKER", "PARTICIPANTS")]
     rows = {ln.split()[0]: ln for ln in lines[1:] if ln.startswith("t-")}
     import re
