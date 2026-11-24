@@ -116,10 +116,29 @@ may span several lines."""
 # its owner has checked out, which can differ from the pinned head.
 READ_HEAD_SHELL = """
 Reading the pinned head: the repository's working copy may have moved on since these commits
-were pinned, so read files at the head commit rather than from disk. Read-only git commands:
+were pinned, so read files at the head commit rather than from disk.{commands}"""
+
+READ_HEAD_GIT = """ Read-only git commands:
   git -C {repo} show {head}:<path>
   git -C {repo} diff --no-ext-diff --no-textconv {base} {head} -- <path>
   git -C {repo} log --format='%H%n%B' {base}..{head}"""
+
+# For a jj repository (#76).  This turn's sandbox is read-only, and a jj command without
+# --ignore-working-copy first snapshots the working copy and, colocated, imports git refs:
+# both take locks under .jj (a secondary workspace's are in the main checkout's), so it fails
+# with "Read-only file system".  And in a jj workspace @ is that workspace's own working-copy
+# commit, usually an empty one on top of the head, so a reviewer must name the pinned ids:
+# through commit_id("..."), which a bookmark or revset alias named like the hash can't shadow.
+READ_HEAD_JJ = """
+This is a jj (Jujutsu) repository. Every jj command needs --ignore-working-copy here: without
+it, jj snapshots the working copy and imports git refs first, which takes write locks this
+read-only turn can't (it fails with "Read-only file system"). Name revisions by the pinned
+commit ids, never @: @ is the workspace's own working-copy commit, not the head under review,
+so jj status and a bare jj diff show the wrong commit. Read-only jj commands (jj parses a path
+as a fileset, so keep it inside root:"..."):
+  jj -R {repo} --ignore-working-copy file show -r 'commit_id("{head}")' 'root:"<path>"'
+  jj -R {repo} --ignore-working-copy diff --git --from 'commit_id("{base}")' --to 'commit_id("{head}")' 'root:"<path>"'
+  jj -R {repo} --ignore-working-copy log -r 'commit_id("{base}")..commit_id("{head}")'"""
 
 READ_HEAD_FILES = """
 Reading files: the repository's working copy may have moved on since these commits were

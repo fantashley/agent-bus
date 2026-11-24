@@ -1262,16 +1262,20 @@ class Worker:
 
     def reading_note(self, refs: dict) -> str:
         """How the reviewer can read the pinned head (#93): copyable read-only git commands
-        for a reviewer with a shell, in a repository git can read (jj's own commands are
-        #76's), else a note that files on disk may not match the head."""
+        for a reviewer with a shell, in a repository git can read, and jj ones that work in
+        a read-only sandbox in a jj repository (#76); else a note that files on disk may not
+        match the head."""
         try:
             shell = ADAPTERS[self.config.harness_of(refs["reviewer"])].shell
         except (KeyError, ValueError):
             shell = False
-        if shell and git_readable(refs["repo"]):
-            return prompts.READ_HEAD_SHELL.format(repo=shlex.quote(refs["repo"]), base=refs["base_commit_id"],
-                                                  head=refs["head_commit_id"])
-        return prompts.READ_HEAD_FILES
+        kind = cfg.vcs(refs["repo"])
+        commands = ((prompts.READ_HEAD_GIT if git_readable(refs["repo"], kind) else "")
+                    + (prompts.READ_HEAD_JJ if kind == "jj" else ""))
+        if not (shell and commands):
+            return prompts.READ_HEAD_FILES
+        ids = {"repo": shlex.quote(refs["repo"]), "base": refs["base_commit_id"], "head": refs["head_commit_id"]}
+        return prompts.READ_HEAD_SHELL.format(commands=commands.format(**ids))
 
     def review_overview(self, t: dict, refs: dict, diff: str, what: str) -> str:
         """What comes before the diff (#93): the changed files, the change's commit messages
