@@ -327,7 +327,9 @@ and agy 1.5.13:
   still load in `-p`, run commands outside the tool set and see the prompt, and no flag turns them
   off: so a checkout with hooks Copilot reads (`.github/hooks/*.json`, or a `hooks` key in
   `.github/copilot/settings*.json` or `.claude/settings*.json`) fails the turn, unless
-  `.github/copilot/settings.json` sets `disableAllHooks`. Your own user and plugin hooks still run.
+  `disableAllHooks` is in effect. That's the value in `.github/copilot/settings.local.json` when
+  it sets one, since Copilot applies that file last, and otherwise the value in
+  `.github/copilot/settings.json`. Your own user and plugin hooks still run.
 - **Antigravity:** every turn passes `--settings` with deny rules for `command(*)`,
   `write_file(*)` (which covers edits) and `execute_url(*)` (the browser subagent). Deny wins over
   any allow rule in your own settings, so a `--settings` in `peers.antigravity.args` is dropped.
@@ -841,7 +843,10 @@ session:
   `AGENT_BUS_BUILD` (the build's store path) and every build looks different. The old server is
   stopped, not left running. A subagent started before the reload keeps its own server on the
   old build until it finishes. Hooks need nothing: each one runs the profile's `agent-bus`
-  afresh.
+  afresh. When the reload would invalidate the session's prompt cache, it warns and skips:
+  run `/reload-plugins --force` to apply it anyway. A session without an interactive terminal
+  (`-p`, the Agent SDK, the desktop app) doesn't restart plugin MCP servers on a reload: the new
+  build applies at its next session.
 - **Codex and Antigravity:** restart the client.
 
 If you pasted the old "Agent Bus" section (`docs/AGENTS-section.md`) into your global agent
@@ -856,7 +861,8 @@ agents are asked to tell you. To check by hand, compare the store paths of the r
 with the installed one:
 
 ```sh
-pgrep -af 'agent-bus.* mcp'            # one line per server, with its /nix/store/...-agent-bus-*/bin path
+pgrep -af 'agent-bus.* mcp'            # Linux: one line per server, with its /nix/store/...-agent-bus-*/bin path
+pgrep -lf 'agent-bus.* mcp'            # macOS: the same (its -a means something else and prints no command lines)
 readlink -f "$(command -v agent-bus)"  # the installed build
 ```
 
