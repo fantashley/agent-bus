@@ -26,7 +26,7 @@ from typing import Iterator
 
 from . import config as cfg
 from . import autoresume, prompts, quota, unvotable
-from .db import HUMAN, SYSTEM, Bus, BusError
+from .db import HUMAN, SYSTEM, Bus, BusError, review_progress
 from .peers import Adapter, TurnResult, adapter, cli_version, extract_json, format_usage
 
 LEASE_S = 120
@@ -801,8 +801,18 @@ class Worker:
     def run_review(self) -> None:
         if (self.thread()["refs"] or {}).get("reviewers"):
             self.run_review_rounds()
-        elif self.review_round(self.job["params"].get("mode", "first")) is not None:
-            self.finish_thread("resolved")
+            return
+        verdict = self.review_round(self.job["params"].get("mode", "first"))
+        if verdict is None:
+            return
+        t = self.thread()
+        if verdict["verdict"] == "request_changes":
+            what = f"{t['refs']['reviewer']} requested changes at head {t['refs']['head_commit_id'][:12]}."
+            if self.park_over_budget(t, what):
+                return
+            if budget_warning(t):
+                self.system(what + budget_warning(t), recipient=None if t["initiator"] == HUMAN else t["initiator"])
+        self.finish_thread("resolved")
 
     def run_review_rounds(self) -> None:
         """A review with several required reviewers (#47): one reviewer per round, on one
@@ -826,7 +836,7 @@ class Worker:
             # Interdiff from its own last head (rebase-aware on another base, #75).
             self.set_thread(refs=json.dumps({**refs, "reviewer": nxt,
                                              "prev_head_commit_id": mine["head_commit_id"]}),
-                            round=t["round"] + 1, max_rounds=t["round"] + 1)
+                            round=t["round"] + 1)
         self.review_outcome()
 
     def review_outcome(self) -> None:
@@ -846,11 +856,35 @@ class Worker:
             return
         order = refs["reviewers"]
         after_fix = order[(order.index(refs["reviewer"]) + 1) % len(order)]
-        self.system(f"{', '.join(st['changes_requested']) or refs['reviewer']} requested changes at head "
+        who = ', '.join(st['changes_requested']) or refs['reviewer']
+        if self.park_over_budget(t, f"{who} requested changes at head {head[:12]}.\n{board}"):
+            return
+        self.system(f"{who} requested changes at head "
                     f"{head[:12]}.\n{board}\nAddress the findings and `send` a note here on how, then call "
                     f"request_review with the same reviewers, the new head_commit_id and prev_head_commit_id="
                     f"{head}. A new head makes every earlier approval stale; the next round goes to "
-                    f"{after_fix}, which sees the findings and your notes.", recipient=to)
+                    f"{after_fix}, which sees the findings and your notes. To push back on a finding instead, "
+                    f"`send` your evidence here and request the same head again (prev_head_commit_id = "
+                    f"head_commit_id): {who.split(', ')[0]} reconsiders, and approvals stand."
+                    + budget_warning(t), recipient=to)
+
+    def park_over_budget(self, t: dict, what: str) -> bool:
+        """Park a review that still asks for changes after its follow-up limit for the human
+        user (#71), with the open findings.  True if parked (or no longer open)."""
+        p = review_progress(t)
+        if p["follow_ups"] < p["followup_limit"]:
+            return False
+        to = None if t["initiator"] == HUMAN else t["initiator"]
+        with self.fenced():
+            if self.bus.transition(self.thread_id, "needs_human"):
+                refs = self.bus.thread(self.thread_id)["refs"] or {}
+                self.bus.set_thread(self.thread_id, refs=json.dumps({**refs, "budget_parked": True}))
+                self.bus.post(self.thread_id, SYSTEM,
+                              f"{what}\nThis review still asks for changes after {p['follow_ups']} follow-up "
+                              "requests, so it now waits for the human user: they can settle the open findings, "
+                              f"or run `agent-bus resume {self.thread_id}` to allow more follow-ups.",
+                              kind="status", recipient=to)
+        return True
 
     def review_round(self, mode: str) -> dict | None:
         """One reviewer's pass at the thread's pinned head.  Posts the verdict and returns
@@ -877,10 +911,15 @@ class Worker:
         # interdiff, or the full diff in a fresh session if that can't be trusted (#75).
         old_base = mine["data"]["base_commit_id"] if resume else None
         rebased = resume and old_base != refs["base_commit_id"]
+        # The author pushes back on this reviewer's findings without changing the code (#71).
+        # (A retry of that pass too: the request marked its round.)
+        pushback = followup and refs.get("pushback_round") == t["round"]
         rebase_note = fallback = ""
         try:
             full_diff, full_heading = self.review_diff(refs, interdiff=False)
-            if rebased:
+            if pushback:
+                pass  # no interdiff: the head is the one it last reviewed
+            elif rebased:
                 inter, why = self.rebase_interdiff(refs, old_base, full_diff)
                 if inter is None:
                     resume, fallback = False, f" Full diff: the base changed and {why}."
@@ -900,17 +939,25 @@ class Worker:
         # The self-contained prompt (first pass, retry, or a follow-up whose session can't be
         # resumed) always has the full base..head diff, the reviewer's earlier verdicts and
         # every note on the thread, so a fresh session never reviews a partial view.
-        fresh = self.review_prompt(t, refs, full_diff, full_heading, notes(everything), earlier)
-        if resume:
+        approved = mine is not None and mine["data"].get("verdict") == "approve"
+        fresh = self.review_prompt(t, refs, full_diff, full_heading, notes(everything), earlier,
+                                   approved=approved, pushback=pushback)
+        replies = "\n\n".join(prompts.render_message(m) for m in notes([m for m in everything
+                                                                       if m["id"] > since])) or "(no replies)"
+        if resume and pushback:
+            prompt = prompts.REVIEW_PUSHBACK.format(head=refs["head_commit_id"], replies=replies,
+                                                    severity=prompts.SEVERITY, budget=budget_note(t))
+        elif resume:
+            converge = prompts.CONVERGE + (prompts.ALREADY_APPROVED.format(prev=refs["prev_head_commit_id"])
+                                           if approved else "")
             prompt = prompts.REVIEW_FOLLOWUP.format(
-                head=refs["head_commit_id"], prev=refs["prev_head_commit_id"],
-                replies="\n\n".join(prompts.render_message(m) for m in notes([m for m in everything
-                                                                              if m["id"] > since]))
-                or "(no replies)",
-                rebase=rebase_note, diff_heading=inter_heading, diff=inter)
+                head=refs["head_commit_id"], prev=refs["prev_head_commit_id"], replies=replies,
+                rebase=rebase_note, converge=converge, severity=prompts.SEVERITY, budget=budget_note(t),
+                diff_heading=inter_heading, diff=inter)
         else:
             prompt = fresh
-        self.system(f"Review {'follow-up ' if followup else ''}{'(retry) ' if mode == 'retry' else ''}"
+        what = "pushback " if pushback else "follow-up " if followup else ""
+        self.system(f"Review {what}{'(retry) ' if mode == 'retry' else ''}"
                     f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.{fallback}")
         res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh)
         if res.quota or res.format_changed or res.config_error:
@@ -925,9 +972,12 @@ class Worker:
             self.mark_delivered(reviewer, upto)
         verdict = normalize_verdict(extract_json(res.text) if res.text else None)
         gave = res  # the turn the verdict came from
-        if verdict is None and res.ok:
-            res2 = self.turn(reviewer, "Reply again with only the JSON verdict object described above.",
-                             fresh_prompt=fresh + "\n\nReply with only the JSON verdict object.")
+        problem = verdict_problem(verdict) if verdict else None
+        if (verdict is None or problem) and res.ok:
+            ask = (f"Your verdict is inconsistent: {problem}. Reply again with only the corrected JSON "
+                   "verdict object described above." if problem else
+                   "Reply again with only the JSON verdict object described above.")
+            res2 = self.turn(reviewer, ask, fresh_prompt=fresh + "\n\n" + ask)
             if res2.quota or res2.format_changed or res2.config_error:
                 if res2.quota:
                     self.park_on_quota(reviewer)
@@ -937,16 +987,20 @@ class Worker:
             if res2.incomplete:
                 res = res2
             verdict, gave = normalize_verdict(extract_json(res2.text) if res2.text else None), res2
-        if verdict is None:
+            problem = verdict_problem(verdict) if verdict else None
+        elif problem:
+            verdict = None  # an inconsistent verdict with no repair turn: not usable
+        if verdict is None or problem:
             if self.finish_thread("needs_human"):
-                self.safe_post(SYSTEM, f"{reviewer} did not return a usable verdict: "
-                               f"{res.error or 'no valid JSON verdict'}. Run `agent-bus resume` to retry.",
+                why = (f"gave an inconsistent verdict ({problem})" if problem else
+                       f"did not return a usable verdict: {res.error or 'no valid JSON verdict'}")
+                self.safe_post(SYSTEM, f"{reviewer} {why}. Run `agent-bus resume` to retry.",
                                kind="status", recipient=t["initiator"])
             return None
         lines = [f"Verdict: {verdict['verdict']}", "", verdict["summary"]]
         for f in verdict["findings"]:
             loc = f"{f['file']}:{f['line']}" if f["line"] else f["file"]
-            lines.append(f"- [{f['severity']}] {loc}: {f['comment']}")
+            lines.append(f"- [{severity_tag(f['severity'])}] {loc}: {f['comment']}")
         # The session that gave the verdict, so a later pass resumes it only if it is still
         # the saved one (see interdiff_from).  That turn's own id: a turn that failed without
         # reporting one leaves an older session saved, which never saw this pass.
@@ -1001,8 +1055,17 @@ class Worker:
             self.event("error", f"review not started: {e}")
 
     def review_prompt(self, t: dict, refs: dict, diff: str, heading: str, replies: list[dict],
-                      earlier: list[dict] | None = None) -> str:
+                      earlier: list[dict] | None = None, approved: bool = False, pushback: bool = False) -> str:
         focus = refs.get("focus")
+        # A reviewer with an earlier verdict converges on it rather than starting over (#71).
+        converge = ""
+        if earlier:
+            converge = "\n" + prompts.CONVERGE
+            if pushback:
+                converge += prompts.PUSHBACK_NOTE
+            elif approved and refs.get("prev_head_commit_id"):
+                converge += prompts.ALREADY_APPROVED.format(prev=refs["prev_head_commit_id"])
+            converge += budget_note(t)
         notes = "\n\n".join(prompts.render_message(m) for m in replies)
         if earlier:
             notes = ("Your earlier verdicts on this change (from a session that could not be resumed):\n\n"
@@ -1015,9 +1078,11 @@ class Worker:
             if refs.get("prev_head_commit_id") else "",
             team=(f"\nRequired reviewers: {', '.join(refs['reviewers'])}. They review one at a time, and the "
                   "change is ready once all of them approve the same head. Earlier verdicts from the others "
-                  f"and {t['initiator']}'s replies are below: check whether those findings are fixed and look "
-                  "for problems not already raised." if refs.get("reviewers") else ""),
+                  f"and {t['initiator']}'s replies are below: check whether those findings are fixed"
+                  + ("." if earlier else " and look for problems not already raised.")
+                  if refs.get("reviewers") else ""),
             focus=self.review_notes(t, refs, notes, focus),
+            severity=prompts.SEVERITY, converge=converge,
             diff_heading=heading, diff=diff)
 
     @staticmethod
@@ -1200,6 +1265,45 @@ def normalize_verdict(v: object) -> dict | None:
                       "severity": f.get("severity") if f.get("severity") in ("high", "medium", "low") else "?",
                       "comment": str(f.get("comment") or "")[:4000]})
     return {"verdict": v["verdict"], "summary": str(v.get("summary") or "").strip()[:8000], "findings": clean}
+
+
+BLOCKING = ("high", "medium")
+
+
+def verdict_problem(v: dict) -> str | None:
+    """Why a verdict breaks the severity rule (#71), or None: it requests changes if and
+    only if a finding is high or medium."""
+    blocking = any(f["severity"] in BLOCKING for f in v["findings"])
+    if v["verdict"] == "request_changes" and not blocking:
+        return "request_changes needs at least one high or medium finding; with none, approve"
+    if v["verdict"] == "approve" and blocking:
+        return "a high or medium finding blocks approval; request changes, or downgrade it to low"
+    return None
+
+
+def severity_tag(severity: str) -> str:
+    """``high, blocking`` / ``low, non-blocking`` for a rendered finding."""
+    if severity in BLOCKING:
+        return f"{severity}, blocking"
+    return f"{severity}, non-blocking" if severity == "low" else severity
+
+
+def budget_note(t: dict) -> str:
+    """The reviewer prompt's note once the soft follow-up budget is spent (#71), else ''."""
+    p = review_progress(t)
+    if not p["budget_warning"]:
+        return ""
+    return prompts.BUDGET_SPENT.format(follow_ups=p["follow_ups"], budget=p["followup_budget"])
+
+
+def budget_warning(t: dict) -> str:
+    """The author's notice once the soft follow-up budget is spent (#71), else ''."""
+    p = review_progress(t)
+    if not p["budget_warning"]:
+        return ""
+    return (f"\nThis review has run long: {p['follow_ups']} follow-up requests, soft budget "
+            f"{p['followup_budget']}. Consider deferring non-blocking findings to a follow-up issue, or "
+            f"asking the human user; after {p['followup_limit']} it waits for them.")
 
 
 def drift_reason(error: str) -> str:

@@ -228,6 +228,12 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         Per-reviewer model/effort go in peer_settings, e.g. {"codex": {"effort": "high"}}. If
         several of your reviews could match a follow-up, it fails with REVIEW_AMBIGUOUS: pass
         `thread` to name the one to continue.
+
+        Only high and medium findings block approval. To push back on a finding rather than
+        change the code, `send` your evidence on the thread, then request the same head again
+        (prev_head_commit_id = head_commit_id): the reviewer that asked for changes reconsiders,
+        once per head. REVIEW_LIMIT_REACHED means the review ran past its follow-up budget and
+        waits for the human user.
         """
         return call(svc.request_review, reviewer=reviewer, repo=repo, change_id=change_id,
                     base_commit_id=base_commit_id, head_commit_id=head_commit_id,

@@ -198,6 +198,7 @@ DEFAULTS = {
     "auto_resume_max": 3,
     "max_messages": 60,
     "max_diff_bytes": 200_000,
+    "review_followup_budget": 3,
     "peers": {},
     "participants": {},
     "agents": None,
@@ -243,6 +244,9 @@ class Config:
     auto_resume_max: int = 3
     max_messages: int = 60
     max_diff_bytes: int = 200_000
+    # Author follow-up requests on a review thread before agent-bus warns that the review is
+    # running long (#71); a review still blocked after twice as many waits for the human.
+    review_followup_budget: int = 3
     # Per-agent overrides: {"claude": {"command": "/path/claude", "args": [...]}}
     peers: dict = field(default_factory=dict)
     # Named participants (#43): {"codex-mini": {"harness": "codex", "model": "...", ...}}.
@@ -267,6 +271,9 @@ class Config:
         if isinstance(conf.auto_resume_max, bool) or not isinstance(conf.auto_resume_max, int) \
                 or conf.auto_resume_max < 0:
             raise ValueError("auto_resume_max must be a whole number, 0 or more")
+        b = conf.review_followup_budget
+        if isinstance(b, bool) or not isinstance(b, int) or b < 1:
+            raise ValueError("review_followup_budget must be a whole number, 1 or more")
         conf._repo_entries()  # reject a malformed repos entry when loading
         if not isinstance(conf.peers, dict):
             raise ValueError("config `peers` must be an object keyed by harness")

@@ -22,6 +22,9 @@ reply is posted for you, and you must not call agent-bus tools.
   thread, so first `send` it a short note on how you addressed each finding. Then `wait(thread)`.
   When several agents must all approve, pass `reviewers=[...]` instead of `reviewer`: they review
   one at a time on one thread, and the change is ready once all of them approve the same head.
+  Only `high` and `medium` findings block. To push back on one instead of changing the code,
+  `send` your evidence and request the same head again (`prev_head_commit_id` = `head_commit_id`).
+  `REVIEW_LIMIT_REACHED` means the review ran past its follow-up budget: stop and tell the user.
 - **Don't ping-pong.** Reply only when you have something new. Threads have message and round caps;
   `THREAD_LIMIT_REACHED` means stop and tell the user.
 - Peers run headless and read-only in allow-listed repos. Discussions produce decisions, not edits.

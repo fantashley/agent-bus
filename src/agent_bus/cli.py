@@ -12,7 +12,7 @@ import time
 
 from . import config as cfg
 from . import hooks, rex
-from .db import HUMAN, SYSTEM, Bus, BusError
+from .db import HUMAN, SYSTEM, Bus, BusError, format_progress
 from .service import Service, present, thread_summary
 from .worker import format_review
 
@@ -57,7 +57,7 @@ def thread_status(bus: Bus, thread: str) -> tuple[str, str | None, str]:
             return "idle", None, f"{thread}: changes requested by {', '.join(st['changes_requested'])}"
     if job:
         if t["kind"] == "review":
-            return "working", None, f"{thread}: {(t['refs'] or {}).get('reviewer')} reviewing"
+            return "working", None, f"{thread}: {(t['refs'] or {}).get('reviewer')} reviewing (pass {t['round']})"
         return "working", None, f"{thread}: round {t['round']}/{t['max_rounds']}"
     # Waiting on an interactive session that has mail here: only the human can nudge it (#20).
     waiting = hooks.mail_waiting(bus, thread)
@@ -240,8 +240,8 @@ def cmd_ask(bus: Bus, args: argparse.Namespace) -> int:
 def _print_history(bus: Bus, thread: str, color: bool) -> None:
     h = bus.history(thread)
     t = h["thread"]
-    print(_color(SYSTEM, f"{t['id']} [{t['status']}] {t['kind']} r{t['round']}/{t['max_rounds']}: {t['goal']}",
-                 color))
+    rounds = format_progress(t) if t["kind"] == "review" else f"r{t['round']}/{t['max_rounds']}"
+    print(_color(SYSTEM, f"{t['id']} [{t['status']}] {t['kind']} {rounds}: {t['goal']}", color))
     if t["kind"] == "review" and (t["refs"] or {}).get("reviewers"):
         st = bus.review_standings(thread)
         print(_color(SYSTEM, f"required reviewers at head {str(st['head_commit_id'])[:12]}"
@@ -568,7 +568,11 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         rows = []
         for t in ts:
             job = bus.active_job(t["id"])
-            rows.append((t["id"], t["status"], t["kind"], f"{t['round']}/{t['max_rounds']}",
+            # Reviews: pass and follow-ups against the budget (#71), e.g. "pass5,fu2/3".
+            rounds = (format_progress(t).replace("pass ", "pass").replace(", follow-ups ", ",fu")
+                      .replace(", budget warning", ",warn").replace(", waiting for human", ",human")
+                      if t["kind"] == "review" else f"{t['round']}/{t['max_rounds']}")
+            rows.append((t["id"], t["status"], t["kind"], rounds,
                          job["status"] if job else "-", ",".join(t["participants"]), t["goal"]))
         head = ("THREAD", "STATUS", "KIND", "ROUND", "WORKER", "PARTICIPANTS")
         widths = [max(len(head[i]), *(len(r[i]) for r in rows)) for i in range(5)]
@@ -604,7 +608,9 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
     if args.cmd == "resume":
         res = svc.resume(args.thread, extra_rounds=args.rounds)
         t = res["thread"]
-        print(f"resumed {t['id']}: status {t['status']}, max rounds {t['max_rounds']}"
+        limit = (f"follow-ups {t['follow_ups']}, limit {t['followup_limit']}" if t["kind"] == "review"
+                 else f"max rounds {t['max_rounds']}")
+        print(f"resumed {t['id']}: status {t['status']}, {limit}"
               + (f", job {res['job']['id']}" if res.get("job") else ""))
         return 0
     if args.cmd == "rex-check":

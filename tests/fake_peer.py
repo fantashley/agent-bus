@@ -86,12 +86,14 @@ if os.environ.get("FAKE_REPLAY") and agent in os.environ.get("FAKE_REPLAY_AGENTS
     sys.exit(int(os.environ.get("FAKE_REPLAY_EXIT", "1")))
 
 repair = "Reply again with only" in prompt
+# A review pass: a diff, an interdiff, or a same-head pushback (#71).
+reviewing = behaviour == "review" or any(k in prompt for k in ("Diff from base to head", "Interdiff",
+                                                                 "has not changed the code"))
 if behaviour == "nojson" and not repair:
     reply = "Thinking out loud, no JSON."
-elif (behaviour == "review" or "Diff from base to head" in prompt or "Interdiff" in prompt) \
-        and agent in os.environ.get("FAKE_APPROVE", "").split(","):
+elif reviewing and agent in os.environ.get("FAKE_APPROVE", "").split(","):
     reply = 'All good.\n{"verdict": "approve", "summary": "fine", "findings": []}'
-elif behaviour == "review" or "Diff from base to head" in prompt or "Interdiff" in prompt:
+elif reviewing:
     reply = 'Looks fine.\n{"verdict": "request_changes", "summary": "one bug", "findings": [{"file": "a.txt", "line": 1, "severity": "high", "comment": "typo"}]}'
 elif behaviour == "garbage":
     reply = "I refuse to emit JSON."

@@ -1102,7 +1102,8 @@ def test_verdict_from_a_turn_without_a_session_id_is_not_resumed(env, no_spawn, 
     claude.request_review("codex", str(repo), x, h, prev_head_commit_id=p)
     with monkeypatch.context() as m:
         m.setattr(Worker, "turn", lambda self, *a, **k: TurnResult(
-            ok=False, text='{"verdict": "request_changes", "summary": "s", "findings": []}',
+            ok=False, text='{"verdict": "request_changes", "summary": "s", "findings": '
+            '[{"file": "a.txt", "line": 1, "severity": "high", "comment": "bug"}]}',
             error="turn timed out"))
         run_job(bus, a)
     assert bus.last_verdict(a, "codex")["data"]["head_commit_id"] == h
