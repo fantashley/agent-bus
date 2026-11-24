@@ -52,8 +52,8 @@ MODEL_FLAGS = {"codex": ("-m", "--model")}
 def effective_model(config: cfg.Config, agent: str, settings: dict) -> str | None:
     """The model participant ``agent``'s turn runs: the per-thread or config setting (which
     replaces any model flag in the extra args), else the last model flag the configured
-    extra args pass, else (Claude) ANTHROPIC_MODEL in its configured env, else None (the
-    CLI's default)."""
+    extra args pass, else ANTHROPIC_MODEL (Claude, its configured env) or COPILOT_MODEL
+    (Copilot, its configured env, else the worker's), else None (the CLI's default)."""
     if settings.get("model"):
         return settings["model"]
     flags = MODEL_FLAGS.get(config.harness_of(agent), ("--model",))
@@ -70,6 +70,9 @@ def effective_model(config: cfg.Config, agent: str, settings: dict) -> str | Non
     if found is None and config.harness_of(agent) == "claude":
         # Claude Code's model variable, when agent-bus sets it for the participant (#36).
         found = config.peer_env(agent).get("ANTHROPIC_MODEL") or None
+    elif found is None and config.harness_of(agent) == "copilot":
+        # Copilot's model variable, below --model in its precedence (#2).
+        found = config.effective_env(agent, "COPILOT_MODEL") or None  # configured, else inherited
     return found
 
 
@@ -102,12 +105,16 @@ def model_scope(config: cfg.Config, agent: str, model: str | None) -> str:
     return model_key(model)
 
 
-def scope_for(config: cfg.Config, agent: str, model: str | None, source: str = "heuristic") -> str:
+def scope_for(config: cfg.Config, agent: str, model: str | None, source: str = "heuristic",
+              per_model: bool = False) -> str:
     """Claude and Codex limits are account-wide; an Antigravity quota may be per model, and
-    a Bedrock throttle or quota is per model and region.  Credentials are account-wide."""
+    a Bedrock throttle or quota is per model and region.  Copilot runs many vendors' models
+    and has both kinds (#2): its adapter says ``per_model`` for "the rate limit for this
+    model", and its session, weekly and plan limits stay account-wide.  Credentials are
+    account-wide."""
     if source == "auth":
         return ""
-    if config.harness_of(agent) == "antigravity" or config.bedrock(agent):
+    if per_model or config.harness_of(agent) == "antigravity" or config.bedrock(agent):
         return model_scope(config, agent, model)
     return ""
 

@@ -1,5 +1,5 @@
 {
-  description = "agent-bus: a local message bus for Claude Code, Codex and Antigravity";
+  description = "agent-bus: a local message bus for Claude Code, Codex, Antigravity and Copilot CLI";
 
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 

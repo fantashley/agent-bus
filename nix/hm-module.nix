@@ -22,6 +22,9 @@ self:
 #   Rex-aware interactive Codex sessions need `codex --no-daemon`. This module
 #   doesn't change how codex is launched or its features (see README).
 # - Antigravity: a plugin directory linked at ~/.gemini/config/plugins/agent-bus.
+# - Copilot CLI: `agent-bus setup-copilot` at activation, which adds or fixes only
+#   the agent-bus entry in ~/.copilot/mcp-config.json ($COPILOT_HOME), leaving
+#   every other server alone; a no-op when it already matches.
 
 let
   cfg = config.local.agentBus;
@@ -46,13 +49,13 @@ let
       plugins = [{
         name = "agent-bus";
         source = "./plugins/agent-bus";
-        description = "Talk to Codex and Antigravity over the local agent bus";
+        description = "Talk to Codex, Antigravity and Copilot CLI over the local agent bus";
       }];
     }} $out/.claude-plugin/marketplace.json
     cp ${json.generate "plugin.json" {
       name = "agent-bus";
       version = cfg.package.version;
-      description = "Talk to Codex and Antigravity over the local agent bus";
+      description = "Talk to Codex, Antigravity and Copilot CLI over the local agent bus";
     }} $out/plugins/agent-bus/.claude-plugin/plugin.json
     # The command is the profile's agent-bus, the same path in every build. `/reload-plugins`
     # only restarts a plugin's MCP server when its entry changes (a new plugin version alone
@@ -187,8 +190,8 @@ in
       default = null;
       example = [ "claude" "codex" "codex-mini" ];
       description = ''
-        The participants available on this machine: the built-in claude, codex and
-        antigravity, and any names from `participants`. Discussions and reviews default to
+        The participants available on this machine: the built-in claude, codex,
+        antigravity and copilot, and any names from `participants`. Discussions and reviews default to
         these, naming any other fails up front, and registration is only done for the
         clients they run on. Null detects them at runtime (a CLI found on PATH counts).
       '';
@@ -198,7 +201,7 @@ in
       type = lib.types.attrsOf (lib.types.submodule {
         options = {
           harness = lib.mkOption {
-            type = lib.types.enum [ "claude" "codex" "antigravity" ];
+            type = lib.types.enum [ "claude" "codex" "antigravity" "copilot" ];
             description = "The CLI harness that runs this participant.";
           };
           model = lib.mkOption {
@@ -275,7 +278,7 @@ in
         Named participants: separately addressable agents (a sender name, a mailbox, a
         discussion peer or reviewer) run by one of the harnesses with their own settings.
         Settings left null come from the harness's `peerSettings` and `peers.<harness>`
-        config. The built-in claude, codex and antigravity are always participants too. An
+        config. The built-in claude, codex, antigravity and copilot are always participants too. An
         interactive client speaks as one with `agent-bus mcp --agent <harness> --participant
         <name>`.
       '';
@@ -384,6 +387,15 @@ in
         turn boundaries.
       '';
     };
+    copilot.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = listed "copilot";
+      defaultText = lib.literalExpression ''agents == null || elem "copilot" agents || a listed participant runs on copilot'';
+      description = ''
+        Register agent-bus with GitHub Copilot CLI (`agent-bus setup-copilot`, which edits
+        only the agent-bus entry of ~/.copilot/mcp-config.json) when copilot is on PATH.
+      '';
+    };
     antigravity.enable = lib.mkOption {
       type = lib.types.bool;
       default = if cfg.agents == null then defaultAntigravity else listed "antigravity";
@@ -440,6 +452,17 @@ in
 
     (lib.mkIf cfg.antigravity.enable {
       home.file.".gemini/config/plugins/agent-bus".source = antigravityPlugin;
+    })
+
+    (lib.mkIf cfg.copilot.enable {
+      home.activation.agentBusCopilot = lib.hm.dag.entryAfter [ "writeBoundary" "installPackages" ] ''
+        PATH="${config.home.profileDirectory}/bin:/etc/profiles/per-user/${config.home.username}/bin:$PATH"
+        if command -v copilot >/dev/null 2>&1; then
+          run ${lib.escapeShellArg bin} setup-copilot --bin ${lib.escapeShellArg bin}
+        else
+          verboseEcho "agent-bus: copilot not on PATH; skipping Copilot MCP registration"
+        fi
+      '';
     })
 
     (lib.mkIf cfg.codex.enable {

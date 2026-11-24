@@ -17,6 +17,7 @@ from .service import Service, present, thread_summary
 from .worker import format_review
 
 COLORS = {"claude": "\x1b[38;5;173m", "codex": "\x1b[38;5;75m", "antigravity": "\x1b[38;5;114m",
+          "copilot": "\x1b[38;5;141m",
           HUMAN: "\x1b[1;38;5;220m", SYSTEM: "\x1b[2m"}
 RESET = "\x1b[0m"
 
@@ -303,6 +304,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="only update Codex's hooks.json; leave config.toml untouched")
     s.add_argument("--hooks-bin", help="stable agent-bus path for hooks.json (default: --bin)")
 
+    s = sub.add_parser("setup-copilot", help="register agent-bus with GitHub Copilot CLI")
+    s.add_argument("--bin", help="agent-bus executable Copilot should run (default: this one)")
+
     s = sub.add_parser("run-job", help="(internal) run a queued job")
     s.add_argument("job")
 
@@ -433,6 +437,18 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"codex: agent-bus hooks {codex_setup.ensure_hooks(enable=False)}")
         except (codex_setup.SetupError, OSError, UnicodeError, subprocess.TimeoutExpired) as e:
             print(f"agent-bus: setup-codex: {e}", file=sys.stderr)
+            return 1
+        return 0
+    if args.cmd == "setup-copilot":
+        from . import copilot_setup
+        me = cfg.self_command()
+        if not args.bin and len(me) != 1:
+            print("agent-bus: setup-copilot: can't tell where agent-bus is installed; pass --bin", file=sys.stderr)
+            return 1
+        try:
+            print(f"copilot: agent-bus entry {copilot_setup.ensure(os.path.abspath(args.bin or me[0]))}")
+        except (copilot_setup.SetupError, OSError) as e:
+            print(f"agent-bus: setup-copilot: {e}", file=sys.stderr)
             return 1
         return 0
     if args.cmd == "run-job":

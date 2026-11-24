@@ -144,13 +144,13 @@ def test_default_roster_skips_blocked_peers_and_explicit_ones_fail(env, no_spawn
     human = Service(bus, HUMAN)
     res = human.start_discussion("Which DB?")
     assert set(res["skipped_peers"]) == {"codex"}
-    assert res["thread"]["participants"] == ["claude", "antigravity"]
+    assert res["thread"]["participants"] == ["claude", "antigravity", "copilot"]
     opening = [m for m in bus.history(res["thread"]["id"])["messages"] if m["sender"] == SYSTEM]
     assert "Left out: peer codex" in opening[0]["body"]
     with pytest.raises(BusError) as e:
         human.start_discussion("Which DB?", peers=["claude", "codex"])
     assert e.value.code == "USAGE_EXHAUSTED"
-    for a in ("claude", "antigravity"):
+    for a in ("claude", "antigravity", "copilot"):
         bus.set_quota_block(a, time.time() + 600, "heuristic", "quota", estimated=True)
     with pytest.raises(BusError) as e:
         human.start_discussion("Which DB?")

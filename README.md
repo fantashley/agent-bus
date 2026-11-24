@@ -1,6 +1,6 @@
 # agent-bus
 
-A local message bus that lets **Claude Code**, **Codex** and **Antigravity** talk to each other
+A local message bus that lets **Claude Code**, **Codex**, **Antigravity** and **GitHub Copilot CLI** talk to each other
 directly, instead of a human relaying messages between windows. Designed in
 [fantashley/dotfiles#131](https://github.com/fantashley/dotfiles/issues/131).
 
@@ -24,7 +24,9 @@ directly, instead of a human relaying messages between windows. Designed in
   can't be listed) and its `apps` feature switched off; Antigravity gets session-only deny rules
   for commands and file writes, and since it has no per-session switch for MCP servers, its turns
   are refused while it has any MCP server besides agent-bus configured, unless
-  `peers.antigravity.allow_mcp` is set. Any
+  `peers.antigravity.allow_mcp` is set. Copilot CLI sees only its file viewing and search
+  tools (`--available-tools`), with shell, writes and memory denied, every MCP server it lists
+  switched off, and the turn stopped if one comes up live anyway. Any
   agent-bus MCP server a peer launches sees `AGENT_BUS_PEER` and refuses every call. The repo
   allowlist decides which repos requests may target and where peers run; reads are bounded by
   each CLI's read-only mode, not by the allowlist.
@@ -187,6 +189,7 @@ its thread for later passes unless new ones are given.
 | Claude Code | `--model`, `--effort` | low, medium, high, xhigh, max |
 | Codex | `-m`, `-c model_reasoning_effort=…` | minimal, low, medium, high, xhigh |
 | Antigravity | `--model`, `--effort` | low, medium, high, xhigh, max |
+| Copilot CLI | `--model`, `--reasoning-effort` | none, minimal, low, medium, high, xhigh, max (what a model supports varies) |
 
 Other effort values, and model names outside a safe character set, are rejected when the
 config loads or when the request is made. The flags are passed on resumed turns too, and each
@@ -202,6 +205,7 @@ else stays read-only:
 | Claude Code | WebSearch, WebFetch | `--tools` (the session's whole built-in set) and `--allowedTools` | removed and `--disallowedTools` |
 | Codex | hosted `web_search`: search and open pages | `-c web_search="cached"`, unless `peers.codex.args` sets another mode | `-c web_search="disabled"` (also when `peers.codex.args` sets it) |
 | Antigravity | `search_web` only: plan mode has no page fetch | needs no approval in plan mode | the turn's agent (`--agent`) has no `search_web` |
+| Copilot CLI | `web_fetch` only: Copilot has no search tool | `web_fetch` in `--available-tools`, and `--allow-all-urls` (`-p` denies an unapproved fetch) | `web_fetch` left out of `--available-tools`, no URL rule |
 
 To turn it off for an agent, set `peers.<agent>.web_search = false` in `config.json` (or
 `local.agentBus.peerSettings.<agent>.web_search = false`). To turn it off for every agent in a
@@ -236,6 +240,24 @@ and agy 1.5.13:
   collaboration tools (`spawn_agent` and friends) stay: nothing switches them off, and a spawned
   agent runs in the same read-only sandbox. The MCP listing that decides which
   servers to switch off sees every `-c`/`--config` spelling and `--profile` from those args.
+- **Copilot CLI** (1.0.108, live probes 2026-11-23): `-p` with the prompt on stdin and
+  `--output-format json`. `--available-tools=view,grep,rg,glob` (plus `web_fetch` when web search
+  is on) is the session's whole tool set, so bash, `apply_patch`, `task` sub-agents, skills, `sql`,
+  dynamic workflows and every MCP tool are undeclared; `--deny-tool` rules for `shell`, `write`
+  and `memory` back that up (deny beats any allow, `allow-all` settings included). Every server
+  `copilot mcp list --json` shows in the turn's directory gets `--disable-mcp-server` (agent-bus
+  too), `--disable-builtin-mcps` turns off the GitHub MCP server, and the turn fails if the list
+  can't be read. Its `session.mcp_servers_loaded` event is checked too: a server that isn't
+  `disabled` stops the turn before it runs. `--sync-session=off` keeps reviewed code out of your
+  GitHub session history, and `--no-auto-update` runs the binary agent-bus fingerprinted.
+  `COPILOT_ALLOW_ALL`, `COPILOT_ASSISTED_APPROVAL` and the `GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS` /
+  `_WORKSPACE_MCP` opt-ins are removed from its environment (and refused in a configured `env`),
+  and options in `peers.copilot.args` that widen tools, permissions, paths, URLs, MCP servers or
+  plugins, or pick the session, mode or output, are dropped. A trusted folder's repository hooks
+  still load in `-p`, run commands outside the tool set and see the prompt, and no flag turns them
+  off: so a checkout with hooks Copilot reads (`.github/hooks/*.json`, or a `hooks` key in
+  `.github/copilot/settings*.json` or `.claude/settings*.json`) fails the turn, unless
+  `.github/copilot/settings.json` sets `disableAllHooks`. Your own user and plugin hooks still run.
 - **Antigravity:** every turn passes `--settings` with deny rules for `command(*)`,
   `write_file(*)` (which covers edits) and `execute_url(*)` (the browser subagent). Deny wins over
   any allow rule in your own settings, so a `--settings` in `peers.antigravity.args` is dropped.
@@ -266,13 +288,15 @@ turns on it and tells you when it should be back. This was agreed on agent-bus t
 - **Detection:** only a turn that failed counts, never one that produced a reply.
   - **Claude Code:** structured. The stream's `rate_limit_event` says the request was rejected
     (without overage) and gives the reset time.
-  - **Codex and Antigravity:** their own usage-limit or quota wording in the failure. A bare 429,
+  - **Codex, Antigravity and Copilot CLI:** their own usage-limit or quota wording in the
+    failure (Copilot's is from `copilot help limits`, not yet seen live). A bare 429,
     an overload, a context-length error or a `RESOURCE_EXHAUSTED` without quota wording stays
     an ordinary error. The raw error is kept in the progress events.
 - **Cache:** the agent is marked out of usage until the reset time, clamped to 7 days. With no
   usable reset time, it's skipped for `quota_cooldown_s`, 15 minutes by default, marked as an
   estimate. Claude and Codex limits are account-wide; an Antigravity block applies to the model
-  that hit it. Blocks expire on their own, and a successful turn lifts one.
+  that hit it. Copilot CLI runs many vendors' models, so its "rate limit for this model" blocks
+  only that model, and its session, weekly and plan limits block the account. Blocks expire on their own, and a successful turn lifts one.
 - **New requests:**
   - default rosters (`ask` / `start_discussion` without peers) leave the agent out and say so;
   - naming it as a peer or reviewer fails at once with `USAGE_EXHAUSTED`, giving the reset time.
@@ -324,8 +348,8 @@ turns on it and tells you when it should be back. This was agreed on agent-bus t
     (`$CODEX_HOME/sessions/…/rollout-…-<session>.jsonl`, in the participant's `codex_home`
     if it sets one) does: the last `token_count` event's
     `rate_limits.primary` / `secondary`, with `used_percent`, `window_minutes` and `resets_at`.
-  - **Antigravity** (agy 1.5.13) reports nothing of the kind, in its stream or elsewhere, so it
-    never gets a warning before it runs out.
+  - **Antigravity** (agy 1.5.13) and **Copilot CLI** (1.0.108) report nothing of the kind in
+    their streams, so they never get a warning before they run out.
 
   A window that has reset since its reading stops counting (a reading with no reset time, after
   6 hours). The warning shows up in `agent-bus agents` (`NEAR THE LIMIT`, and `usage_limits` /
@@ -654,6 +678,10 @@ This installs the CLI, writes `~/.config/agent-bus/config.json`, and registers t
   matches; the rest of `~/.codex/config.toml` is left alone.
 - **Antigravity:** a plugin linked at `~/.gemini/config/plugins/agent-bus` (on by default when
   `local.antigravity.enable` is set).
+- **Copilot CLI:** `agent-bus setup-copilot` at activation adds or fixes only the `agent-bus`
+  entry in `~/.copilot/mcp-config.json` (`$COPILOT_HOME`), keeping every other server and key,
+  and refuses a file that isn't a JSON object. Skipped when the entry already matches. Copilot
+  has no agent-bus hooks yet, and whether it reports Rex program status is unverified.
 
 Add [`docs/AGENTS-section.md`](docs/AGENTS-section.md) to the shared global agent rules.
 
@@ -706,9 +734,12 @@ You don't need all three agents. agent-bus works with whichever of them a machin
 ### Named participants
 
 A participant is an identity on the bus: a sender name, a mailbox, a discussion peer, a
-reviewer. A harness is the CLI that runs it (Claude Code, Codex, Antigravity). By default
-each harness runs one participant with its own name, so `claude`, `codex` and `antigravity`
-work as they always have. You can add more participants on the same harness, each with its
+reviewer. A harness is the CLI that runs it (Claude Code, Codex, Antigravity, Copilot CLI). By
+default each harness runs one participant with its own name, so `claude`, `codex`,
+`antigravity` and `copilot` work as they always have. Copilot CLI is a harness for many
+vendors' models, so it suits several participants, e.g.
+`copilot-gpt = { harness = "copilot"; model = "gpt-6.2-sol"; }` next to
+`copilot-sonnet = { harness = "copilot"; model = "claude-sonnet-5.5"; }`. You can add more participants on the same harness, each with its
 own model and launch settings:
 
 ```nix

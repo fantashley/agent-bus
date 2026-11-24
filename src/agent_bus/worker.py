@@ -445,7 +445,8 @@ class Worker:
         with self.fenced():  # the cache is shared: only a worker that still holds its lease writes it
             subj = quota.subject(self.config, agent)  # shared by every participant on it
             block = self.bus.set_quota_block(subj, until, source, quota.reason(subj, source),
-                                             scope=quota.scope_for(self.config, agent, model, source),
+                                             scope=quota.scope_for(self.config, agent, model, source,
+                                                                   per_model=found.get("scope") == "model"),
                                              estimated=estimated)
         found.update(resets_at=until)
         self.quota_notice(agent, block)
@@ -523,11 +524,11 @@ class Worker:
 
     def preamble(self, agent: str, t: dict) -> str:
         repo_note = f" in {t['repo']}" if t["repo"] else ""
-        web = adapter(agent, self.config, repo=t["repo"]).web_search  # as the turn itself resolves it
+        peer = adapter(agent, self.config, repo=t["repo"])  # web search as the turn itself resolves it
         return prompts.PREAMBLE.format(
             agent=agent, thread=t["id"], participants=", ".join(t["participants"]),
             initiator="the human user" if t["initiator"] == HUMAN else t["initiator"], repo_note=repo_note,
-            web_note=" and search the web" if web else "")
+            web_note=peer.web_note if peer.web_search else "")
 
     def question(self, t: dict) -> str:
         """The question, fenced as peer data when an agent (not the human user) asked it."""
