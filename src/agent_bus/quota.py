@@ -72,7 +72,7 @@ def effective_model(config: cfg.Config, agent: str, settings: dict) -> str | Non
         found = config.peer_env(agent).get("ANTHROPIC_MODEL") or None
     elif found is None and config.harness_of(agent) == "copilot":
         # Copilot's model variable, below --model in its precedence (#2).
-        found = config.peer_env(agent).get("COPILOT_MODEL") or None
+        found = config.effective_env(agent, "COPILOT_MODEL") or None  # configured, else inherited
     return found
 
 

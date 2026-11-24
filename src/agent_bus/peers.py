@@ -1447,6 +1447,53 @@ def _copilot_strip(args: list[str], drop: set[str]) -> list[str]:
     return out
 
 
+def _copilot_repo_hooks_check(cwd: str) -> None:
+    """Refuse a checkout that defines repository hooks Copilot could run.
+
+    Copilot loads a repository's hooks in -p mode when the folder is trusted, and nothing
+    on its command line or in its environment switches them off (hooks reference, 1.0.108).
+    A hook runs commands at session start, before and outside the turn's read-only tool
+    set, and sees the review prompt.  agent-bus can't tell whether the user trusted the
+    folder, so any repository hook fails the turn (#98 covers the other harnesses).
+    Copilot's own repo-wide off switch, ``disableAllHooks`` in .github/copilot/settings.json,
+    is honoured."""
+    roots = [Path(cwd)]
+    for d in (Path(cwd), *Path(cwd).parents):  # the repository root, where Copilot looks
+        if (d / ".git").exists() or (d / ".jj").exists():
+            if d != roots[0]:
+                roots.append(d)
+            break
+
+    def load(f: Path):
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, UnicodeError, ValueError) as e:
+            raise PeerSetupError(f"PEER_SETUP: can't read {f} to check it for Copilot hooks ({e}); "
+                                 "refusing to run the turn") from e
+        return data if isinstance(data, dict) else {}
+
+    found = []
+    for root in roots:
+        settings = root / ".github" / "copilot" / "settings.json"
+        if settings.is_file() and load(settings).get("disableAllHooks") is True:
+            continue
+        hook_files = sorted((root / ".github" / "hooks").glob("*.json")) if (root / ".github" / "hooks").is_dir() else []
+        for f in hook_files:
+            data = load(f)
+            if data.get("hooks") and data.get("disableAllHooks") is not True:
+                found.append(f)
+        for rel in (".github/copilot/settings.json", ".github/copilot/settings.local.json",
+                    ".claude/settings.json", ".claude/settings.local.json"):
+            f = root / rel
+            if f.is_file() and load(f).get("hooks"):
+                found.append(f)
+    if found:
+        raise PeerSetupError(
+            "PEER_SETUP: this checkout defines hooks Copilot can run outside a read-only turn ("
+            + ", ".join(str(f) for f in found) + "); refusing to run the turn. Remove them, or set "
+            "disableAllHooks in .github/copilot/settings.json.")
+
+
 class CopilotAdapter(Adapter):
     """GitHub Copilot CLI (`copilot -p`, 1.0.108; issue #2)."""
     agent = "copilot"
@@ -1518,6 +1565,7 @@ class CopilotAdapter(Adapter):
         return sorted(servers)
 
     def invocation(self, prompt, resume_id, cwd, add_dirs):
+        _copilot_repo_hooks_check(cwd)
         tools = list(COPILOT_TOOLS) + (list(COPILOT_WEB_TOOLS) if self.web_search else [])
         # The prompt is read from stdin when -p is empty (live probe).  --no-auto-update runs
         # the binary agent-bus fingerprinted, not a newer copy it downloaded earlier.

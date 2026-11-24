@@ -250,10 +250,14 @@ and agy 1.5.13:
   can't be read. Its `session.mcp_servers_loaded` event is checked too: a server that isn't
   `disabled` stops the turn before it runs. `--sync-session=off` keeps reviewed code out of your
   GitHub session history, and `--no-auto-update` runs the binary agent-bus fingerprinted.
-  `COPILOT_ALLOW_ALL` and `COPILOT_ASSISTED_APPROVAL` are removed from its environment (and
-  refused in a configured `env`), and options in `peers.copilot.args` that widen tools,
-  permissions, paths, URLs, MCP servers or plugins, or pick the session, mode or output, are
-  dropped.
+  `COPILOT_ALLOW_ALL`, `COPILOT_ASSISTED_APPROVAL` and the `GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS` /
+  `_WORKSPACE_MCP` opt-ins are removed from its environment (and refused in a configured `env`),
+  and options in `peers.copilot.args` that widen tools, permissions, paths, URLs, MCP servers or
+  plugins, or pick the session, mode or output, are dropped. A trusted folder's repository hooks
+  still load in `-p`, run commands outside the tool set and see the prompt, and no flag turns them
+  off: so a checkout with hooks Copilot reads (`.github/hooks/*.json`, or a `hooks` key in
+  `.github/copilot/settings*.json` or `.claude/settings*.json`) fails the turn, unless
+  `.github/copilot/settings.json` sets `disableAllHooks`. Your own user and plugin hooks still run.
 - **Antigravity:** every turn passes `--settings` with deny rules for `command(*)`,
   `write_file(*)` (which covers edits) and `execute_url(*)` (the browser subagent). Deny wins over
   any allow rule in your own settings, so a `--settings` in `peers.antigravity.args` is dropped.

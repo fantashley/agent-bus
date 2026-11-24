@@ -289,13 +289,53 @@ def test_only_the_per_model_rate_limit_is_scoped_to_the_model(env):
     assert quota.scope_for(conf, "copilot", "gpt-x", "heuristic") == ""
 
 
-def test_copilot_model_in_env_names_the_quota_scope(env):
+def test_copilot_model_in_env_names_the_quota_scope(env, monkeypatch):
     # COPILOT_MODEL picks the model below --model: two participants on one account that
     # choose models this way get separate per-model blocks.
     from agent_bus import quota
+    monkeypatch.setenv("COPILOT_MODEL", "gpt-inherited")  # the CLI gets the worker's env too
+    assert quota.effective_model(cfg.Config.load(), "copilot", {}) == "gpt-inherited"
     set_peers(env, copilot={"env": {"COPILOT_MODEL": "gpt-a"}})
     conf = cfg.Config.load()
     assert quota.effective_model(conf, "copilot", {}) == "gpt-a"
     assert quota.effective_model(conf, "copilot", {"model": "gpt-b"}) == "gpt-b"
     set_peers(env, copilot={"env": {"COPILOT_MODEL": "gpt-a"}, "args": ["--model", "gpt-c"]})
     assert quota.effective_model(cfg.Config.load(), "copilot", {}) == "gpt-c"
+
+
+# ------------------------------------------------------------------ repository hooks
+
+
+@pytest.mark.parametrize("rel, content", [
+    (".github/hooks/start.json", {"version": 1, "hooks": {"sessionStart": [{"type": "command", "bash": "touch x"}]}}),
+    (".github/copilot/settings.json", {"hooks": {"sessionStart": [{"type": "command", "bash": "touch x"}]}}),
+    (".claude/settings.json", {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "touch x"}]}]}}),
+])
+def test_repository_hooks_refuse_the_turn(env, rel, content):
+    # A trusted folder's hooks load in -p and run outside the tool set: no flag turns them off.
+    f = env["repo"] / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(content))
+    res, _ = run(env)
+    assert not res.ok and "PEER_SETUP" in res.error and rel.split("/")[-1] in res.error
+    assert not [c for c in calls(env) if c["agent"] == "copilot"]  # nothing was launched
+
+
+def test_repository_hooks_switched_off_or_absent_are_fine(env):
+    (env["repo"] / ".claude").mkdir()
+    (env["repo"] / ".claude" / "settings.local.json").write_text(json.dumps({"permissions": {"allow": []}}))
+    assert run(env)[0].ok
+    hooks = env["repo"] / ".github" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "start.json").write_text(json.dumps({"hooks": {"sessionStart": [{"bash": "x"}]}}))
+    (env["repo"] / ".github" / "copilot").mkdir()
+    (env["repo"] / ".github" / "copilot" / "settings.json").write_text(json.dumps({"disableAllHooks": True}))
+    assert run(env)[0].ok
+
+
+def test_unreadable_hook_config_fails_closed(env):
+    hooks = env["repo"] / ".github" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "broken.json").write_text("{not json")
+    res, _ = run(env)
+    assert not res.ok and "broken.json" in res.error
