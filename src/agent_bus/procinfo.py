@@ -39,6 +39,20 @@ def proc(pid: int) -> tuple[int, str] | None:
         return None
 
 
+def alive(pid: int) -> bool:
+    """Whether ``pid`` is a running process (not gone, not a zombie).  A pid that can't
+    be read counts as alive: callers use this to decide whether something is safe to
+    take over, so an unknown answer must not look like "exited"."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # e.g. EPERM: it exists, owned by someone else
+        return True
+    info = proc(pid)
+    return info is None or info[1] != "Z"
+
+
 def start_time(pid: int) -> str | None:
     """An opaque token for when a process started, so a reused pid isn't mistaken for it."""
     try:

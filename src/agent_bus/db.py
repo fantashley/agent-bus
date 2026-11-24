@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from . import config as cfg
+from . import procinfo
 
 HUMAN = "human"
 SYSTEM = "system"
@@ -234,6 +236,21 @@ def _loads(value: str | None) -> Any:
     return json.loads(value) if value else None
 
 
+# Routine lifecycle notices from before they were tagged quiet (#72): system status
+# messages that only say the next step has begun.
+_LEGACY_QUIET = re.compile(r"^(Discussion started by |Round 1 \(blind\): collecting initial proposals |"
+                           r"Round \d+ of \d+: vote on a proposal |"
+                           r"Review (pushback |follow-up )?(\(retry\) )?requested from \S+ at head )")
+
+
+def is_quiet(m: dict) -> bool:
+    """A routine lifecycle notice ("Round 2 of 3", "Review requested from ..."): it is
+    delivered like any message, but it doesn't end a ``wait`` by itself (#72)."""
+    if m["sender"] != SYSTEM or m["kind"] != "status":
+        return False
+    return bool(m["data"].get("quiet")) or bool(_LEGACY_QUIET.match(m["body"]))
+
+
 def wrap_peer(sender: str, body: str) -> str:
     """Visibly fence text written by another agent."""
     safe = body.replace("[/peer_data]", "[/peer_data​]")
@@ -439,16 +456,45 @@ class Bus:
         session's window, so no Rex location is stored."""
         env = os.environ if env is None else env
         loc = {} if rex_reason else env
-        sid = "s-" + secrets.token_hex(4)
         now = _now()
-        self.conn.execute(
-            "INSERT INTO sessions (id, agent_type, harness, cwd, repo, role, rex_session, rex_block, rex_server,"
-            " rex_reason, client_pid, client_start, pid, started_at, last_seen)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (sid, agent_type, harness or agent_type, cwd, repo, role, loc.get("REX_SESSION"), loc.get("REX_BLOCK"),
-             loc.get("REX_SERVER"), rex_reason, client_pid, client_start, os.getpid(), now, now),
-        )
+        harness = harness or agent_type
+        with self.tx():
+            sid = self._reattachable(agent_type, harness, rex_reason, client_pid, client_start)
+            if sid:
+                # The same client restarted its MCP server (e.g. after "Connection closed"):
+                # carry on as that session, so its read cursors, the threads it started and
+                # its hooks' state stay its own (#72).
+                self.conn.execute(
+                    "UPDATE sessions SET cwd=?, repo=?, role=?, rex_session=?, rex_block=?, rex_server=?, pid=?,"
+                    " last_seen=? WHERE id=?",
+                    (cwd, repo, role, loc.get("REX_SESSION"), loc.get("REX_BLOCK"), loc.get("REX_SERVER"),
+                     os.getpid(), now, sid))
+                return sid
+            sid = "s-" + secrets.token_hex(4)
+            self.conn.execute(
+                "INSERT INTO sessions (id, agent_type, harness, cwd, repo, role, rex_session, rex_block, rex_server,"
+                " rex_reason, client_pid, client_start, pid, started_at, last_seen)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, agent_type, harness, cwd, repo, role, loc.get("REX_SESSION"), loc.get("REX_BLOCK"),
+                 loc.get("REX_SERVER"), rex_reason, client_pid, client_start, os.getpid(), now, now),
+            )
         return sid
+
+    def _reattachable(self, agent_type: str, harness: str, rex_reason: str | None, client_pid: int | None,
+                      client_start: str | None) -> str | None:
+        """The one earlier session a new MCP server of the same client should continue, or
+        None.  The client must be verified (pid and start time) and not a shared daemon
+        serving several windows; every earlier session of that client, participant and
+        harness must have lost its server; and there must be exactly one, so an ambiguous
+        history starts afresh rather than guessing."""
+        if rex_reason or not client_pid or not client_start:
+            return None
+        rows = self._all("SELECT id, pid FROM sessions WHERE agent_type=? AND COALESCE(harness, agent_type)=?"
+                         " AND client_pid=? AND client_start=? AND rex_reason IS NULL",
+                         agent_type, harness, client_pid, client_start)
+        if len(rows) != 1 or rows[0]["pid"] is None or procinfo.alive(rows[0]["pid"]):
+            return None
+        return rows[0]["id"]
 
     def touch_session(self, sid: str) -> None:
         self.conn.execute("UPDATE sessions SET last_seen=? WHERE id=?", (_now(), sid))
@@ -723,6 +769,18 @@ class Bus:
             "INSERT INTO cursors VALUES (?,?,?) ON CONFLICT(subscriber, thread_id)"
             " DO UPDATE SET last_id=max(last_id, excluded.last_id)", (subscriber, thread_id, last_id))
 
+    def cursor(self, subscriber: str, thread_id: str) -> int:
+        """The id of the last message on the thread this subscriber has read (0: none)."""
+        return self._cursor(subscriber, thread_id)
+
+    def last_message_id(self, thread_id: str) -> int:
+        row = self._one("SELECT MAX(id) AS id FROM messages WHERE thread_id=?", thread_id)
+        return row["id"] or 0
+
+    def mark_read(self, subscriber: str, thread_id: str, last_id: int) -> None:
+        """Move the subscriber's cursor on the thread forward to ``last_id`` (never back)."""
+        self._set_cursor(subscriber, thread_id, last_id)
+
     def candidate_threads(self, agent_type: str) -> list[dict]:
         """Threads that can hold unread mail for ``agent_type``: open, or changed in the
         last day, and involving it.  Not capped, so repeated reads always reach every
@@ -764,6 +822,36 @@ class Bus:
             if len(out) >= limit:
                 break
         return out
+
+    def replay(self, subscriber: str, agent_type: str, thread_id: str, after: int, limit: int = 50) -> list[dict]:
+        """Messages for ``agent_type`` on the thread after message ``after`` (which the reader
+        says it has seen), whatever this subscriber's cursor says, e.g. to recover a reply
+        lost when a connection dropped (#72).  The cursor moves on to the last one, or with
+        none, to ``after``: never back, never past the thread's last message, and never past
+        a message round 1 still hides from the reader, which the replay stops short of as
+        a read from the cursor does.  One transaction, so blindness, the rows and the
+        cursor move all come from the same state (a resumed thread can be blind again)."""
+        with self.tx():
+            t = self.thread(thread_id)
+            after = max(0, after)
+            bound = None
+            if self._blind(t, agent_type):
+                bound = self._one(
+                    "SELECT MIN(id) AS id FROM messages WHERE thread_id=? AND sender NOT IN (?,?,?)"
+                    " AND (recipient IS NULL OR recipient=?)", thread_id, HUMAN, SYSTEM, agent_type,
+                    agent_type)["id"]
+            rows = self._all(
+                "SELECT * FROM messages WHERE thread_id=? AND id>? AND id<? AND sender!=?"
+                " AND (recipient IS NULL OR recipient=?) ORDER BY id LIMIT ?",
+                thread_id, after, bound if bound is not None else 2**62, agent_type, agent_type, limit)
+            msgs, _ = self._visible(t, rows, agent_type)
+            if msgs:
+                self._set_cursor(subscriber, thread_id, msgs[-1]["id"])
+            else:
+                upto = min(after, self.last_message_id(thread_id), bound - 1 if bound is not None else after)
+                if upto > 0:
+                    self._set_cursor(subscriber, thread_id, upto)
+            return msgs
 
     # ---------------------------------------------------------------------- jobs
 
@@ -1100,13 +1188,14 @@ class Bus:
             "INSERT INTO events (thread_id, job_id, agent, kind, text, created_at) VALUES (?,?,?,?,?,?)",
             (thread_id, job_id, agent, kind, text[:2000], _now()))
 
-    def events(self, thread_id: str, after_id: int = 0, agent: str | None = None) -> list[dict]:
+    def events(self, thread_id: str, after_id: int = 0, agent: str | None = None,
+               job_id: str | None = None) -> list[dict]:
+        sql, args = "SELECT * FROM events WHERE thread_id=? AND id>?", [thread_id, after_id]
         if agent:
-            rows = self._all("SELECT * FROM events WHERE thread_id=? AND id>? AND agent=? ORDER BY id",
-                             thread_id, after_id, agent)
-        else:
-            rows = self._all("SELECT * FROM events WHERE thread_id=? AND id>? ORDER BY id", thread_id, after_id)
-        return [dict(r) for r in rows]
+            sql, args = sql + " AND agent=?", [*args, agent]
+        if job_id:
+            sql, args = sql + " AND job_id=?", [*args, job_id]
+        return [dict(r) for r in self._all(sql + " ORDER BY id", *args)]
 
     def peer_busy(self, thread_id: str, agent: str) -> bool:
         row = self._one("SELECT kind FROM events WHERE thread_id=? AND agent=? AND kind IN ('turn_start','turn_end')"

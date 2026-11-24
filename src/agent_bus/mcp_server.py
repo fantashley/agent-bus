@@ -162,23 +162,70 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         """List threads you're involved in."""
         return call(svc.threads, include_closed=include_closed)
 
-    @mcp.tool()
-    async def wait(thread: str, timeout_s: int = 60) -> dict[str, Any]:
-        """Block until a new message for you arrives on `thread`, or the timeout (max 55 s) passes.
+    # One poller per thread for this session's waits: a second wait on the same thread
+    # joins the first instead of sitting out its whole timeout (#72).
+    pollers: dict[str, dict] = {}
 
-        Returns {"status": "timeout"} when nothing arrived; call again to keep waiting.
-        """
-        # 55 s keeps us under clients' default 60 s tool timeout (Codex).
-        timeout_s = max(1, min(int(timeout_s), 55))
-        end = time.monotonic() + timeout_s
+    async def poll_until_woken(thread: str) -> dict:
         while True:
-            res = call(svc.inbox, thread=thread, limit=50)
-            if res.get("error") or res.get("messages"):
+            res = call(svc.poll, thread)
+            if res is not None:
                 return res
-            if time.monotonic() >= end:
-                state = call(svc.thread_state, thread)
-                return {"status": "timeout", **state}
             await asyncio.sleep(1.0)
+
+    def poller(thread: str) -> tuple[dict, bool]:
+        """The thread's running poller (and True: joined), or a new one (False)."""
+        entry = pollers.get(thread)
+        if entry is None:
+            task = asyncio.ensure_future(poll_until_woken(thread))
+            entry = pollers[thread] = {"task": task, "callers": 0}
+            # A finished poller's result belongs to the waits already attached to it; a
+            # later wait starts a new one.
+            task.add_done_callback(lambda _t: pollers.pop(thread, None) if pollers.get(thread) is entry else None)
+            return entry, False
+        return entry, True
+
+    @mcp.tool()
+    async def wait(thread: str, timeout_s: int = 55, after_message_id: int | None = None) -> dict[str, Any]:
+        """Block until something for you arrives on `thread`, or the timeout (max 55 s) passes.
+
+        Returns the new messages (with `cursor`, the last message id read). Routine notices
+        such as "Round 2 of 3" or "Review requested from ..." don't end the wait by
+        themselves; they come with the next message or on timeout. On timeout it returns
+        {"status": "timeout"} with the thread's state and `progress`: per peer working on
+        it, the turn's state, elapsed time, latest activity and tool calls. Call again to
+        keep waiting; one wait at a time is enough (concurrent waits on a thread share what
+        wakes them). after_message_id replays everything after that message, e.g. a reply lost
+        when the connection dropped.
+        """
+        # 55 s keeps us under clients' 60 s tool timeouts (Codex's default; Claude Code's is
+        # a hard wall clock that progress notifications don't extend).
+        timeout_s = max(1, min(int(timeout_s), 55))
+        if after_message_id is not None:
+            res = call(svc.poll, thread, after_message_id=int(after_message_id))
+            if res is not None:
+                return res
+        entry, joined = poller(thread)
+        task = entry["task"]
+        entry["callers"] += 1
+        res = None
+        try:
+            res = await asyncio.wait_for(asyncio.shield(task), timeout_s)
+        except TimeoutError:
+            if task.done() and not task.cancelled():
+                res = task.result()
+        finally:
+            entry["callers"] -= 1
+            last = entry["callers"] == 0
+            if last and not task.done():
+                task.cancel()  # nobody is waiting for it any more
+                if pollers.get(thread) is entry:
+                    del pollers[thread]
+        if res is None:
+            # Only the last wait to leave takes what is still unread; while another wait
+            # runs on, its poller delivers it, so nothing is split between the two.
+            res = call(svc.wait_timeout, thread, deliver=last)
+        return {**res, "joined": True} if joined else res
 
     @mcp.tool()
     def start_discussion(question: str, peers: list[str] | None = None, repo: str | None = None,

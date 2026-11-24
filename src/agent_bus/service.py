@@ -15,11 +15,13 @@ from typing import Any
 from . import config as cfg
 from . import autoresume, quota
 from . import rex, unvotable, worker
-from .db import HUMAN, SYSTEM, Bus, BusError, review_progress, wrap_peer
+from .db import HUMAN, SYSTEM, Bus, BusError, is_quiet, review_progress, wrap_peer
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # A label for the change under review: a jj change id, a git branch name, or e.g. "PR #12".
 CHANGE_RE = re.compile(r"[A-Za-z0-9#][A-Za-z0-9 ._/#:+-]{0,99}")
+BLIND_NOTE = ("Round 1 is blind: other participants' views stay hidden until you post "
+              "your own with send(kind=\"proposal\").")
 
 
 def present(m: dict) -> dict:
@@ -32,7 +34,7 @@ def present(m: dict) -> dict:
            "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(m["created_at"]))}
     if m["recipient"]:
         out["to"] = m["recipient"]
-    data = {k: v for k, v in m["data"].items() if k not in ("discussion", "session")}
+    data = {k: v for k, v in m["data"].items() if k not in ("discussion", "session", "quiet")}
     if data:
         out["data"] = data
     return out
@@ -111,14 +113,99 @@ class Service:
 
     def inbox(self, thread: str | None = None, limit: int = 50) -> dict:
         msgs = self.bus.unread(self.subscriber, self.agent, thread_id=thread, limit=max(1, min(limit, 200)))
+        return self._batch(thread, msgs)
+
+    def _batch(self, thread: str | None, msgs: list[dict]) -> dict:
         res: dict[str, Any] = {"messages": [present(m) for m in msgs]}
         if thread:
             t = self.bus.thread(thread)
             res["thread"] = thread_summary(t)
+            # The last message in this batch (or, with none, the last one read on the
+            # thread): pass it to wait(after_message_id=...) to replay anything after it,
+            # e.g. a reply lost when the connection dropped, or the next page (#72).
+            res["cursor"] = msgs[-1]["id"] if msgs else self.bus.cursor(self.subscriber, thread)
             if self.bus._blind(t, self.agent):
-                res["blind"] = ("Round 1 is blind: other participants' views stay hidden until you post "
-                                "your own with send(kind=\"proposal\").")
+                res["blind"] = BLIND_NOTE
         return res
+
+    # ------------------------------------------------------------------ waiting (#72)
+
+    def poll(self, thread: str, after_message_id: int | None = None, limit: int = 50,
+             wake_quiet: bool = False) -> dict | None:
+        """One look for ``wait``: the unread messages on ``thread``, marked read, when they
+        should end the wait; otherwise None, leaving them unread.  Routine lifecycle
+        notices (db.is_quiet) don't end it by themselves unless ``wake_quiet``; a full
+        page does, so quiet notices can never hide what comes after them.
+        ``after_message_id`` replays everything after that message instead (Bus.replay)."""
+        if after_message_id is not None:
+            msgs = self.bus.replay(self.subscriber, self.agent, thread, int(after_message_id), limit=limit)
+            return self._batch(thread, msgs) if msgs else None
+        msgs = self.bus.unread(self.subscriber, self.agent, thread_id=thread, limit=limit, advance=False)
+        if not msgs or (not wake_quiet and len(msgs) < limit and all(is_quiet(m) for m in msgs)):
+            return None
+        self.bus.mark_read(self.subscriber, thread, msgs[-1]["id"])
+        return self._batch(thread, msgs)
+
+    def wait_timeout(self, thread: str, deliver: bool = True) -> dict:
+        """What ``wait`` returns when nothing woke it: any quiet notices still unread, the
+        thread's state and the progress of its current job.  ``deliver=False`` leaves
+        unread messages for a concurrent wait that is still running."""
+        delivered = self.poll(thread, wake_quiet=True) if deliver else None
+        res: dict[str, Any] = {"status": "timeout", **self.thread_state(thread)}
+        res["thread"].pop("goal", None)  # the caller has it already; it can be long
+        if delivered:
+            res["messages"] = delivered["messages"]
+        res["cursor"] = delivered["cursor"] if delivered else self.bus.cursor(self.subscriber, thread)
+        progress = self.progress(thread)
+        if progress:
+            res["progress"] = progress
+        return res
+
+    def progress(self, thread: str) -> dict | None:
+        """How the thread's latest job is going, from its progress events: per peer that
+        has taken a turn in it, the turn's state, elapsed time, latest activity and counts.
+        Metadata only: event text can be a peer's draft, which the caller must not see
+        before it is posted (and never unfenced)."""
+        jobs = self.bus.jobs(thread)
+        if not jobs:
+            return None
+        job = jobs[-1]
+        now = time.time()
+        # Not the job's error: it can quote what a peer was about to post.
+        info: dict[str, Any] = {"status": job["status"], "elapsed_s": round(now - job["created_at"])}
+        turns: dict[str, dict] = {}
+        for e in self.bus.events(thread, job_id=job["id"]):
+            agent, kind = e["agent"], e["kind"]
+            if not agent:
+                continue
+            if kind == "turn_start":
+                turns[agent] = {"state": "working", "start": e["created_at"], "end": None, "last": e,
+                                "tool_calls": 0, "api_retries": 0, "errors": 0}
+                continue
+            turn = turns.get(agent)
+            if turn is None:
+                continue
+            turn["last"] = e
+            if kind == "turn_end":
+                turn["state"] = "failed" if (e["text"] or "").startswith("failed") else "done"
+                turn["end"] = e["created_at"]
+            elif kind == "tool":
+                turn["tool_calls"] += 1
+            elif kind == "api_retry":
+                turn["api_retries"] += 1
+            elif kind == "error":
+                turn["errors"] += 1
+        peers: dict[str, dict] = {}
+        for agent, turn in turns.items():
+            state = turn["state"]
+            if state == "working" and job["status"] not in ("queued", "running"):
+                state = "stopped"  # its worker ended mid-turn
+            out = {"state": state, "turn_elapsed_s": round((turn["end"] or now) - turn["start"]),
+                   "last_event": turn["last"]["kind"], "last_event_age_s": round(now - turn["last"]["created_at"]),
+                   "tool_calls": turn["tool_calls"]}
+            out.update({k: turn[k] for k in ("api_retries", "errors") if turn[k]})
+            peers[agent] = out
+        return {"job": info, "peers": peers}
 
     def history(self, thread: str, limit: int = 200) -> dict:
         h = self.bus.history(thread, viewer=None if self.agent == HUMAN else self.agent, limit=limit)
@@ -137,7 +224,10 @@ class Service:
         t = self.bus.thread(thread)
         res: dict[str, Any] = {"thread": thread_summary(t)}
         if t["kind"] == "discussion":
-            res["standings"] = self.bus.standings(thread)
+            if self.bus._blind(t, self.agent):
+                res["blind"] = BLIND_NOTE  # standings would show who has proposed what
+            else:
+                res["standings"] = self.bus.standings(thread)
             job = self.bus.active_job(thread)
             res["worker"] = job["status"] if job else "idle"
         elif t["kind"] == "review":
@@ -216,7 +306,7 @@ class Service:
         self.bus.post(t["id"], SYSTEM, f"Discussion started by {'the human user' if self.agent == HUMAN else self.agent} "
                       f"with {', '.join(participants)}; up to {rounds} rounds."
                       + "".join(f" Left out: {quota.message(p, 'peer', b, self.config)}" for p, b in skipped.items()),
-                      kind="status")
+                      kind="status", data={"quiet": True})
         job = self._dispatch(t["id"], "discussion", {"mode": "start"}, f"{t['id']}:start")
         res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(t["id"])), "job": job}
         if skipped:
