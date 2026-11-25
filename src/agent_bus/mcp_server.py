@@ -37,8 +37,9 @@ discussion, request a review or debrief a thread.
   with send(kind="proposal") BEFORE reading anything else (round 1 is blind), then loop
   wait(thread) and respond with send(kind="vote", on=..., stance=..., reasons=...) or a revised proposal.
 - To get a change reviewed, call request_review with pinned commit ids (`reviewers=[...]` when
-  several agents must all approve: they review one at a time). Put the acceptance criteria and any
-  evidence the reviewers can't read themselves in `focus`. For the next head, `send` a note on how
+  several agents must all approve: they review one at a time). Put the acceptance criteria in
+  `focus`, and facts the reviewers can't read themselves (command output, another repo's code) in
+  `evidence` (start_discussion takes it too). For the next head, `send` a note on how
   you addressed each finding, then request again with prev_head_commit_id = the thread's current head.
 - To ask a finished review's or discussion's peers for feedback, call debrief(thread): each answers
   in its own resumed session, and the thread's status and verdicts don't change.
@@ -251,7 +252,7 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
     def start_discussion(question: str, peers: list[str] | None = None, repo: str | None = None,
                          context_refs: list[str] | None = None, max_rounds: int | None = None,
                          deadline_minutes: int | None = None, watch: bool = False,
-                         peer_settings: dict | None = None) -> dict[str, Any]:
+                         peer_settings: dict | None = None, evidence: list[dict] | None = None) -> dict[str, Any]:
         """Start a discussion with other agents that ends in agreement or documented dissent.
 
         peers: participant names to include (default: every other available agent). repo: an allow-listed repo the
@@ -259,10 +260,14 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         view with send(kind="proposal") right away, then loop wait(thread). watch=True opens Rex
         viewer panes when you're running inside Rex. peer_settings optionally sets a peer's model
         and/or reasoning effort for this discussion, e.g. {"codex": {"effort": "high"}}.
+        evidence: optional read-only facts the peers can't reach themselves (command output, another
+        repo's code, an issue's text), as [{"title": ..., "text": ...}]: at most 8 items, 20,000
+        characters each and 60,000 in all (over that is refused, never cut). Every peer gets them
+        in full with the question, fenced as data from you. context_refs only point at things.
         """
         return flag_stale(call(svc.start_discussion, question=question, peers=peers, repo=repo,
                                context_refs=context_refs, max_rounds=max_rounds, deadline_minutes=deadline_minutes,
-                               watch=watch, peer_settings=peer_settings))
+                               watch=watch, peer_settings=peer_settings, evidence=evidence))
 
     @mcp.tool()
     def advance_discussion(thread: str) -> dict[str, Any]:
@@ -275,7 +280,7 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
                        prev_head_commit_id: str | None = None, focus: str | None = None,
                        model: str | None = None, effort: str | None = None,
                        peer_settings: dict | None = None, thread: str | None = None,
-                       testing: str | None = None) -> dict[str, Any]:
+                       testing: str | None = None, evidence: list[dict] | None = None) -> dict[str, Any]:
         """Ask other agents for a read-only review of a pinned change in an allow-listed repo.
 
         Pin full commit ids (`git rev-parse HEAD`, or `jj log --no-graph -r @ -T commit_id` in a jj
@@ -310,12 +315,20 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
 
         `testing` is an optional short note on how you tested this head (commands run and their
         results): reviewers can't run tests themselves, and see it as your unchecked claim.
+
+        `evidence` is optional read-only facts the reviewers can't reach themselves (command
+        output, another repo's code, an issue's text), as [{"title": ..., "text": ...}]: at most
+        8 items, 20,000 characters each and 60,000 in all (over that is refused, never cut). It
+        is stored on the thread and every reviewer gets it in full on its first pass (and in any
+        fresh session), fenced as data from you. Only the request that starts a review takes it;
+        a follow-up keeps it (passing it again is refused): post anything new with send.
+        `focus` says what to check; `evidence` holds the facts to check it against.
         """
         return flag_stale(call(svc.request_review, reviewer=reviewer, repo=repo, change_id=change_id,
                                base_commit_id=base_commit_id, head_commit_id=head_commit_id,
                                prev_head_commit_id=prev_head_commit_id, focus=focus, model=model, effort=effort,
                                reviewers=reviewers, peer_settings=peer_settings, thread=thread,
-                               testing=testing))
+                               testing=testing, evidence=evidence))
 
     @mcp.tool()
     def debrief(thread: str, question: str | None = None, peers: list[str] | None = None) -> dict[str, Any]:

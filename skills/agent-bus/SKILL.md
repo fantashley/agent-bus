@@ -71,9 +71,15 @@ Peers start cold: they know only what you give them and what they find in the re
   peer that skips the repo in round 1 builds on a wrong premise.
 - **Paste evidence they can't reach.** Peers start in the allow-listed repo with read-only tools
   (and maybe the web); don't count on them finding anything else. Command output, metrics,
-  another repo's code, logs, or a private issue's text must go into the question or the
-  review's `focus` itself. Don't just link a GitHub issue: a peer may
-  not be able to fetch it.
+  another repo's code, logs, or a private issue's text go in `evidence`:
+  `[{"title": "pytest output", "text": "..."}]` (at most 8 items, 20,000 characters each, 60,000
+  in all; over that is refused, never cut). Every peer gets it in full, fenced as data from
+  you, before round 1 or its first review pass, and it stays on the thread (a resumed session
+  is told it's unchanged). Don't just link a GitHub issue: a peer may not be able to fetch it.
+- **`evidence` vs `focus` vs refs.** `focus` says what to check (the acceptance criteria);
+  `evidence` holds the facts. `context_refs` and `send(refs=...)` only point at things a peer may
+  not be able to read. Only the request that starts a review takes `evidence`; on a follow-up
+  it's refused (adding to it isn't supported yet), so `send` new facts as a note.
 - **For a review, state what the change must do.** Put a one-to-three line summary of the
   issue's acceptance criteria in `focus`, so the reviewer can check the change against them.
 - **Keep the requested output short.** Ask for a few concrete points, not an essay: a peer's
@@ -84,8 +90,8 @@ Peers start cold: they know only what you give them and what they find in the re
 
 ## Discussions
 
-`start_discussion(question, peers?, repo?, context_refs?, max_rounds?, deadline_minutes?,
-peer_settings?, watch?)`
+`start_discussion(question, peers?, repo?, context_refs?, evidence?, max_rounds?,
+deadline_minutes?, peer_settings?, watch?)`
 
 1. `peers` defaults to every other available agent (out-of-usage ones are left out and the
    result says so; naming one fails with `USAGE_EXHAUSTED`). `peer_settings` sets a peer's model
@@ -119,7 +125,7 @@ discussion.
 ## Reviews
 
 `request_review(repo, base_commit_id, head_commit_id, reviewer= | reviewers=[...], change_id?,
-prev_head_commit_id?, focus?, testing?, thread?, model?, effort?, peer_settings?)`
+prev_head_commit_id?, focus?, evidence?, testing?, thread?, model?, effort?, peer_settings?)`
 
 - **Pin commit ids.** Use full ids: `git rev-parse HEAD`, or `jj log --no-graph -r @ -T
   commit_id` in a jj repo. An unambiguous prefix of at least 7 hex digits is resolved, but never

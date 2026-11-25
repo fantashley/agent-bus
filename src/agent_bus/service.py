@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 from . import config as cfg
-from . import autoresume, provenance, quota
+from . import autoresume, evidence as ev, provenance, quota
 from . import rex, unvotable, worker
 from .db import HUMAN, SYSTEM, Bus, BusError, deadline_message, is_quiet, overdue, past_deadline, review_progress, wrap_peer
 
@@ -334,6 +334,8 @@ class Service:
         self.bus.expire_discussion(thread)
         h = self.bus.history(thread, viewer=None if self.agent == HUMAN else self.agent, limit=limit)
         res = {"thread": thread_summary(h["thread"]), "messages": [present(m) for m in h["messages"]]}
+        if ev.of(h["thread"]):
+            res["evidence"] = ev.present(h["thread"])
         if h["thread"]["kind"] == "review":
             res.update(self.review_state(h["thread"]))
         if h["blind"]:
@@ -386,11 +388,14 @@ class Service:
     def start_discussion(self, question: str, peers: list[str] | None = None, repo: str | None = None,
                          context_refs: list[str] | None = None, max_rounds: int | None = None,
                          deadline_minutes: int | None = None, watch: bool = False,
-                         peer_settings: dict | None = None) -> dict:
+                         peer_settings: dict | None = None, evidence: list | None = None) -> dict:
         """``peer_settings``: optional per-peer model/effort for this discussion's headless
-        turns, e.g. {"codex": {"effort": "high"}}, on top of the config's."""
+        turns, e.g. {"codex": {"effort": "high"}}, on top of the config's.
+
+        ``evidence``: read-only {"title", "text"} items every peer gets with the question (#114)."""
         if not question or not question.strip():
             raise ValueError("question is empty")
+        evidence = ev.check(evidence)
         defaulted = peers is None
         if defaulted:
             peers = [a for a in self.config.available_agents() if a != self.agent]
@@ -437,7 +442,8 @@ class Service:
                 initiator_session=self.session_id, max_rounds=rounds,
                 max_messages=max(self.config.max_messages, rounds * len(participants) * 3),
                 deadline=time.time() + minutes * 60, repo=repo_path,
-                refs={k: v for k, v in (("context_refs", context_refs), ("peer_settings", settings)) if v} or None)
+                refs={k: v for k, v in (("context_refs", context_refs), ("peer_settings", settings),
+                                         ("evidence", evidence)) if v} or None)
             if self.agent == HUMAN:
                 self.bus.post(t["id"], HUMAN, question.strip())
             else:
@@ -520,7 +526,8 @@ class Service:
                        change_id: str | None = None, prev_head_commit_id: str | None = None,
                        focus: str | None = None, model: str | None = None, effort: str | None = None,
                        reviewers: list[str] | None = None, peer_settings: dict | None = None,
-                       thread: str | None = None, testing: str | None = None) -> dict:
+                       thread: str | None = None, testing: str | None = None,
+                       evidence: list | None = None) -> dict:
         """``model``/``effort`` override the config for this reviewer on this thread; a
         follow-up pass keeps the thread's settings unless it gives new ones.
 
@@ -533,6 +540,8 @@ class Service:
         if testing is not None and (not isinstance(testing, str) or len(testing) > MAX_TESTING_NOTE):
             raise ValueError(f"testing must be a note of at most {MAX_TESTING_NOTE} characters")
         testing = (testing.strip() or None) if testing is not None else None
+        # Read-only items shown to every reviewer of the thread (#114); only a new review takes them.
+        evidence = ev.check(evidence)
         if reviewers is not None:
             if reviewer is not None:
                 raise ValueError("give `reviewer` or `reviewers`, not both")
@@ -553,7 +562,8 @@ class Service:
                     model, effort = given.get("model"), given.get("effort")
             else:
                 return self._request_reviews(reviewers, repo, base_commit_id, head_commit_id, change_id,
-                                             prev_head_commit_id, focus, peer_settings, thread, testing)
+                                             prev_head_commit_id, focus, peer_settings, thread, testing,
+                                             evidence)
         elif peer_settings:
             raise ValueError("peer_settings goes with `reviewers`; use model/effort with a single `reviewer`")
         if thread is not None:
@@ -572,6 +582,8 @@ class Service:
                 "prev_head_commit_id": prev_head_commit_id, "focus": focus, "testing": testing,
                 "heads": [head_commit_id],  # every head this thread has been asked to review
                 **self._budget_refs()}
+        if evidence:
+            refs["evidence"] = evidence
         if override:
             refs["peer_settings"] = {reviewer: override}
         self.bus.reap()
@@ -584,6 +596,10 @@ class Service:
             if previous:
                 t = previous
                 old = t["refs"] or {}
+                self._no_followup_evidence(t, evidence)
+                refs.pop("evidence", None)
+                if old.get("evidence"):
+                    refs["evidence"] = old["evidence"]  # kept for every later pass and fresh session
                 current = old.get("head_commit_id")
                 active = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND status IN ('queued','running')",
                                        t["id"])
@@ -669,6 +685,25 @@ class Service:
         return {"thread": thread_summary(t), "job": job, "review": self.bus.review_standings(t["id"]),
                 "next": f"Call wait(\"{t['id']}\") for the verdict, or check inbox later."}
 
+    @staticmethod
+    def _no_followup_evidence(t: dict, evidence: list | None) -> None:
+        """Evidence attaches when a review starts (#114); a follow-up can't add to it yet."""
+        if evidence:
+            raise ValueError(f"evidence attaches only to a new review; {t['id']} keeps the evidence it "
+                             "started with (adding to it isn't supported yet). Post anything new as a note "
+                             f"with send(thread=\"{t['id']}\", ...) or in focus")
+
+    @staticmethod
+    def _same_evidence(t: dict, evidence: list | None) -> None:
+        """A repeat of a request is idempotent only with the evidence its review started with
+        (#114): other evidence is refused rather than reported as seen by reviewers that never
+        got it, or put on a second thread that a follow-up couldn't tell apart."""
+        if ((t["refs"] or {}).get("evidence") or None) != (evidence or None):
+            raise ValueError(f"{t['id']} already reviews this request with "
+                             f"{'other' if (t['refs'] or {}).get('evidence') else 'no'} evidence, and evidence "
+                             "can't be changed on a review. Repeat the request with the same evidence, or post "
+                             f"anything new with send(thread=\"{t['id']}\", ...)")
+
     def _fresh_review(self, reviewer: str, repo_path: str, refs: dict, override: dict,
                       request: list) -> tuple[dict, dict, bool]:
         """Start a single-reviewer thread, or return the one this exact request started while it
@@ -684,6 +719,9 @@ class Service:
             t = self.bus.thread(row["thread_id"])
             if t["status"] == "cancelled" or self._pinned_request(t) != request:
                 continue  # moved on to another diff: new work
+            # Checked whatever its pass's state: a failed one stays resumable, so a retry with
+            # other evidence on a new thread would leave two reviews of this head.
+            self._same_evidence(t, refs.get("evidence"))
             latest = self._revision_pass(t)
             if latest and latest["status"] in ("queued", "running", "done"):
                 return t, latest, False  # idempotent, including a pass `agent-bus resume` restarted
@@ -887,7 +925,7 @@ class Service:
     def _request_reviews(self, reviewers: list[str], repo: str, base_commit_id: str, head_commit_id: str,
                          change_id: str | None, prev_head_commit_id: str | None, focus: str | None,
                          peer_settings: dict | None, thread: str | None = None,
-                         testing: str | None = None) -> dict:
+                         testing: str | None = None, evidence: list | None = None) -> dict:
         """Several required reviewers on one thread, one per round (#47).
 
         The first request starts the first reviewer in the list.  Each approval hands the
@@ -928,14 +966,15 @@ class Service:
                 t = self._previous_review_set(order, repo_path, prev_head_commit_id, base_commit_id, head_commit_id,
                                               change_id, thread)
                 if t:
+                    self._no_followup_evidence(t, evidence)
                     job_row, created = self._followup_reviews(t, order, request, settings, focus, goal, change_id,
                                                               testing)
                 else:  # no lineage: a fresh review that happens to name a previous head
                     t, job_row, created = self._fresh_reviews(order, repo_path, request, settings, focus, goal,
-                                                              change_id, testing)
+                                                              change_id, testing, evidence)
             else:
                 t, job_row, created = self._fresh_reviews(order, repo_path, request, settings, focus, goal,
-                                                          change_id, testing)
+                                                          change_id, testing, evidence)
             t = self.bus.thread(t["id"])
             st = self.bus.review_standings(t["id"])
         if created:
@@ -950,7 +989,7 @@ class Service:
 
     def _fresh_reviews(self, order: list[str], repo_path: str, request: list, settings: dict,
                        focus: str | None, goal: str, change_id: str | None,
-                       testing: str | None = None) -> tuple[dict, dict, bool]:
+                       testing: str | None = None, evidence: list | None = None) -> tuple[dict, dict, bool]:
         """Start a several-reviewer thread, or return the one this exact request started while
         it is still pinned to this diff (retrying its pass if that failed)."""
         base, prev, head = request
@@ -961,6 +1000,7 @@ class Service:
             if (t["status"] == "cancelled" or (t["refs"] or {}).get("request") != request
                     or (t["refs"] or {}).get("change_id") != change_id):
                 continue  # moved on to another diff, or another change's review: new work
+            self._same_evidence(t, evidence)
             latest = self._revision_job(t)
             if latest and latest["status"] in ("queued", "running", "done"):
                 return t, latest, False  # idempotent, including a pass `agent-bus resume` restarted
@@ -984,6 +1024,8 @@ class Service:
                                 "request": request, **self._budget_refs()}
         if settings:
             refs["peer_settings"] = settings
+        if evidence:
+            refs["evidence"] = evidence
         t = self.bus.create_thread("review", goal, [self.agent, *order], initiator=self.agent,
                                    initiator_session=self.session_id, max_rounds=1,
                                    max_messages=self.config.max_messages, repo=repo_path, refs=refs)

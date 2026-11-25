@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from . import config as cfg
+from . import evidence as ev
 from . import autoresume, procinfo, prompts, provenance, quota, snapshot, unvotable, usages
 from .db import HUMAN, SYSTEM, Bus, BusError, format_dissent, review_progress
 from .peers import (ADAPTERS, Adapter, TurnResult, adapter, cli_version, extract_reply, fenced_body,
@@ -751,7 +752,8 @@ class Worker:
             note = provenance.peer_note(t["opening_provenance"]["record"], t["opening_provenance"]["records"])
             if note:
                 who += f" ({note})"
-        return prompts.QUESTION.format(asker=who, question=q) + self.context_note(t)
+        # The evidence goes wherever the question does: every self-contained prompt (#114).
+        return prompts.QUESTION.format(asker=who, question=q) + self.context_note(t) + ev.full(t)
 
     def context_note(self, t: dict) -> str:
         refs = (t["refs"] or {}).get("context_refs")
@@ -950,7 +952,8 @@ class Worker:
                  + body(everything, "Thread so far:"))
         if self.bus.peer_session(self.thread_id, agent) is None:
             return fresh, fresh, upto
-        return body(new, "Messages since your last turn:"), fresh, upto
+        # A resumed session had the question and the evidence in its first prompt.
+        return ev.unchanged(t) + body(new, "Messages since your last turn:"), fresh, upto
 
     def contribute(self, agent: str, prompt: str, resume: bool = True, blind: bool = False,
                    fresh_prompt: str | None = None, delivered_upto: int | None = None) -> None:
@@ -1281,7 +1284,8 @@ class Worker:
                                                     severity=prompts.SEVERITY, budget=budget_note(t),
                                                     time_limit=self.time_limit_note(), earlier=earlier_note,
                                                     testing=("\n" + self.testing_note(t, refs) + "\n"
-                                                             if self.testing_note(t, refs) else ""),
+                                                             if self.testing_note(t, refs) else "")
+                                                    + ev.unchanged(t),
                                                     verdict_format=verdict_format(prior))
         elif resume:
             prompt = prompts.REVIEW_FOLLOWUP.format(
@@ -1615,6 +1619,11 @@ class Worker:
         testing = self.testing_note(t, refs)
         if testing:
             parts.append(testing)
+        # The whole change goes to a self-contained prompt, so the evidence goes in full; an
+        # interdiff goes to a resumed session, which had it already (#114).
+        shared = (ev.full(t) if what == "change" else ev.unchanged(t)).strip("\n")
+        if shared:
+            parts.append(shared)
         return "".join(f"\n{p}\n" for p in parts)
 
     @staticmethod

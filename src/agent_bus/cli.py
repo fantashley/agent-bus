@@ -13,6 +13,7 @@ import textwrap
 import time
 
 from . import config as cfg
+from . import evidence as ev
 from . import hooks, provenance, rex
 from .db import HUMAN, SYSTEM, Bus, BusError, format_progress, is_quiet
 from .service import Service, present, thread_summary
@@ -72,6 +73,58 @@ def _merged(msgs: list[dict], actions: list[dict]) -> list[tuple[str, dict]]:
     """Messages and message-less human actions in the order they happened."""
     items = [("m", m) for m in msgs] + [("a", a) for a in actions]
     return sorted(items, key=lambda it: (it[1]["created_at"], it[0] == "m"))
+
+
+def format_evidence(t: dict, color: bool) -> str | None:
+    """A thread's evidence (#114) for `history` and `tail`: every item, in full, or None."""
+    items = ev.of(t)
+    if not items:
+        return None
+    who = "human" if t["initiator"] == HUMAN else t["initiator"]
+    lines = [_color(t["initiator"], f"evidence from {who} ({len(items)} item{'s' if len(items) != 1 else ''}, "
+                                    "shown to every peer):", color)]
+    for i, it in enumerate(items, 1):
+        lines.append(_color(t["initiator"], provenance.printable(f"  [{i}] {it['title']}"), color))
+        # Terminal controls in pasted output (a captured log's escape sequences) are shown as "?".
+        body = "\n".join(provenance.printable(line.replace("\t", "    ").rstrip())
+                         for line in it["text"].strip("\r\n").splitlines())
+        lines.append(textwrap.indent(body, "    "))
+    return "\n".join(lines)
+
+
+def read_evidence(specs: list[str]) -> list[dict] | None:
+    """`ask --evidence TITLE=PATH` items, read here by the human's own CLI (`-` is stdin)."""
+    if len(specs) > ev.MAX_ITEMS:
+        raise ValueError(f"{len(specs)} --evidence items; at most {ev.MAX_ITEMS} are allowed")
+    items = []
+    left = ev.MAX_TOTAL  # what the combined cap still allows, titles included
+    for spec in specs:
+        title, sep, path = spec.partition("=")
+        if not sep or not title.strip() or not path:
+            raise ValueError(f"--evidence expects TITLE=PATH (or TITLE=- for stdin), got {spec!r}")
+        left -= len(" ".join(title.split()))
+        cap = min(ev.MAX_TEXT, left)
+        if cap < 1:
+            raise ValueError(f"--evidence {title!r}: the items before it use up the {ev.MAX_TOTAL}-character "
+                             "total; nothing was created")
+        # Never more than what the caps still allow plus one character, so an oversized file
+        # or an endless stream is refused without being read whole; line endings are kept.
+        try:
+            if path == "-":
+                text = sys.stdin.read(cap + 1)
+            else:
+                with open(os.path.expanduser(path), encoding="utf-8", errors="replace", newline="") as f:
+                    text = f.read(cap + 1)
+        except OSError as e:
+            raise ValueError(f"--evidence {title!r}: can't read {path}: {e.strerror or e}") from None
+        if len(text) > cap:
+            which = (f"over {ev.MAX_TEXT} characters" if cap == ev.MAX_TEXT
+                     else f"over the {ev.MAX_TOTAL}-character total with the items before it")
+            raise ValueError(f"--evidence {title!r} is {which}; nothing was created: "
+                             "trim it to the relevant part (agent-bus never cuts evidence short)")
+        left -= len(text)
+        items.append({"title": title, "text": text})
+    return items or None
 
 
 def thread_header(t: dict) -> str:
@@ -148,6 +201,9 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
     if not only:
         print(_color(SYSTEM, thread_header(t), color))
         print(_color(SYSTEM, f"goal: {t['goal']}", color))
+        shared = format_evidence(t, color)
+        if shared:
+            print(shared)
     if args.peer and not only:
         print(_color(SYSTEM, f"viewing {args.peer} (output only; intervene with `agent-bus reply`)", color))
     from . import worker
@@ -279,7 +335,8 @@ def cmd_ask(bus: Bus, args: argparse.Namespace) -> int:
             raise ValueError(f"--set expects AGENT.model=VALUE or AGENT.effort=VALUE, got {item!r}")
         settings.setdefault(agent, {})[field_] = value
     res = svc.start_discussion(args.prompt, peers=peers, repo=args.repo, max_rounds=args.rounds,
-                               deadline_minutes=args.deadline, watch=args.watch, peer_settings=settings or None)
+                               deadline_minutes=args.deadline, watch=args.watch, peer_settings=settings or None,
+                               evidence=read_evidence(args.evidence))
     tid = res["thread"]["id"]
     print(f"started {tid} with {', '.join(res['thread']['participants'])} (job {res['job']['id']})")
     from . import quota
@@ -372,6 +429,9 @@ def _print_history(bus: Bus, thread: str, color: bool) -> None:
         st = bus.review_standings(thread)
         print(_color(SYSTEM, f"required reviewers at head {str(st['head_commit_id'])[:12]}"
                      + (" (complete)" if st["complete"] else "") + ":\n" + format_review(st), color))
+    shared = format_evidence(t, color)
+    if shared:
+        print(shared)
     for k, m in _merged(h["messages"], bus.human_actions(thread)):
         print(format_action(m, color) if k == "a" else format_message(m, color))
 
@@ -498,6 +558,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--watch", action="store_true", help="inside Rex: open panes following each agent")
     s.add_argument("--set", dest="settings", action="append", default=[], metavar="AGENT.KEY=VALUE",
                    help="per-agent model/effort for this discussion, e.g. codex.effort=high (repeatable)")
+    s.add_argument("--evidence", action="append", default=[], metavar="TITLE=PATH",
+                   help="attach a file's text (or - for stdin) as read-only evidence every agent sees "
+                        "(repeatable; at most 8 items, 20,000 characters each, 60,000 in all)")
     s.add_argument("--wait", action="store_true", help="wait for the outcome, then print the thread")
 
     s = sub.add_parser("threads", help="what's going on, and which threads need you",
@@ -878,6 +941,7 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
             print(json.dumps({"thread": thread_summary(h["thread"]),
                               **({"review": bus.review_standings(args.thread)}
                                  if h["thread"]["kind"] == "review" else {}),
+                              **({"evidence": ev.of(h["thread"])} if ev.of(h["thread"]) else {}),
                               "messages": [_with_provenance(m) for m in h["messages"]],
                               "human_actions": [{"id": a["id"], "command": a["command"], "detail": a["detail"],
                                                  "at": time.strftime("%Y-%m-%dT%H:%M:%S",
