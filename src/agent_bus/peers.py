@@ -787,7 +787,8 @@ class ClaudeAdapter(Adapter):
     # 4: dontAsk instead of plan mode, and a --permission-mode in the configured args dropped
     # (#110).
     # 5: a review turn also gets its pinned head's read-only snapshot with --add-dir (#111).
-    recipe = "5"
+    # 6: --setting-sources user: the checkout's own .claude/settings*.json don't load (#98).
+    recipe = "6"
     known_events = frozenset({"system", "assistant", "user", "result", "rate_limit_event", "stream_event"})
     default_command = cfg.AGENT_INFO["claude"]["cli"]
     # Read-only tools only. No Bash at all: `jj`/`git` accept flags (--tool, --output,
@@ -804,9 +805,14 @@ class ClaudeAdapter(Adapter):
         # follow; dontAsk adds no instructions (Claude Code 2.1.331, live probes 2026-11-24: the
         # same five tools declared, Write "No such tool available", a resumed turn works; #110).
         tools = ",".join(t for t in self.allowed_tools if self.web_search or t not in self.web_tool_names)
+        # --setting-sources user: the checkout's .claude/settings.json and settings.local.json
+        # don't load.  -p skips the trust dialog, so their hooks ran in a peer turn, and so did
+        # their apiKeyHelper, and their env could point the CLI at another API endpoint;
+        # disableAllHooks in our --settings stops the hooks but not those (Claude Code 2.1.331,
+        # live probes 2026-11-24, #98).  A --add-dir's settings never loaded.
         argv = [self.command, "-p", "--output-format", "stream-json", "--verbose",
-                "--permission-mode", "dontAsk", "--strict-mcp-config", "--tools", tools,
-                "--allowedTools", tools]
+                "--permission-mode", "dontAsk", "--strict-mcp-config", "--setting-sources", "user",
+                "--tools", tools, "--allowedTools", tools]
         if not self.web_search:  # removed from the session, not just left unapproved
             argv += ["--disallowedTools", ",".join(self.web_tool_names)]
         for d in add_dirs:
@@ -820,12 +826,13 @@ class ClaudeAdapter(Adapter):
             argv += ["--session-id", sid]
         argv += ["--settings", json.dumps(self.flag_settings(), sort_keys=True)]
         # Ours is the whole inventory, the only flag settings (a second --settings could turn
-        # the credential refresh back on) and the only permission mode (a later one wins).
-        argv += _strip_flags(self.extra_args(), {"--tools", "--settings", "--permission-mode"})
+        # the credential refresh back on), the only permission mode (a later one wins) and the
+        # only setting sources (one could load the checkout's settings again).
+        argv += _strip_flags(self.extra_args(), {"--tools", "--settings", "--permission-mode", "--setting-sources"})
         return Invocation(argv=argv, stdin=self.headless + prompt, external_id=sid)
 
     def flag_settings(self) -> dict:
-        """Settings passed with --settings, which outrank the user's and project's own
+        """Settings passed with --settings, which outrank the user's own (the project's don't load)
         (Claude Code 2.1.330, live probe 2026-11-23; only managed settings outrank them):
         - ``awsAuthRefresh`` off: with expired AWS credentials Claude Code runs it even in
           print mode, and it is typically an interactive `aws sso login` (#36);
@@ -959,20 +966,77 @@ _CODEX_KEY = re.compile(r"[A-Za-z0-9_-]+")
 # - image_generation: image_gen makes an image and saves it outside the sandbox's reach.
 # - tool_suggest: request_plugin_install, which installs a plugin into ~/.codex.  It wasn't
 #   declared in the probes once apps was off, so this is belt and braces.
+# - hooks: hooks from the checkout's .codex/hooks.json or a [hooks] table in its
+#   .codex/config.toml, which codex loads in a trusted project.  A hook runs a command outside
+#   the turn's tools and sees the prompt.  No probe of 0.172.0 saw one run in `exec`, even with
+#   --dangerously-bypass-hook-trust, so this is belt and braces too; it also turns off your own
+#   hooks for peer turns (#98).
 # Left on: the collaboration tools (spawn_agent, send_message, ...).  No switch removes them
 # (features.multi_agent and multi_agent_v2 = false don't: the model's catalog entry picks
 # multi-agent v2), and a spawned agent is a thread of the same process with the same config:
 # a probe's sub-agent got `Read-only file system` for `touch`.  They can't act outside the
 # sandbox; they only cost tokens.
-CODEX_FEATURES_OFF = ("apps", "goals", "image_generation", "tool_suggest")
+CODEX_FEATURES_OFF = ("apps", "goals", "image_generation", "tool_suggest", "hooks")
 # Flags that pick a sandbox or approval mode themselves, so they'd beat our `-c` overrides,
 # and ones that change the repo or codex's own state outside the sandbox: --worktree creates
 # a managed git worktree, and --trust saves trust for the project (MCP commands included).
 # --yolo and --not-so-yolo are hidden aliases codex exec 0.171.0 accepts; it doesn't take
-# abbreviated long flags (`--dangerously` is rejected).
+# abbreviated long flags (`--dangerously` is rejected).  --dangerously-bypass-hook-trust runs
+# hooks nobody reviewed, and --ignore-rules is agent-bus's own (codex rejects it twice).
 _CODEX_SANDBOX_FLAGS = {"-s", "--sandbox"}
 _CODEX_SANDBOX_BOOL_FLAGS = {"--dangerously-bypass-approvals-and-sandbox", "--yolo", "--not-so-yolo",
-                             "--approve-for-me", "--worktree", "--trust"}
+                             "--approve-for-me", "--worktree", "--trust", "--dangerously-bypass-hook-trust",
+                             "--ignore-rules"}
+
+
+def _repo_dirs(start: str) -> list[Path]:
+    """``start`` and its parents up to the repository root (only ``start`` outside a repo).
+    The parents are walked from the normalized path (no ``..``) and, when a symlink leads
+    elsewhere, from the resolved one too."""
+    out: list[Path] = []
+    for base in dict.fromkeys((Path(os.path.abspath(start)), Path(start).resolve())):
+        dirs = []
+        for d in (base, *base.parents):
+            dirs.append(d)
+            if (d / ".git").exists() or (d / ".jj").exists():
+                break
+        else:
+            dirs = [base]
+        out += [d for d in dirs if d not in out]
+    return out
+
+
+# Keys a trusted project's .codex/config.toml may set (codex ignores only notify, the model
+# providers and a few others there) that make codex write or run something on the host,
+# outside the read-only sandbox: sqlite_home and log_dir move its state and log databases to a
+# directory the checkout picks (live probe, codex 0.172.0, 2026-11-24: both were created
+# there), and the js_repl keys pick the node binary and modules it runs (#98).
+_CODEX_PROJECT_HOST_KEYS = ("sqlite_home", "log_dir", "js_repl_node_path", "js_repl_node_module_dirs")
+
+
+def _codex_project_check(cwd: str) -> None:
+    """Refuse a checkout whose own .codex/config.toml (in the turn's directory or a parent up
+    to the repository root) sets a key in ``_CODEX_PROJECT_HOST_KEYS``.  Codex loads it only in
+    a trusted project, and a `-c` override can't make a project untrusted; agent-bus can't tell
+    trust from here, so any such key fails the turn."""
+    import tomllib
+    found = []
+    for d in _repo_dirs(cwd):
+        f = d / ".codex" / "config.toml"
+        if not f.is_file():
+            continue
+        try:
+            data = tomllib.loads(f.read_text())
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as e:
+            raise PeerSetupError(f"PEER_SETUP: can't read {f} to check it for Codex settings that act outside the "
+                                 f"sandbox ({e}); refusing to run the turn") from e
+        keys = [k for k in _CODEX_PROJECT_HOST_KEYS if k in data]
+        if keys:
+            found.append(f"{f} ({', '.join(keys)})")
+    if found:
+        raise PeerSetupError(
+            "PEER_SETUP: this checkout's Codex config sets paths Codex writes to or runs outside the read-only "
+            "sandbox (" + "; ".join(found) + "); refusing to run the turn. Remove them to review it with Codex.")
 
 
 class CodexAdapter(Adapter):
@@ -981,7 +1045,9 @@ class CodexAdapter(Adapter):
     # (issue #46).
     # 3: goals, image_generation and tool_suggest off too; the sandbox and approval overrides
     # come after the configured args, whose own sandbox flags are dropped (issue #54).
-    recipe = "3"
+    # 4: --ignore-rules, hooks off, and a checkout whose config moves codex's state is refused
+    # (#98).
+    recipe = "4"
     known_events = frozenset({"thread.started", "turn.started", "item.started", "item.updated", "item.completed",
                               "turn.completed", "turn.failed", "error"})
     default_command = cfg.AGENT_INFO["codex"]["cli"]
@@ -1072,7 +1138,13 @@ class CodexAdapter(Adapter):
         # offered plugin management, site publishing and more.  Web search is codex's hosted
         # tool (search and open_page, run by OpenAI), on by default ("cached" in a read-only
         # sandbox); off sets web_search="disabled" (issue #46).
-        common = ["--json", "--skip-git-repo-check"]
+        _codex_project_check(cwd)
+        # --ignore-rules: no execpolicy .rules file loads.  In a trusted project codex reads the
+        # checkout's .codex/rules/*.rules, and an `allow` rule there runs a matching command
+        # outside the read-only sandbox (live probe, codex 0.172.0, 2026-11-24: a project rule
+        # allowing `touch` let the turn create a file the sandbox otherwise blocks; #98).  Your
+        # own rules don't load either: a peer turn runs nothing outside the sandbox.
+        common = ["--json", "--skip-git-repo-check", "--ignore-rules"]
         common += self.setting_args()
         extra = self.extra_args()
         # After the configured args, since a later -c wins (a features table, or a server
@@ -1173,6 +1245,84 @@ class CodexAdapter(Adapter):
                       r"quota exceeded\. check your plan")
 
 
+# Where agy looks for a workspace's own customizations (agy 1.5.13's customization guide): a
+# root of these names in each directory from the turn's directory up to the repository root,
+# and in each added directory.
+_AGY_CUSTOM_ROOTS = (".agents", ".agent", "_agents", "_agent")
+
+
+def _agy_flag_values(args: list[str], flags: set[str]) -> list[str]:
+    """The values of ``flags`` in an agy argv slice (``-f v`` or ``-f=v``; Go-style flags)."""
+    out = []
+    for i, a in enumerate(args):
+        if a == "--":
+            break
+        if a in flags and i + 1 < len(args):
+            out.append(args[i + 1])
+        elif "=" in a and a.split("=", 1)[0] in flags:
+            out.append(a.split("=", 1)[1])
+    return out
+
+
+def _agy_workspace_check(dirs: list[str]) -> None:
+    """Refuse a workspace that defines hooks or MCP servers agy would run.
+
+    agy loads a workspace's ``hooks.json`` (its hooks run shell commands at session start and
+    around every model call, and get the prompt on stdin), its ``mcp_config.json`` (a stdio
+    server's command starts with the session) and the plugins under its ``plugins/``, from every
+    workspace directory: the turn's own and every --add-dir, a review's snapshot of the head
+    included.  Nothing turns them off for a session: the folder trust list doesn't gate them in
+    print mode, and --settings takes no key for them (live probes, agy 1.5.13, 2026-11-24, #98).
+    A hook with ``"enabled": false`` and a server with ``"disabled": true`` are fine."""
+    def load(f: Path):
+        try:
+            text = f.read_text().strip()
+            data = json.loads(text) if text else {}  # agy leaves an empty mcp_config.json
+        except (OSError, UnicodeError, ValueError) as e:
+            raise PeerSetupError(f"PEER_SETUP: can't read {f} to check it for Antigravity hooks and MCP servers "
+                                 f"({e}); refusing to run the turn") from e
+        if not isinstance(data, dict):
+            raise PeerSetupError(f"PEER_SETUP: {f} isn't a JSON object, so agent-bus can't check it for "
+                                 "Antigravity hooks and MCP servers; refusing to run the turn")
+        return data
+
+    def live(f: Path) -> bool:
+        if not f.is_file():
+            return False
+        data = load(f)
+        if f.name == "hooks.json":
+            return any(not (isinstance(spec, dict) and spec.get("enabled") is False) for spec in data.values())
+        if f.name == "mcp_config.json":
+            servers = data.get("mcpServers") or {}
+            return not isinstance(servers, dict) or any(
+                not (isinstance(spec, dict) and spec.get("disabled") is True) for spec in servers.values())
+        return bool(data)  # plugins.json: plugins of the workspace's own, with their hooks and servers
+
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for start in dirs:
+        for d in _repo_dirs(start):
+            for name in _AGY_CUSTOM_ROOTS:
+                root = d / name
+                if root in seen or not root.is_dir():
+                    continue
+                seen.add(root)
+                try:
+                    plugins = sorted(p for p in (root / "plugins").iterdir() if p.is_dir()) \
+                        if (root / "plugins").is_dir() else []
+                except OSError as e:
+                    raise PeerSetupError(f"PEER_SETUP: can't list {root / 'plugins'} to check it for Antigravity "
+                                         f"hooks and MCP servers ({e}); refusing to run the turn") from e
+                files = [root / "hooks.json", root / "mcp_config.json", root / "plugins.json"]
+                files += [f for p in plugins for f in (p / "hooks.json", p / "mcp_config.json")]
+                found += [f for f in files if live(f)]
+    if found:
+        raise PeerSetupError(
+            "PEER_SETUP: this workspace defines hooks or MCP servers Antigravity would run outside a read-only "
+            "turn (" + ", ".join(str(f) for f in found) + "); refusing to run the turn. Remove them, or set "
+            '"enabled": false on each hook and "disabled": true on each MCP server.')
+
+
 class AntigravityAdapter(Adapter):
     agent = "antigravity"
     # 2: headless tool guidance in every prompt; denied actions reported as an incomplete turn.
@@ -1185,7 +1335,8 @@ class AntigravityAdapter(Adapter):
     # guidance says the prompt lists its files (#111).
     # 8: the guidance says a review shows where the change's names are used, and to read long
     # files by line range (#117).
-    recipe = "8"
+    # 9: a workspace with its own hooks, MCP servers or plugins is refused (#98).
+    recipe = "9"
     # agy 1.5.13 in plan mode declares search_web (Google-grounded search, run server side) but
     # no page fetch.  `search_web(*)` and `read_url(*)` deny rules are ignored, but a custom
     # agent's `tools` list removes it (live probes, 2026-11-23): see peer_agent.
@@ -1293,6 +1444,10 @@ class AntigravityAdapter(Adapter):
 
     def invocation(self, prompt, resume_id, cwd, add_dirs):
         self.check_isolation()
+        # A directory in the configured args is a workspace directory too: a relative one is
+        # relative to the turn's directory, where agy runs, not the worker's.
+        configured = [os.path.join(cwd, d) for d in _agy_flag_values(self.extra_args(), {"--add-dir", "-add-dir"})]
+        _agy_workspace_check([cwd, *add_dirs, *configured])
         name, agent_dir = self.peer_agent()
         # --disable-slash-commands: in print mode, no slash command or skill expands from the
         # prompt (peer text included), and plan mode leaves out its /plan meta-prompt, which
@@ -1454,10 +1609,11 @@ _COPILOT_DROP = {
     "--config-dir",
 }
 # Environment variables equivalent to permission flags (`copilot help environment`), and
-# the opt-ins that load the checkout's own hooks and MCP servers in -p mode (off by default
-# there).
+# the opt-ins that load the checkout's own hooks, MCP servers and extensions (which run as
+# processes of their own) in -p mode (off by default there).
 _COPILOT_DROP_ENV = ("COPILOT_ALLOW_ALL", "COPILOT_ASSISTED_APPROVAL",
-                     "GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS", "GITHUB_COPILOT_PROMPT_MODE_WORKSPACE_MCP")
+                     "GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS", "GITHUB_COPILOT_PROMPT_MODE_WORKSPACE_MCP",
+                     "GITHUB_COPILOT_PROMPT_MODE_EXTENSIONS")
 COPILOT_USAGE = {"input": "input", "output": "output", "cache_read": "cache_read", "cache_write": "cache_write"}
 # Copilot's own usage-limit messages (`copilot help limits` and `help billing`, 1.0.108):
 # "You've hit the rate limit for this model.", "You've hit your session rate limit.",
@@ -1503,7 +1659,7 @@ def _copilot_repo_hooks_check(cwd: str, repo_root: bool = True) -> None:
     on its command line or in its environment switches them off (hooks reference, 1.0.108).
     A hook runs commands at session start, before and outside the turn's read-only tool
     set, and sees the review prompt.  agent-bus can't tell whether the user trusted the
-    folder, so any repository hook fails the turn (#98 covers the other harnesses).
+    folder, so any repository hook fails the turn (#98).
     Copilot's own repo-wide off switch, ``disableAllHooks`` in .github/copilot/settings.json,
     is honoured as Copilot resolves it: settings.local.json, applied after it, wins.
     ``repo_root`` False: only ``cwd`` itself, for an added directory (a review's snapshot of
@@ -1546,6 +1702,18 @@ def _copilot_repo_hooks_check(cwd: str, repo_root: bool = True) -> None:
             if data.get("hooks") and data.get("disableAllHooks") is not True:
                 found.append(f)
         found += [root / rel for rel, data in settings.items() if data.get("hooks")]
+    # Language servers: .github/lsp.json names commands a trusted folder starts in the
+    # background, whatever the turn's tools are, and nothing switches them off for a run (Copilot
+    # CLI's LSP docs; not probed live, #98).  disableAllHooks doesn't cover them.
+    lsp = []
+    for root in roots:
+        f = root / ".github" / "lsp.json"
+        if f.is_file() and load(f):
+            lsp.append(f)
+    if lsp:
+        raise PeerSetupError(
+            "PEER_SETUP: this checkout defines language servers Copilot can start outside a read-only turn ("
+            + ", ".join(str(f) for f in lsp) + "); refusing to run the turn. Remove them to review it with Copilot.")
     if found:
         raise PeerSetupError(
             "PEER_SETUP: this checkout defines hooks Copilot can run outside a read-only turn ("
@@ -1554,11 +1722,59 @@ def _copilot_repo_hooks_check(cwd: str, repo_root: bool = True) -> None:
             "local file wins).")
 
 
+# A workspace's own MCP server files (Copilot CLI's MCP docs): `.mcp.json` in each directory
+# from the working directory up to the repository root, and `.github/mcp.json`.
+_COPILOT_WORKSPACE_MCP = (".mcp.json", ".github/mcp.json")
+
+
+
+def _copilot_workspace_mcp(d: str) -> list[str]:
+    """The MCP servers an added directory's own files define (a review's snapshot of the head
+    holds the head's).  `copilot mcp list` runs in the turn's directory and can't see them, so
+    each is switched off by name too; one that can't be read or named fails the turn (#98)."""
+    names: list[str] = []
+    for rel in _COPILOT_WORKSPACE_MCP:
+        f = Path(d) / rel
+        if not f.is_file():
+            continue
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, UnicodeError, ValueError) as e:
+            raise PeerSetupError(f"PEER_SETUP: can't read {f} to switch off its MCP servers ({e}); "
+                                 "refusing to run the turn") from e
+        # The servers are under "mcpServers" or "servers", or are the top-level keys themselves
+        # (a bare object): every object-valued key at either level is taken as a server name.
+        if not isinstance(data, dict):
+            raise PeerSetupError(f"PEER_SETUP: {f} isn't a JSON object, so agent-bus can't switch off its MCP "
+                                 "servers; refusing to run the turn")
+        # A bare server may itself be named "mcpServers" or "servers", and Copilot loads each
+        # valid entry of a wrapper even when a sibling is invalid.  So both readings are switched
+        # off: every object inside the key (a wrapped server, whatever it's named) and, when it
+        # also holds a non-object (a server's command, url or args), the key itself.
+        bad = PeerSetupError(f"PEER_SETUP: {f} has MCP servers agent-bus can't switch off; refusing to run "
+                             "the turn")
+        found = []
+        for k, v in data.items():
+            if k in ("mcpServers", "servers"):
+                if not isinstance(v, dict):
+                    raise bad
+                found += [n for n, x in v.items() if isinstance(x, dict)]
+                if any(not isinstance(x, dict) for x in v.values()):
+                    found.append(k)
+            elif isinstance(v, dict):
+                found.append(k)
+        if any(not (isinstance(n, str) and n and not n.startswith("-")) for n in found):
+            raise bad
+        names += [n for n in found if n not in names]
+    return names
+
+
 class CopilotAdapter(Adapter):
     """GitHub Copilot CLI (`copilot -p`, 1.0.108; issue #2)."""
     agent = "copilot"
     # 2: a review turn also gets its pinned head's read-only snapshot with --add-dir (#111).
-    recipe = "2"
+    # 3: an added directory's own MCP servers are switched off too (#98).
+    recipe = "3"
     headless = COPILOT_HEADLESS
     default_command = cfg.AGENT_INFO["copilot"]["cli"]
     # Every event type seen in live probes of 1.0.108 (2026-11-23), plus the error event its
@@ -1638,10 +1854,13 @@ class CopilotAdapter(Adapter):
             argv.append(f"--deny-tool={rule}")
         if self.web_search:
             argv.append("--allow-all-urls")
-        for name in self.mcp_servers(cwd):
-            argv += ["--disable-mcp-server", name]
+        off = self.mcp_servers(cwd)
         for d in add_dirs:
             _copilot_repo_hooks_check(d, repo_root=False)  # an added directory's files load too
+            off += [n for n in _copilot_workspace_mcp(d) if n not in off]
+        for name in off:
+            argv += ["--disable-mcp-server", name]
+        for d in add_dirs:
             argv += ["--add-dir", d]
         argv += self.setting_args()
         sid = resume_id

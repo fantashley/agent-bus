@@ -288,8 +288,8 @@ Where the requests go: Claude's WebSearch and Codex's `web_search` (searching an
 pages) run on Anthropic's and OpenAI's side, and agy's `search_web` is Google-grounded search
 run by Google. Claude's WebFetch fetches the page from this machine, from the local CLI process.
 
-What keeps the rest read-only, checked with live probes of Claude Code 2.1.330, codex 0.171.0
-and agy 1.5.13:
+What keeps the rest read-only, checked with live probes of Claude Code 2.1.330 and 2.1.331,
+codex 0.171.0 and 0.172.0, and agy 1.5.13:
 - **Claude Code:** `--tools` limits the session to Read, Grep, Glob and the web tools. Without
   it, Bash, CronCreate and the other built-in tools are still declared, just not pre-approved.
   A `--tools` in `peers.claude.args` is dropped. The permission mode is `dontAsk`, which denies
@@ -297,6 +297,11 @@ and agy 1.5.13:
   is dropped. Plan mode was as locked down, but its system prompt asks for a plan file and
   `ExitPlanMode`, which a headless reply can't follow (live probes of 2.1.331: the same five
   tools are declared, and `Write` is "No such tool available").
+  `--setting-sources user` keeps the checkout's own `.claude/settings.json` and
+  `settings.local.json` from loading: `-p` skips the trust dialog, so their hooks ran in a peer
+  turn, and so did their `apiKeyHelper`, and their `env` could point the CLI at another API
+  endpoint (live probes of 2.1.331; `disableAllHooks` stops the hooks but not the rest). A
+  `--setting-sources` in `peers.claude.args` is dropped. Settings in an `--add-dir` never load.
 - **Codex:** the read-only sandbox blocks writes and shell network access (`touch` fails with a
   read-only file system, `curl` can't resolve hosts). The `apps` feature is turned off because
   it adds a `codex_apps` MCP server, which `codex mcp list` doesn't show, with tools such as
@@ -310,6 +315,18 @@ and agy 1.5.13:
   collaboration tools (`spawn_agent` and friends) stay: nothing switches them off, and a spawned
   agent runs in the same read-only sandbox. The MCP listing that decides which
   servers to switch off sees every `-c`/`--config` spelling and `--profile` from those args.
+  In a project you trust, codex also loads the checkout's `.codex/` layer. Its `.rules` files
+  could let a command out of the sandbox (live probe of 0.172.0: a project rule that allowed
+  `touch` let the turn create a file the sandbox otherwise blocks), so turns pass
+  `--ignore-rules`, which skips your own rules too. Its hooks (`.codex/hooks.json` or a
+  `[hooks]` table) would run outside the sandbox, so the `hooks` feature is off, yours
+  included, and `--dangerously-bypass-hook-trust` and `--enable hooks` in `peers.codex.args`
+  are dropped. Its MCP servers are in the listing above and are switched off. Codex ignores
+  `notify`, model providers and some other keys in a project's `config.toml`, but not
+  `sqlite_home` or `log_dir` (live probe: codex created its state and log databases where a
+  project's config pointed them) or the `js_repl` node path and modules. A checkout whose
+  `.codex/config.toml` (in the turn's directory or a parent up to the repository root) sets one
+  of those fails the turn. The rest of it (instructions and other settings) still applies.
 - **Copilot CLI** (1.0.108, live probes 2026-11-23): `-p` with the prompt on stdin and
   `--output-format json`. `--available-tools=view,grep,rg,glob` (plus `web_fetch` when web search
   is on) is the session's whole tool set, so bash, `apply_patch`, `task` sub-agents, skills, `sql`,
@@ -321,7 +338,7 @@ and agy 1.5.13:
   `disabled` stops the turn before it runs. `--sync-session=off` keeps reviewed code out of your
   GitHub session history, and `--no-auto-update` runs the binary agent-bus fingerprinted.
   `COPILOT_ALLOW_ALL`, `COPILOT_ASSISTED_APPROVAL` and the `GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS` /
-  `_WORKSPACE_MCP` opt-ins are removed from its environment (and refused in a configured `env`),
+  `_WORKSPACE_MCP` / `_EXTENSIONS` opt-ins are removed from its environment (and refused in a configured `env`),
   and options in `peers.copilot.args` that widen tools, permissions, paths, URLs, MCP servers or
   plugins, or pick the session, mode or output, are dropped. A trusted folder's repository hooks
   still load in `-p`, run commands outside the tool set and see the prompt, and no flag turns them
@@ -329,7 +346,12 @@ and agy 1.5.13:
   `.github/copilot/settings*.json` or `.claude/settings*.json`) fails the turn, unless
   `disableAllHooks` is in effect. That's the value in `.github/copilot/settings.local.json` when
   it sets one, since Copilot applies that file last, and otherwise the value in
-  `.github/copilot/settings.json`. Your own user and plugin hooks still run.
+  `.github/copilot/settings.json`. Your own user and plugin hooks still run. A review's snapshot
+  of the head (an added directory) is checked the same way, and since `copilot mcp list` runs in
+  the turn's directory and can't see it, the servers in the snapshot's `.mcp.json` and
+  `.github/mcp.json` are switched off by name too (a file it can't read fails the turn). A
+  checkout (or snapshot) with a non-empty `.github/lsp.json` fails the turn too: a trusted folder
+  starts those language servers in the background, and `disableAllHooks` doesn't cover them.
 - **Antigravity:** every turn passes `--settings` with deny rules for `command(*)`,
   `write_file(*)` (which covers edits) and `execute_url(*)` (the browser subagent). Deny wins over
   any allow rule in your own settings, so a `--settings` in `peers.antigravity.args` is dropped.
@@ -346,13 +368,36 @@ and agy 1.5.13:
   mean replacing the blanket command deny with an allowlist of git and rg flags. Turns also
   pass `--disable-slash-commands`, so nothing in the prompt expands as a slash command or skill,
   and plan mode leaves out its `/plan` meta-prompt (plan and walkthrough artifacts and asking
-  for approval).
+  for approval). agy loads a workspace's own `hooks.json`, `mcp_config.json` and `plugins/`
+  from its `.agents` (or `.agent`, `_agents`, `_agent`) directories, from the turn's directory
+  up to the repository root and from every added directory, a review's snapshot of the head
+  and any `--add-dir` in `peers.antigravity.args` included. In print mode they load whatever the folder trust list says, and `--settings` has no
+  key that turns them off (live probes of 1.5.13). So a turn fails before it starts when any of
+  them defines a hook without `"enabled": false`, an MCP server without `"disabled": true`, or a
+  non-empty `plugins.json`. Rules, skills and `AGENTS.md` are only text, and still load.
 - **Every harness:** each turn's prompt, resumed ones included, starts with a note that
   agent-bus's instructions take precedence over the harness's own instructions for interactive
   sessions, and that only the final message is posted (earlier text can still show in the
   live progress view). Copilot's also says to post no progress
   updates and not to cut the reply short (its harness asks for both, and no flag drops that).
   Antigravity's says not to call agent-bus tools and to name files by path, not `file://` links.
+
+What a checkout under review can still change (issue #98): the switches above keep its own
+hooks, MCP servers, rules and command-running settings out of a peer turn, or refuse the turn.
+What's left is trusted:
+- **Your own config:** user-level, plugin and managed hooks and settings still apply (Claude
+  Code's and Copilot's user hooks run, and so does anything in `~/.gemini/config`), except that
+  Codex peer turns run no hooks or rules at all. Directories above the repository root (say a
+  `.agents` in `~/src`) count as yours and aren't checked.
+- **Instructions:** `CLAUDE.md`, `AGENTS.md`, agy's rules and skills, and the non-command keys
+  of a trusted project's `.codex/config.toml` still load. They can steer what the peer says, as
+  can the code it reads, and its reply reaches you as `peer_data`.
+- **Copilot's and agy's refusals look at files:** agent-bus reads the files their docs and
+  probes name just before the turn starts. A location a later CLI version adds isn't covered
+  until agent-bus learns it (a new recipe), and the snapshot MCP handling for Copilot follows its
+  docs, without a live probe. Copilot refuses a checkout with hooks even when the folder isn't
+  trusted (agent-bus can't tell), and agy one with its own hooks or MCP servers: switch them off
+  in the checkout, or review it some other way.
 
 Pages a peer reads are untrusted. A peer's reply already reaches you and the other agents as
 `peer_data`, and a peer can't write files, use the network from a shell, or run commands at
