@@ -1568,6 +1568,18 @@ class Bus:
                 return r
         return None
 
+    def next_unreviewed(self, thread_id: str, after: str | None) -> str | None:
+        """The next required reviewer with no verdict on the current revision (pending or
+        stale), going round the list from the one after ``after``, or None.  A review-only
+        review (#148) hands each head to every reviewer, a request for changes included."""
+        st = self.review_standings(thread_id)
+        order = list(st["reviewers"])
+        start = order.index(after) + 1 if after in order else 0
+        for r in order[start:] + order[:start]:
+            if st["reviewers"][r]["state"] in ("pending", "stale"):
+                return r
+        return None
+
 
 # The default when a review thread doesn't record its own budget (one from before #71).
 DEFAULT_FOLLOWUP_BUDGET = 3
@@ -1613,10 +1625,20 @@ def review_progress(t: dict) -> dict:
     refs = t["refs"] or {}
     budget = int(refs.get("followup_budget") or DEFAULT_FOLLOWUP_BUDGET)
     used = int(refs.get("follow_ups") or 0)
+    # A review-only review (#148) follows a colleague's pushes for as long as the pull request
+    # lives, so it has no hard limit (None): only the soft budget's warning applies.
+    limit = None if refs.get("review_only") else int(refs.get("followup_limit") or 2 * budget)
     return {"passes": t["round"], "follow_ups": used, "followup_budget": budget,
-            "followup_limit": int(refs.get("followup_limit") or 2 * budget),
+            "followup_limit": limit,
             "budget_warning": used >= budget,
             "waiting_for_human": bool(refs.get("budget_parked")) and t["status"] == "needs_human"}
+
+
+def over_followup_limit(p: dict) -> bool:
+    """Whether review_progress ``p`` (or a review's standings) is at its follow-up limit.
+    A review-only review has none (#148)."""
+    limit = p.get("followup_limit")
+    return limit is not None and p.get("follow_ups", 0) >= limit
 
 
 def format_progress(t: dict) -> str:

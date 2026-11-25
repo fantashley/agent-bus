@@ -30,7 +30,7 @@ from typing import Iterator
 from . import config as cfg
 from . import evidence as ev
 from . import autoresume, procinfo, prompts, provenance, quota, snapshot, unvotable, usages
-from .db import HUMAN, SYSTEM, Bus, BusError, format_dissent, review_progress
+from .db import HUMAN, SYSTEM, Bus, BusError, format_dissent, over_followup_limit, review_progress
 from .peers import (ADAPTERS, Adapter, TurnResult, adapter, cli_version, extract_reply, fenced_body,
                     format_usage)
 
@@ -1115,7 +1115,9 @@ class Worker:
     def run_review_rounds(self) -> None:
         """A review with several required reviewers (#47): one reviewer per round, on one
         thread.  An approval hands the current head to the next reviewer still without a
-        valid approval; a request for changes stops for the author to push a fix."""
+        valid approval; a request for changes stops for the author to push a fix, except on a
+        review-only review (#148), where every reviewer gives a verdict on each head (the
+        initiator relays them all to the author at once)."""
         mode = self.job["params"].get("mode", "first")
         while True:
             t = self.thread()
@@ -1127,7 +1129,15 @@ class Worker:
                     return  # parked as needs_human (or failed) with a notice
                 state = self.bus.review_standings(self.thread_id)["reviewers"][reviewer]["state"]
             mode = "first"
-            nxt = self.bus.next_reviewer(self.thread_id, after=reviewer) if state == "approved" else None
+            if state == "approved":
+                nxt = self.bus.next_reviewer(self.thread_id, after=reviewer)
+                if nxt is not None and refs.get("review_only") and \
+                        self.bus.review_standings(self.thread_id)["reviewers"][nxt]["state"] == "changes_requested":
+                    nxt = self.bus.next_unreviewed(self.thread_id, after=reviewer)
+            elif refs.get("review_only"):
+                nxt = self.bus.next_unreviewed(self.thread_id, after=reviewer)
+            else:
+                nxt = None
             if nxt is None:
                 break
             mine = self.bus.review_standings(self.thread_id)["reviewers"][nxt]
@@ -1178,14 +1188,14 @@ class Worker:
     def park_over_budget(self, t: dict, what: str) -> bool:
         """Park a review that still asks for changes after its follow-up limit for the human
         user (#71), with the open findings.  True if parked (or no longer open)."""
-        if review_progress(t)["follow_ups"] < review_progress(t)["followup_limit"]:
+        if not over_followup_limit(review_progress(t)):
             return False
         to = None if t["initiator"] == HUMAN else t["initiator"]
         with self.fenced():
             # Judged again inside the write: a human resume may have raised the limit since.
             now = self.bus.thread(self.thread_id)
             p = review_progress(now)
-            if p["follow_ups"] < p["followup_limit"]:
+            if not over_followup_limit(p):
                 return False
             if self.bus.transition(self.thread_id, "needs_human"):
                 refs = now["refs"] or {}
@@ -2251,9 +2261,10 @@ def settle_earlier(v: dict | None, prior: dict[str, dict], reusable: set[str] = 
         # (an approval that leaves one unsaid is refused: settlement_problem).
         carry = settled.get(fid) == "still_blocking" or (fid not in settled and v["verdict"] == "request_changes")
         if carry and fid not in listed:
+            # Marked carried: its location is from an earlier head, not confirmed on this one (#148).
             v["findings"].append({"file": str(old.get("file") or "?"), "line": old.get("line"),
                                   "severity": old.get("severity"), "comment": str(old.get("comment") or ""),
-                                  "id": fid})  # a blocking one: never pre-existing (prior_blocking)
+                                  "id": fid, "carried": True})  # blocking: never pre-existing (prior_blocking)
     return v
 
 
@@ -2341,6 +2352,10 @@ def budget_warning(t: dict) -> str:
     p = review_progress(t)
     if not p["budget_warning"]:
         return ""
+    if p["followup_limit"] is None:  # review-only (#148): no hard limit
+        return (f"\nThis review has run long: {p['follow_ups']} follow-up requests, soft budget "
+                f"{p['followup_budget']}. It is review-only, so it never parks for the human user; "
+                "consider finishing it with finish_review once the remaining findings are minor.")
     return (f"\nThis review has run long: {p['follow_ups']} follow-up requests, soft budget "
             f"{p['followup_budget']}. Consider deferring non-blocking findings to a follow-up issue, or "
             f"asking the human user; after {p['followup_limit']} it waits for them.")

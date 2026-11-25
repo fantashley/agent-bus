@@ -22,8 +22,9 @@ self:
 #   Rex-aware interactive Codex sessions need `codex --no-daemon`. This module
 #   doesn't change how codex is launched or its features (see README).
 # - Antigravity: a plugin directory linked at ~/.gemini/config/plugins/agent-bus.
-# - The agent-bus skill (skills/agent-bus/SKILL.md, the how-to agents read) ships in the
-#   Claude Code and Antigravity plugins, and is linked at ~/.agents/skills/agent-bus, where
+# - The agent-bus skill (skills/agent-bus/SKILL.md, the how-to agents read) and the
+#   agent-bus-pr-review skill (#148) ship in the Claude Code and Antigravity plugins, and are
+#   linked at ~/.agents/skills/<name>, where
 #   Codex and Copilot CLI load user skills. The plugins are built by ./plugins.nix.
 # - Copilot CLI: `agent-bus setup-copilot` at activation, which adds or fixes only
 #   the agent-bus entry in ~/.copilot/mcp-config.json ($COPILOT_HOME), leaving
@@ -353,8 +354,10 @@ in
       defaultText = lib.literalExpression "codex.enable || copilot.enable";
       description = ''
         Link the agent-bus skill (how to start discussions, request reviews and debriefs, and
-        what each error code means) at ~/.agents/skills/agent-bus, where Codex and Copilot CLI
-        load user skills. The Claude Code and Antigravity plugins carry it themselves.
+        what each error code means) at ~/.agents/skills/agent-bus, and the agent-bus-pr-review
+        skill (reviewing a colleague's GitHub pull request) at ~/.agents/skills/agent-bus-pr-review,
+        where Codex and Copilot CLI load user skills. The Claude Code and Antigravity plugins
+        carry them themselves.
       '';
     };
 
@@ -394,6 +397,7 @@ in
 
     (lib.mkIf cfg.skill.enable {
       home.file.".agents/skills/agent-bus".source = plugins.skill;
+      home.file.".agents/skills/agent-bus-pr-review".source = plugins.prReviewSkill;
     })
 
     (lib.mkIf cfg.antigravity.enable {

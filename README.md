@@ -158,11 +158,17 @@ wait until it is resolved (or `needs_human`).
 **Reviewing someone else's change** (#145). `request_review(..., review_only=true)` marks a
 review whose initiator isn't the change's author, say a colleague's pull request. A request for
 changes then waits for the author's next head instead of the initiator's fix: `next_action` says
-`await_head: ...`, and the multi-reviewer notice says the same. When the author pushes, the
+`await_head: ...`, and the multi-reviewer notice says the same. With several reviewers, a
+request for changes doesn't end the round as it does otherwise: every reviewer gives a verdict
+on each head (#148), so the initiator can relay all the findings to the author at once. When the author pushes, the
 initiator requests the new head as an ordinary follow-up (`prev_head_commit_id`), so the
 interdiff and finding settlement work as usual. The flag is set when the review starts and kept
 by its follow-ups (a fresh request of the other kind for the same diff is a separate review);
-`threads` and `history` show `review_only: true`.
+`threads` and `history` show `review_only: true`. A review-only review follows the author's
+pushes for as long as the pull request lives, so it is exempt from the follow-up limit below
+(#148): it reports `followup_limit: null`, never parks as `needs_human` for its budget, and only
+gets the soft budget's warning. The [`agent-bus-pr-review` skill](#reviewing-github-pull-requests) builds a GitHub
+pull request review on top of it.
 
 **Finishing a review without every approval** (#145). The initiator calls
 `finish_review(thread, reason)` (the human user: `agent-bus finish <thread> --reason …`), once no
@@ -266,7 +272,8 @@ handoffs, retries and repeats are free) against a soft budget, `review_followup_
 config (default 3). Once it is spent, reviewers are told the review has run long and your
 changes-requested notices suggest deferring non-blocking findings to a follow-up issue. A review
 that still asks for changes after twice the budget goes to `needs_human` and refuses follow-ups
-with `REVIEW_LIMIT_REACHED` until the human runs `agent-bus resume <thread>`, which allows
+with `REVIEW_LIMIT_REACHED` (review-only reviews excepted, above) until the human runs
+`agent-bus resume <thread>`, which allows
 another budget's worth. A pushback at the limit that is still due its verdict (say it hit a usage
 limit) is the exception: the error says to wait for that verdict, because a resume reruns the
 pushback without raising the limit. Reviews report `passes`, `follow_ups` and `followup_budget` instead of a
@@ -276,6 +283,22 @@ If the repo doesn't have a pinned commit (base, head, or the previous head a fol
 against), the reviewer isn't started. The thread goes to `needs_human` with a notice naming the
 missing commit, and the job is marked failed. Make the commit available in the repo, then request
 the review again (a first pass) or run `agent-bus resume <thread>` (either pass).
+
+### Reviewing GitHub pull requests
+
+The `agent-bus-pr-review` skill ([`skills/agent-bus-pr-review/SKILL.md`](skills/agent-bus-pr-review/SKILL.md),
+#148) lets your agent relay a review of a colleague's GitHub pull request; the colleague doesn't
+need agent-bus. Given a PR URL, the agent fetches the PR's head into an allow-listed git
+checkout (fetch only: nothing from the branch runs), pins the merge base and head, and starts a
+review-only review with your reviewers and the PR's text and linked issue as `evidence`. Its
+helper, `pr_review.py`, turns the verdicts into a **draft** review: a summary plus an inline
+comment per finding, tagged with the finding's id (pre-existing ones marked non-blocking). The
+agent shows you the draft and posts it with `gh` only after you approve it. When the author
+pushes, ask for an update: the agent relays the author's replies on the finding threads (as
+untrusted notes), requests a follow-up on the same thread, and drafts replies on the existing
+threads (resolving the fixed ones) instead of new comments. A small state file per PR, under
+`~/.local/state/agent-bus/pr-reviews/`, maps the PR to its thread, last reviewed head and each
+finding's comment and thread ids. `finish_review` ends the review when you're done.
 
 ## Debriefs
 
@@ -1037,6 +1060,9 @@ which ships with the build:
 - **Claude Code** and **Antigravity:** in the plugin (`skills/agent-bus/`).
 - **Codex** and **Copilot CLI:** linked at `~/.agents/skills/agent-bus`, where both load user
   skills (`local.agentBus.skill.enable`, on when either is enabled).
+
+The `agent-bus-pr-review` skill ([above](#reviewing-github-pull-requests)) ships the same way,
+next to it (`skills/agent-bus-pr-review/`, `~/.agents/skills/agent-bus-pr-review`).
 
 A client without skills can be pointed at that file from its global instructions instead.
 

@@ -1008,7 +1008,8 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
     if args.cmd == "resume":
         res = svc.resume(args.thread, extra_rounds=args.rounds)
         t = res["thread"]
-        limit = (f"follow-ups {t['follow_ups']}, limit {t['followup_limit']}" if t["kind"] == "review"
+        limit = (f"follow-ups {t['follow_ups']}, limit {t['followup_limit'] or 'none (review-only)'}"
+                 if t["kind"] == "review"
                  else f"max rounds {t['max_rounds']}")
         print(f"resumed {t['id']}: status {t['status']}, {limit}"
               + (f", job {res['job']['id']}" if res.get("job") else ""))
