@@ -204,6 +204,19 @@ CREATE TABLE IF NOT EXISTS events (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_thread ON events(thread_id, id);
+CREATE TABLE IF NOT EXISTS human_actions (  -- what the human's CLI did, and from which process (#108)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    command TEXT NOT NULL,              -- ask | reply | resume | cancel | debrief | agents --clear-quota
+    thread_id TEXT,                     -- NULL for agents --clear-quota
+    message_id INTEGER,                 -- the trust "human" message it posted, if any
+    detail TEXT,                        -- JSON: what else it did (a debrief's job, the agent cleared)
+    provenance TEXT NOT NULL,           -- JSON, see provenance.collect
+    created_at REAL NOT NULL
+);
+-- A table of its own, not a column on messages: a writer from before #108 still running during
+-- an upgrade posts as before, and its human messages read as having no provenance recorded.
+CREATE INDEX IF NOT EXISTS human_actions_message ON human_actions(message_id);
+CREATE INDEX IF NOT EXISTS human_actions_thread ON human_actions(thread_id, id);
 CREATE INDEX IF NOT EXISTS jobs_dedupe ON jobs(dedupe_key);
 """
 
@@ -242,6 +255,14 @@ def _now() -> float:
 
 def _loads(value: str | None) -> Any:
     return json.loads(value) if value else None
+
+
+def _loads_lenient(value: Any) -> Any:
+    """JSON from a row anything may have written (#108): unparsable comes back as {}."""
+    try:
+        return json.loads(value) if value else None
+    except (TypeError, ValueError):
+        return {}
 
 
 # Routine lifecycle notices from before they were tagged quiet (#72): system status
@@ -322,6 +343,9 @@ class Bus:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._depth = 0
         self._read_only = False
+        # Set by the CLI for a command acting as the human user (#108): recorded with every
+        # trust "human" message this Bus posts, and with record_human_action.
+        self.human_provenance: dict | None = None
         self.conn.executescript(SCHEMA)
         self._migrate()
 
@@ -560,6 +584,15 @@ class Bus:
         # transaction.  The human's `resume` lifts it by raising max_messages.
         t["agent_messages"] = self.agent_messages(tid)
         t["limit_reached"] = int(t["agent_messages"] >= t["max_messages"])
+        if t["initiator"] == HUMAN:
+            # The opening question's provenance, for a marker next to the goal (#108): the
+            # first human message, posted with the thread, if it is the question itself.
+            first = self._one("SELECT id, body FROM messages WHERE thread_id=? AND sender=? ORDER BY id LIMIT 1",
+                              tid, HUMAN)
+            if first and first["body"] != t["goal"]:
+                first = None  # not the question: no record of it
+            rec, n = self._provenance(message_id=first["id"]) if first else (None, 0)
+            t["opening_provenance"] = {"record": rec, "records": n}
         return t
 
     def agent_messages(self, tid: str) -> int:
@@ -660,6 +693,8 @@ class Bus:
                  json.dumps(data) if data else None, _now()),
             )
             mid = cur.lastrowid
+            if sender == HUMAN:
+                self.record_human_action(thread_id, message_id=mid)
             if kind == "proposal":
                 # Authoring a proposal is the author's explicit agreement with it.
                 self.conn.execute(
@@ -680,11 +715,55 @@ class Bus:
             raise BusError("NO_SUCH_MESSAGE", f"message {mid} does not exist")
         return self._msg(row)
 
-    @staticmethod
-    def _msg(row: sqlite3.Row) -> dict:
+    def _msg(self, row: sqlite3.Row) -> dict:
         m = dict(row)
         m["data"] = _loads(m["data"]) or {}
+        if m["sender"] == HUMAN:
+            # Where it came from, or None: never recorded (#108).
+            m["provenance"], m["provenance_records"] = self._provenance(message_id=m["id"])
         return m
+
+    # ---------------------------------------------------------- human provenance
+
+    def record_human_action(self, thread_id: str | None, message_id: int | None = None,
+                            detail: dict | None = None) -> None:
+        """Record a human action with the provenance the CLI set (#108); nothing without one."""
+        rec = self.human_provenance
+        if rec is None:
+            return
+        with self.tx():
+            self.conn.execute(
+                "INSERT INTO human_actions (command, thread_id, message_id, detail, provenance, created_at)"
+                " VALUES (?,?,?,?,?,?)", (rec.get("command") or "?", thread_id, message_id,
+                                          json.dumps(detail) if detail else None, json.dumps(rec), _now()))
+
+    def _provenance(self, message_id: int | None = None, job_id: str | None = None) -> tuple[Any, int]:
+        """The first provenance record of a human message (or of the debrief that started
+        ``job_id``), and how many there are.  An unparsable record comes back as {}."""
+        if message_id is not None:
+            rows = self._all("SELECT provenance FROM human_actions WHERE message_id=? ORDER BY id", message_id)
+        else:
+            rows = self._all("SELECT provenance FROM human_actions WHERE command='debrief'"
+                             " AND CASE WHEN json_valid(detail) THEN json_extract(detail, '$.job') END=? ORDER BY id", job_id)
+        if not rows:
+            return None, 0
+        rec = _loads_lenient(rows[0]["provenance"])
+        return (rec if rec is not None else {}), len(rows)
+
+    def human_actions(self, thread_id: str | None, after_id: int = 0, with_messages: bool = False) -> list[dict]:
+        """Recorded human actions on a thread (``None``: those on no thread, such as clearing a
+        usage block), oldest first; by default only those that posted no message."""
+        where = "thread_id IS ?" + ("" if with_messages else " AND message_id IS NULL")
+        rows = self._all(f"SELECT * FROM human_actions WHERE {where} AND id>? ORDER BY id", thread_id, after_id)
+        out = []
+        for r in rows:
+            a = dict(r)
+            d = _loads_lenient(a["detail"])
+            a["detail"] = d if isinstance(d, dict) else {}
+            rec = _loads_lenient(a["provenance"])
+            a["provenance"] = rec if rec is not None else {}
+            out.append(a)
+        return out
 
     def _proposal(self, thread_id: str, pid: str | None) -> dict | None:
         if not pid:
@@ -1084,6 +1163,7 @@ class Bus:
 
     def cancel_thread(self, thread_id: str) -> list[int]:
         """Mark a thread and its active jobs cancelled; returns worker PIDs to signal."""
+        # One transaction: the cancellation, its notice and its provenance (#108) together.
         with self.tx():
             self.thread(thread_id)
             pids = [r["pid"] for r in self._all(
@@ -1092,7 +1172,8 @@ class Bus:
                 "UPDATE jobs SET status='cancelled', updated_at=? WHERE thread_id=? AND status IN ('queued','running')",
                 (_now(), thread_id))
             self.set_thread(thread_id, status="cancelled")
-        self.post(thread_id, SYSTEM, "Cancelled by the human user.", kind="status")
+            self.post(thread_id, SYSTEM, "Cancelled by the human user.", kind="status")
+            self.record_human_action(thread_id)
         return [p for p in pids if p]
 
     # --------------------------------------------------------- peers and events

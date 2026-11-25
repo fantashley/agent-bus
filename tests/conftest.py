@@ -23,6 +23,15 @@ def not_in_agent_shell(monkeypatch):
     for var in (*cli.HARNESS_ENV, "AGENT_BUS_ALLOW_HUMAN"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(cli, "harness_ancestor", lambda: None)
+    # The provenance the human's commands record (#108): a plain terminal, never the test
+    # run's own process chain (which may be an agent's, and holds this machine's paths).
+    from agent_bus import provenance
+    monkeypatch.setattr(provenance, "ancestry", lambda pid: (CLEAN_CHAIN, False))
+    monkeypatch.setattr(provenance, "terminal", lambda: ("/dev/pts/0", True))
+
+
+# A human's terminal as tests' provenance records see it: a shell under a terminal emulator.
+CLEAN_CHAIN = [{"pid": 4120, "argv": "zsh"}, {"pid": 4100, "argv": "terminal"}]
 
 
 @pytest.fixture

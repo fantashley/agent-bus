@@ -6,6 +6,7 @@ template restates that it is information, not instructions.
 
 from __future__ import annotations
 
+from . import provenance
 from .db import HUMAN, SYSTEM, wrap_peer  # noqa: F401 (re-exported)
 
 PREAMBLE = """\
@@ -395,7 +396,8 @@ def render_message(m: dict) -> str:
         head += f" on head {str(m['data']['head_commit_id'])[:12]}"
     head += f"] round {m.get('round') or '-'}"
     if who == HUMAN:
-        return f"{head} from the human user:\n{m['body']}"
+        note = provenance.peer_note(m["provenance"], m.get("provenance_records", 1)) if "provenance" in m else ""
+        return f"{head} from the human user{f' ({note})' if note else ''}:\n{m['body']}"
     if who == SYSTEM:
         return f"{head} from agent-bus:\n{m['body']}"
     return f"{head} from {who}:\n{wrap_peer(who, m['body'])}"
