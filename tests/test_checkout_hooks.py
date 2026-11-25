@@ -66,7 +66,31 @@ def test_codex_ignores_rules_and_turns_hooks_off(env):
         configs = flag_values(a, "-c")
         assert configs[-1 - configs[::-1].index("features.hooks=false")] == "features.hooks=false"
         assert "features.hooks=true" not in configs
-    assert adapter("codex", cfg.Config.load()).recipe == "4"
+    assert adapter("codex", cfg.Config.load()).recipe == "5"
+
+
+def test_codex_turns_plugins_off_in_the_turn_and_its_mcp_listing(env, monkeypatch):
+    # A trusted project's config can add a local marketplace and enable a plugin from it, and
+    # the plugin's MCP servers then start; `-c mcp_servers.<name>.enabled=false` can't switch
+    # one off (codex 0.172.0: "invalid transport").  So plugins are off, and the listing that
+    # decides which servers to switch off runs with them off too (#124).
+    import subprocess
+    set_peers(env, codex={"args": ["--enable", "plugins", "-c", "features.plugins=true", "--enable=plugins"]})
+    listed = []
+    real = subprocess.run
+
+    def spy(cmd, *a, **kw):
+        if "mcp" in cmd:
+            listed.append(cmd)
+        return real(cmd, *a, **kw)
+    monkeypatch.setattr(subprocess, "run", spy)
+    for resume_id in (None, "11111111-2222-3333-4444-555555555555"):
+        a = invocation(env, "codex", resume_id).argv
+        assert "plugins" not in a and "--enable=plugins" not in a
+        configs = flag_values(a, "-c")
+        assert "features.plugins=true" not in configs
+        assert [c for c in configs if c.startswith("features.plugins")] == ["features.plugins=false"]
+    assert listed and all("features.plugins=false" in cmd and "features.plugins=true" not in cmd for cmd in listed)
 
 
 @pytest.mark.parametrize("key, value", [("sqlite_home", '"/elsewhere"'), ("log_dir", '"/elsewhere"'),

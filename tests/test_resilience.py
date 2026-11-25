@@ -46,7 +46,7 @@ def test_version_is_probed_once_per_binary_and_recorded_per_turn(env, no_spawn, 
     tid = Service(bus, HUMAN).start_discussion("q", peers=["codex"])["thread"]["id"]
     run_job(bus, tid)
     starts = events(bus, tid, "turn_start")
-    assert starts and all("codex-cli 1.0.0 · recipe codex/4" in s for s in starts)
+    assert starts and all("codex-cli 1.0.0 · recipe codex/5" in s for s in starts)
 
 
 def test_exit_zero_without_a_reply_is_format_drift(env, no_spawn, monkeypatch):

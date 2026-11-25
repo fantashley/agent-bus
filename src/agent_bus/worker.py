@@ -496,7 +496,7 @@ class Worker:
             return TurnResult(ok=False, error="the discussion's deadline passed before the turn started")
         res = ad.run(prompt, cwd, max(30.0, min(self.config.turn_timeout_s, left)), emit, resume_id=resume_id,
                      add_dirs=add_dirs, cancelled=self.cancelled, peer_tag=tag)
-        self.account(ad, model, res, resumed=bool(resume_id), row=row)
+        self.settle_usage(ad, model, res, resumed=bool(resume_id), row=row)
         # A fresh session can't fix running out of usage; it would only spend more.  Check
         # again first: another worker may have found this agent out of usage meanwhile.
         # Nor can it fix a changed output format, or a turn the CLI stopped partway through
@@ -517,16 +517,17 @@ class Worker:
             if left > 0:
                 res = ad.run(fresh_prompt or prompt, cwd, max(30.0, min(self.config.turn_timeout_s, left)), emit,
                              add_dirs=add_dirs, cancelled=self.cancelled, peer_tag=tag)
-                self.account(ad, model, res, resumed=False, row=row)
+                self.settle_usage(ad, model, res, resumed=False, row=row)
                 fresh = True
             else:
                 self.drop_usage(row)
         self.event("turn_end", ("ok" if res.ok else f"failed: {res.error}") + tokens(res), agent)
         self.check()  # a worker that lost its lease records nothing
-        if fresh:
+        if fresh and res.launched:
             # The stored session is dropped only once the fresh one has run, never between
             # the last deadline check and the launch: a skipped fallback keeps it for a
-            # later resume or debrief (#106).
+            # later resume or debrief (#106), and so does one whose CLI never started (its
+            # setup was refused, or the subprocess couldn't be created; #129).
             self.set_peer_session(agent, None)
         if res.quota:
             self.record_quota(agent, model, res.quota)
@@ -572,6 +573,14 @@ class Worker:
         if res.external_id:
             self.set_peer_session(agent, res.external_id)
         return res
+
+    def settle_usage(self, ad: Adapter, model: str | None, res: TurnResult, resumed: bool,
+                     row: int | None) -> None:
+        """Record a CLI run's tokens, or drop its started row when the CLI never launched (#129)."""
+        if res.launched:
+            self.account(ad, model, res, resumed=resumed, row=row)
+        else:
+            self.drop_usage(row)
 
     def drop_usage(self, row: int | None) -> None:
         """A turn marked as started (begin_usage) that never ran its CLI: delete the row, so
