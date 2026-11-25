@@ -549,11 +549,28 @@ def usage_from(raw: object, keys: dict[str, str]) -> dict | None:
     return out or None
 
 
+def uncached_input(u: dict) -> int | None:
+    """Input tokens not read from a cache: fresh input plus input written to the cache
+    (#101).  Every adapter's "input" is the fresh part (CodexAdapter takes the cached part
+    out of codex's own count), so this is the same sum for every CLI."""
+    if "input" not in u and "cache_write" not in u:
+        return None
+    return u.get("input", 0) + u.get("cache_write", 0)
+
+
 def format_usage(u: dict | None, label: str = "tokens") -> str:
+    """`` · tokens in 26470 (9333 cached, 17137 uncached) out 4 thinking 0``: input split into
+    what came from the CLI's prompt cache and what didn't (#101)."""
     if not u:
         return ""
-    names = (("input", "in"), ("output", "out"), ("cache_read", "cache"), ("thinking", "thinking"))
-    return f" · {label} " + " ".join(f"{name} {u[k]}" for k, name in names if k in u)
+    parts = []
+    fresh = uncached_input(u)
+    if fresh is not None or "cache_read" in u:
+        split = [f"{u['cache_read']} cached"] if "cache_read" in u else []
+        split += [f"{fresh} uncached"] if fresh is not None else []
+        parts.append(f"in {(fresh or 0) + u.get('cache_read', 0)} ({', '.join(split)})")
+    parts += [f"{name} {u[k]}" for k, name in (("output", "out"), ("thinking", "thinking")) if k in u]
+    return f" · {label} " + " ".join(parts)
 
 
 def _limit(window: object, used: object, minutes: object = None, resets_at: object = None) -> dict | None:
@@ -948,6 +965,19 @@ CLAUDE_USAGE = {"input": "input_tokens", "output": "output_tokens", "cache_read"
                 "cache_write": "cache_creation_input_tokens"}
 CODEX_USAGE = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cached_input_tokens",
                "cache_write": "cache_write_input_tokens", "thinking": "reasoning_output_tokens"}
+
+
+def codex_usage(raw: object) -> dict | None:
+    """codex's counters in agent-bus's terms.  Its input_tokens is the whole prompt, cached
+    part included (live probe, codex-cli 0.172.0: 18033 input, 13952 of them cached), while
+    every other CLI reports only the input it didn't read from the cache: "input" here is
+    that fresh part too, so cached and uncached input mean the same for every agent (#101)."""
+    u = usage_from(raw, CODEX_USAGE)
+    if u and "input" in u:
+        u["input"] = max(0, u["input"] - u.get("cache_read", 0) - u.get("cache_write", 0))
+    return u
+
+
 AGY_USAGE = {"input": "input_tokens", "output": "output_tokens", "cache_read": "cache_read_tokens",
              "thinking": "thinking_tokens"}
 
@@ -1201,7 +1231,7 @@ class CodexAdapter(Adapter):
             elif itype in ("mcp_tool_call", "file_change") and typ == "item.started":
                 emit("tool", _short(f"{itype} {item.get('query') or item.get('tool') or ''}"))
         elif typ == "turn.completed":
-            st.usage = usage_from(obj.get("usage"), CODEX_USAGE)
+            st.usage = codex_usage(obj.get("usage"))
         elif typ in ("turn.failed", "error"):
             err = obj.get("error") or obj.get("message") or obj
             st.error = _short(json.dumps(err) if not isinstance(err, str) else err, 800)
@@ -1983,6 +2013,69 @@ def web_search_report(agent: str, config: Config) -> dict:
         note += f"; off in {', '.join(off_in)}"
     return {"enabled": on, "off_enforced": cls.web_off_enforced, "tools": cls.web_tools, "note": note,
             "off_in_repos": off_in}
+
+
+# The opening line of a reply's long-text block (#101): ```body or ~~~~body, CommonMark style.
+_BODY_OPEN = re.compile(r"[ ]{0,3}(`{3,}|~{3,})[ \t]*body[ \t]*")
+_FENCE_OPEN = re.compile(r"[ ]{0,3}(`{3,}|~{3,}).*")
+
+
+def fenced_body(text: str) -> tuple[str | None, str]:
+    """A reply's last block fenced as ``body`` (#101), and the reply without it.
+
+    A peer can put a long proposal, vote reasons or review summary in such a block next to a
+    small JSON object, so the long text needs no JSON escaping.  The block closes on a line of
+    the same fence character, at least as long as the opening one (CommonMark), so a body
+    fenced with four tildes can hold ``` code blocks.  Every body block is left out of the
+    rest, which is where the reply's JSON is looked for: a block may quote JSON (an example
+    verdict) that must never be taken for the reply's own.  An unclosed block (a reply cut
+    short) and all that follows it are left out too, and then there is no body.  (None, text)
+    when there is no body block at all."""
+    lines = text.split("\n")
+    found = None
+    blocks: list[tuple[int, int]] = []
+    cut = len(lines)
+    i = 0
+    while i < len(lines):
+        m = _BODY_OPEN.fullmatch(lines[i]) or _FENCE_OPEN.fullmatch(lines[i])
+        if not m:
+            i += 1
+            continue
+        fence = m.group(1)
+        close = re.compile(rf"[ ]{{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*")
+        end = next((j for j in range(i + 1, len(lines)) if close.fullmatch(lines[j])), None)
+        if not _BODY_OPEN.fullmatch(lines[i]):
+            # Any other code block (a ```json verdict, an example) is passed over whole, so a
+            # body marker quoted inside one is not a block of its own.
+            i = len(lines) if end is None else end + 1
+            continue
+        if end is None:
+            cut = i
+            break
+        found = (i, end)
+        blocks.append(found)
+        i = end + 1
+    kept = [line for n, line in enumerate(lines[:cut]) if not any(a <= n <= b for a, b in blocks)]
+    if found is None or cut < len(lines):
+        return None, "\n".join(kept)
+    i, end = found
+    return "\n".join(lines[i + 1:end]).strip("\n"), "\n".join(kept)
+
+
+def extract_reply(text: str, field: str | Callable[[dict], str | None]) -> dict | None:
+    """The reply's JSON object (extract_json), with its long-text ``field`` taken from a
+    ```body block when the object leaves that field out or empty (#101).  ``field`` may
+    depend on the object (a proposal's "proposal", a vote's "reasons").  With a body block,
+    the object is looked for only outside it, so JSON quoted in the body is never taken for
+    the reply's own."""
+    body, rest = fenced_body(text)
+    obj = extract_json(rest)
+    if obj is None or body is None or not body.strip():
+        return obj
+    name = field(obj) if callable(field) else field
+    if name and not (isinstance(obj.get(name), str) and obj[name].strip()):
+        obj = {**obj, name: body}
+    return obj
 
 
 def extract_json(text: str) -> dict | None:

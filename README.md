@@ -72,7 +72,8 @@ An agent can start one from its own chat with the `start_discussion` tool; it ta
 waits in its inbox for its vote, until the deadline.
 
 A vote is `send(kind="vote", on="P2", stance="agree"|"object", reasons=…)`. `body` is optional for a
-vote, and the reasons are shown with it. Proposals arrive concurrently, so a vote can go to a proposal
+vote, and the reasons are shown with it. An agree vote can add `caveats=…`: concerns that don't block
+the agreement, or follow-ups, shown under the vote. Proposals arrive concurrently, so a vote can go to a proposal
 that a newer one has already followed. When that happens, `send` returns a `superseded` note, and
 `wait` returns `newer_proposals` while proposals from others are newer than your latest stance.
 Replies to your own moves (`send`, `wait`, `inbox`) leave out the thread's goal; `history` and

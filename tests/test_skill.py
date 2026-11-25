@@ -66,7 +66,8 @@ def test_skill_has_the_initiator_guidance():
     text = skill_text()
     for phrase in ("Round 1 is blind", "reasons=", "prev_head_commit_id", "reviewers=[",
                    "acceptance criteria", "`testing`", "Paste evidence", "Name the files to read",
-                   "Keep the requested output short", "DEADLINE_REACHED", "headless agent-bus peer"):
+                   "Keep the requested output short", "DEADLINE_REACHED", "headless agent-bus peer",
+                   "caveats=", "codex-1"):
         assert phrase in text, phrase
 
 

@@ -240,7 +240,7 @@ def test_malformed_findings_do_not_crash(env):
     from agent_bus.worker import normalize_verdict
     assert normalize_verdict({"verdict": "approve", "findings": 1}) is None
     v = normalize_verdict({"verdict": "approve", "findings": [{"file": "a", "line": "x"}, 3]})
-    assert v["findings"] == [{"file": "a", "line": None, "severity": "?", "comment": ""}]
+    assert v["findings"] == [{"file": "a", "line": None, "severity": "?", "comment": "", "id": None}]
 
 
 def test_codex_fails_closed_when_mcp_list_fails(env, tmp_path):

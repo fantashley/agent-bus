@@ -44,6 +44,21 @@ def format_message(m: dict, color: bool) -> str:
     return f"{head}\n{body}"
 
 
+def thread_header(t: dict) -> str:
+    """The first line of `agent-bus tail`: the thread, its kind and who is on it in which role
+    (#101), so a thread with a single peer doesn't read as that peer alone."""
+    init = "the human user" if t["initiator"] == HUMAN else t["initiator"]
+    others = [p for p in t["participants"] if p != t["initiator"]]
+    if t["kind"] == "review":
+        reviewers = (t["refs"] or {}).get("reviewers") or others
+        roles = f"requested by {init} · reviewer{'s' if len(reviewers) != 1 else ''}: {', '.join(reviewers)}"
+    elif t["kind"] == "discussion":
+        roles = f"started by {init} · peer{'s' if len(others) != 1 else ''}: {', '.join(others) or '-'}"
+    else:
+        roles = f"started by {init} · with {', '.join(others) or '-'}"
+    return f"agent-bus {t['id']} · {t['kind']} · {roles}"
+
+
 def thread_status(bus: Bus, thread: str) -> tuple[str, str | None, str]:
     """Map bus state to (OSC 7501 state, blocked kind, message)."""
     t = bus.thread(thread)
@@ -96,7 +111,7 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
     last_msg = last_ev = 0
     last_status = None
     t = bus.thread(args.thread)
-    print(_color(SYSTEM, f"agent-bus {t['id']} · {t['kind']} · {', '.join(t['participants'])}", color))
+    print(_color(SYSTEM, thread_header(t), color))
     print(_color(SYSTEM, f"goal: {t['goal']}", color))
     if args.peer:
         print(_color(SYSTEM, f"viewing {args.peer} (output only; intervene with `agent-bus reply`)", color))
