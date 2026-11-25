@@ -30,7 +30,8 @@ from typing import Iterator
 from . import config as cfg
 from . import autoresume, prompts, quota, snapshot, unvotable, usages
 from .db import HUMAN, SYSTEM, Bus, BusError, format_dissent, review_progress
-from .peers import ADAPTERS, Adapter, TurnResult, adapter, cli_version, extract_json, format_usage
+from .peers import (ADAPTERS, Adapter, TurnResult, adapter, cli_version, extract_reply, fenced_body,
+                    format_usage)
 
 LEASE_S = 120
 
@@ -904,8 +905,13 @@ class Worker:
         since = self.bus.delivered(self.thread_id, agent)
         # One read: the watermark is exactly the last message the prompt contains.
         everything = self.bus.history(self.thread_id)["messages"]
-        new = [m for m in everything if m["id"] > since]
         upto = everything[-1]["id"] if everything else 0
+        # The opening question is in the prompt already (the fresh one asks it, a resumed
+        # session had it in round 1): the transcript leaves out its message (#101).
+        first = everything[0] if everything else None
+        if first and first["sender"] == t["initiator"] and first["kind"] == "message":
+            everything = everything[1:]
+        new = [m for m in everything if m["id"] > since]
         standings = prompts.render_standings(self.bus, self.thread_id)
 
         def body(msgs: list[dict], heading: str) -> str:
@@ -935,7 +941,7 @@ class Worker:
         if not res.ok and not res.text:
             self.system(f"{agent} could not take its turn: {res.error}")
             return
-        action = extract_json(res.text)
+        action = extract_reply(res.text, move_field)
         if not self.valid_action(action, blind) and self.deadline_left() > 0:  # no repair turn past it (#74)
             self.event("repair", "asking again for the move: " + (
                 "no JSON object in the reply" if action is None else
@@ -949,15 +955,16 @@ class Worker:
             if res2.incomplete:
                 self.system(f"{agent} could not repair its reply: {res2.error}")
                 return
-            action = extract_json(res2.text) if res2.text else None
+            action = extract_reply(res2.text, move_field) if res2.text else None
         if not self.valid_action(action, blind):
             self.safe_post(agent, res.text.strip()[:20000] or "(empty reply)", kind="message",
                            session_id=f"job:{self.job['id']}")
             self.safe_post(SYSTEM, f"{agent}'s reply had no valid {'proposal' if blind else 'proposal or vote'}, "
                         "so it was posted as a plain message.", kind="status")
             return
-        prose = strip_trailing_json(res.text)
+        prose = strip_trailing_json(fenced_body(res.text)[1])
         reasons = action.get("reasons") if isinstance(action.get("reasons"), str) else None
+        caveats = action.get("caveats").strip() if isinstance(action.get("caveats"), str) else ""
         try:
             if action["action"] == "propose":
                 body = action["proposal"].strip()
@@ -967,8 +974,15 @@ class Worker:
                           data={"discussion": prose[-4000:]}, allow_past_deadline=True)
             else:
                 # A turn started before the deadline counts even if it ends after it (#74).
-                self.post(agent, reasons or action["stance"], kind="vote", session_id=f"job:{self.job['id']}",
-                          data={"on": action["on"], "stance": action["stance"], "reasons": reasons},
+                # Caveats are an agree vote's non-blocking concerns (#101); on an objection
+                # they are just more of its reasons.
+                body = (reasons or action["stance"]).strip()
+                if caveats:
+                    body += (f"\n\nCaveats (non-blocking): {caveats}" if action["stance"] == "agree"
+                             else f"\n\nAlso: {caveats}")
+                self.post(agent, body, kind="vote", session_id=f"job:{self.job['id']}",
+                          data={"on": action["on"], "stance": action["stance"], "reasons": reasons,
+                                **({"caveats": caveats} if caveats and action["stance"] == "agree" else {})},
                           allow_past_deadline=True)
         except BusError as e:
             self.system(f"{agent}'s {action['action']} was rejected: {e.message}")
@@ -977,7 +991,7 @@ class Worker:
     def valid_action(a: object, blind: bool = False) -> bool:
         if not isinstance(a, dict):
             return False
-        if a.get("reasons") is not None and not isinstance(a.get("reasons"), str):
+        if any(a.get(k) is not None and not isinstance(a.get(k), str) for k in ("reasons", "caveats")):
             return False
         if a.get("action") == "propose":
             return isinstance(a.get("proposal"), str) and bool(a["proposal"].strip())
@@ -1111,7 +1125,7 @@ class Worker:
         if self.park_over_budget(t, f"{who} requested changes at head {head[:12]}.\n{board}"):
             return
         self.system(f"{who} requested changes at head "
-                    f"{head[:12]}.\n{board}\nAddress the findings and `send` a note here on how, then call "
+                    f"{head[:12]}.\n{board}\nAddress the findings, `send` a note here on each by id, then call "
                     f"request_review with the same reviewers, the new head_commit_id and prev_head_commit_id="
                     f"{head}. A new head makes every earlier approval stale; the next round goes to "
                     f"{after_fix}, which sees the findings and your notes. To push back on a finding instead, "
@@ -1198,14 +1212,18 @@ class Worker:
         # The self-contained prompt (first pass, retry, or a follow-up whose session can't be
         # resumed) always has the full base..head diff, the reviewer's earlier verdicts and
         # every note on the thread, so a fresh session never reviews a partial view.
-        # It approved, and the head moved only because another reviewer asked for changes since
-        # (that reviewer's latest verdict still does).
+        # Whether another reviewer asked for changes since this one's last verdict (that
+        # reviewer's latest verdict still does): what moved the head, if this one approved.
         others: dict[str, str] = {}
         for m in everything:
             if mine is not None and m["kind"] == "review_verdict" and m["id"] > mine["id"] and m["sender"] != reviewer:
                 others[m["sender"]] = m["data"].get("verdict")
-        approved = (mine is not None and mine["data"].get("verdict") == "approve" and bool(refs.get("reviewers"))
-                    and "request_changes" in others.values())
+        # Its earlier blocking findings, by id, for the verdict to settle (#101).
+        prior = prior_blocking(mine)
+        earlier_note = earlier_findings_note(reviewer, mine, prior)
+        # The follow-up framing goes by its last verdict, not by whether it raised findings (#101).
+        framing = self.followup_framing(mine, refs.get("prev_head_commit_id"),
+                                        "request_changes" in others.values(), earlier_note)
         # Why the self-contained prompt has the whole change rather than an interdiff (#93).
         if not followup and not earlier:
             why_full = "this is your first pass on this change"
@@ -1216,23 +1234,22 @@ class Worker:
         else:
             why_full = "your earlier session can't be resumed, so this pass starts a fresh one"
         fresh = self.review_prompt(t, refs, full_diff, f"{full_heading.rstrip(':')}, because {why_full}:",
-                                   notes(everything), earlier, approved=approved, pushback=pushback, snap=snap)
+                                   notes(everything), earlier, framing=framing, pushback=pushback, snap=snap,
+                                   earlier_note=earlier_note)
         replies = "\n\n".join(prompts.render_message(m) for m in notes([m for m in everything
                                                                        if m["id"] > since])) or "(no replies)"
         if resume and pushback:
             prompt = prompts.REVIEW_PUSHBACK.format(head=refs["head_commit_id"], replies=replies,
                                                     reading=self.reading_note(refs, snap, listing=False),
                                                     severity=prompts.SEVERITY, budget=budget_note(t),
-                                                    time_limit=self.time_limit_note(),
+                                                    time_limit=self.time_limit_note(), earlier=earlier_note,
                                                     testing=("\n" + self.testing_note(t, refs) + "\n"
                                                              if self.testing_note(t, refs) else ""),
                                                     verdict_format=prompts.VERDICT_FORMAT)
         elif resume:
-            converge = prompts.CONVERGE + (prompts.ALREADY_APPROVED.format(prev=refs["prev_head_commit_id"])
-                                           if approved else "")
             prompt = prompts.REVIEW_FOLLOWUP.format(
                 head=refs["head_commit_id"], prev=refs["prev_head_commit_id"], replies=replies,
-                rebase=rebase_note, reading=self.reading_note(refs, snap, diff=inter), converge=converge,
+                rebase=rebase_note, reading=self.reading_note(refs, snap, diff=inter), converge=framing,
                 severity=prompts.SEVERITY, budget=budget_note(t),
                 time_limit=self.time_limit_note(), overview=self.review_overview(t, refs, inter, "interdiff"),
                 diff_heading=inter_heading, diff=inter, verdict_format=prompts.VERDICT_FORMAT)
@@ -1255,16 +1272,17 @@ class Worker:
             return None
         if res.ok or res.text:
             self.mark_delivered(reviewer, upto)
-        raw = extract_json(res.text) if res.text else None
-        verdict = normalize_verdict(raw)
+        raw = extract_reply(res.text, "summary") if res.text else None
+        verdict = settle_earlier(normalize_verdict(raw), prior)
         gave = res  # the turn the verdict came from
-        problem = verdict_problem(verdict) if verdict else None
+        problem = (verdict_problem(verdict) or settlement_problem(verdict, prior)) if verdict else None
         if (verdict is None or problem) and res.ok:
             # Why a repair turn runs, for `agent-bus tail` (#93).
             self.event("repair", f"asking again for the verdict: {repair_reason(raw, problem)}", reviewer)
             ask = (f"Your verdict is inconsistent: {problem}. Reply again with only the corrected JSON "
-                   "verdict object described above." if problem else
-                   "Reply again with only the JSON verdict object described above.")
+                   "verdict object described above (and its body block, if you use one)." if problem else
+                   "Reply again with only the JSON verdict object described above (and its body block, if "
+                   "you use one).")
             res2 = self.turn(reviewer, ask, fresh_prompt=fresh + "\n\n" + ask, read_dirs=read_dirs)
             if res2.quota or res2.format_changed or res2.config_error:
                 if res2.quota:
@@ -1274,8 +1292,21 @@ class Worker:
                 return None
             if res2.incomplete:
                 res = res2
-            verdict, gave = normalize_verdict(extract_json(res2.text) if res2.text else None), res2
-            problem = verdict_problem(verdict) if verdict else None
+            first = verdict
+            raw2 = extract_reply(res2.text, "summary") if res2.text else None
+            verdict = normalize_verdict(raw2)
+            gave = res2
+            if verdict and first:
+                # A repair that sent only the corrected JSON keeps what the first reply had:
+                # its summary, and its settlements if the repair gives no "earlier" at all,
+                # except for findings the repair lists again itself (it may have settled a
+                # conflict that way).
+                verdict["summary"] = verdict["summary"] or first["summary"]
+                if "earlier" not in raw2:
+                    relisted = {f["id"] for f in verdict["findings"] if f["id"]}
+                    verdict["earlier"] = [e for e in first["earlier"] if e["id"] not in relisted]
+            verdict = settle_earlier(verdict, prior)
+            problem = (verdict_problem(verdict) or settlement_problem(verdict, prior)) if verdict else None
         elif problem:
             verdict = None  # an inconsistent verdict with no repair turn: not usable
         if verdict is None or problem:
@@ -1285,16 +1316,23 @@ class Worker:
                 self.safe_post(SYSTEM, f"{reviewer} {why}. Run `agent-bus resume` to retry.",
                                kind="status", recipient=t["initiator"])
             return None
+        number_findings(reviewer, verdict["findings"], earlier)
         lines = [f"Verdict: {verdict['verdict']}", "", verdict["summary"]]
+        if verdict["earlier"]:
+            lines += ["", "Earlier findings:"]
+            lines += [f"- {e['id']} {e['status'].replace('_', ' ')}" + (f": {e['note']}" if e["note"] else "")
+                      for e in verdict["earlier"]]
+        if verdict["earlier"] and verdict["findings"]:
+            lines += ["", "Findings:"]
         for f in verdict["findings"]:
             loc = f"{f['file']}:{f['line']}" if f["line"] else f["file"]
-            lines.append(f"- [{severity_tag(f['severity'])}] {loc}: {f['comment']}")
+            lines.append(f"- [{severity_tag(f['severity'])}] {f['id']} {loc}: {f['comment']}")
         # The session that gave the verdict, so a later pass resumes it only if it is still
         # the saved one (see interdiff_from).  That turn's own id: a turn that failed without
         # reporting one leaves an older session saved, which never saw this pass.
         self.post(reviewer, "\n".join(lines).strip(), kind="review_verdict", session_id=f"job:{self.job['id']}",
                   recipient=t["initiator"],
-                  data={"verdict": verdict["verdict"], "findings": verdict["findings"],
+                  data={"verdict": verdict["verdict"], "findings": verdict["findings"], "earlier": verdict["earlier"],
                         "head_commit_id": refs["head_commit_id"], "base_commit_id": refs["base_commit_id"],
                         "revision": refs.get("revision", 0), "request_id": t["id"],
                         "session": gave.external_id})
@@ -1342,18 +1380,26 @@ class Worker:
             self.bus.finish_job(self.job["id"], "failed", self.owner, str(e))
             self.event("error", f"review not started: {e}")
 
+    def followup_framing(self, mine: dict | None, prev: str | None, others_asked: bool, earlier_note: str) -> str:
+        """How a follow-up pass starts (#71), chosen by the reviewer's last verdict (#101): an
+        approval has nothing of its own to settle; a request for changes settles its blocking
+        findings, by id.  "" before its first verdict."""
+        if mine is None:
+            return ""
+        if mine["data"].get("verdict") == "approve":
+            why = prompts.APPROVED_OTHERS if others_asked else prompts.APPROVED_AUTHOR
+            return prompts.ALREADY_APPROVED.format(prev=prev or mine["data"].get("head_commit_id") or "the last head",
+                                                   why=why)
+        return prompts.CONVERGE + earlier_note
+
     def review_prompt(self, t: dict, refs: dict, diff: str, heading: str, replies: list[dict],
-                      earlier: list[dict] | None = None, approved: bool = False, pushback: bool = False,
-                      snap: snapshot.Snapshot | None = None) -> str:
+                      earlier: list[dict] | None = None, framing: str = "", pushback: bool = False,
+                      snap: snapshot.Snapshot | None = None, earlier_note: str = "") -> str:
         focus = refs.get("focus")
         # A reviewer with an earlier verdict converges on it rather than starting over (#71).
         converge = ""
         if earlier:
-            converge = "\n" + prompts.CONVERGE
-            if pushback:
-                converge += prompts.PUSHBACK_NOTE
-            elif approved and refs.get("prev_head_commit_id"):
-                converge += prompts.ALREADY_APPROVED.format(prev=refs["prev_head_commit_id"])
+            converge = "\n" + (prompts.CONVERGE + prompts.PUSHBACK_NOTE + earlier_note if pushback else framing)
         converge += budget_note(t)  # every pass, a reviewer's first one too
         notes = "\n\n".join(prompts.render_message(m) for m in replies)
         if earlier:
@@ -1854,9 +1900,23 @@ def diff_overview(diff: str) -> str:
            f"+{sum(f['add'] for f in files)} -{sum(f['del'] for f in files)}"]
     for f in files:
         counts = "binary" if f["binary"] else f"+{f['add']} -{f['del']}"
-        moved = f" (from {f['old']})" if f["status"] == "R" else ""
-        out.append(f"  {f['status']} {f['path']}{moved}  {counts}")
+        moved = f" (from {shown_path(f['old'])})" if f["status"] == "R" else ""
+        out.append(f"  {f['status']} {shown_path(f['path'])}{moved}  {counts}")
     return "\n".join(out)
+
+
+def shown_path(path: str) -> str:
+    """A path for one row of the overview: control characters (a newline in a C-quoted name)
+    escaped, so a file never spans two rows (#101)."""
+    simple = {"\n": "\\n", "\t": "\\t", "\r": "\\r"}
+
+    def esc(c: str) -> str:
+        if c in simple:
+            return simple[c]
+        if ord(c) < 32 or 127 <= ord(c) < 160:
+            return f"\\x{ord(c):02x}"
+        return f"\\u{ord(c):04x}" if c in "\u2028\u2029" else c  # line breaks to str.splitlines
+    return "".join(esc(c) for c in path)
 
 
 def repair_reason(raw: object, problem: str | None) -> str:
@@ -1892,8 +1952,109 @@ def normalize_verdict(v: object) -> dict | None:
         clean.append({"file": str(f.get("file") or "?")[:300],
                       "line": line if isinstance(line, int) and not isinstance(line, bool) else None,
                       "severity": f.get("severity") if f.get("severity") in ("high", "medium", "low") else "?",
-                      "comment": str(f.get("comment") or "")[:4000]})
-    return {"verdict": v["verdict"], "summary": str(v.get("summary") or "").strip()[:8000], "findings": clean}
+                      "comment": str(f.get("comment") or "")[:4000],
+                      # An earlier finding's id, when it raises that one again (#101); checked later.
+                      "id": f["id"] if isinstance(f.get("id"), str) and FINDING_ID.fullmatch(f["id"]) else None})
+    earlier = []
+    for e in v.get("earlier") if isinstance(v.get("earlier"), list) else []:
+        if (isinstance(e, dict) and isinstance(e.get("id"), str) and FINDING_ID.fullmatch(e["id"])
+                and e.get("status") in SETTLED):
+            note = e.get("note")
+            earlier.append({"id": e["id"], "status": e["status"],
+                            "note": " ".join(note.split())[:2000] if isinstance(note, str) else ""})
+    return {"verdict": v["verdict"], "summary": str(v.get("summary") or "").strip()[:8000], "findings": clean,
+            "earlier": earlier}
+
+
+FINDING_ID = re.compile(r"\S{1,80}-[0-9]{1,6}")
+SETTLED = ("fixed", "withdrawn", "still_blocking")
+
+
+def prior_blocking(mine: dict | None) -> dict[str, dict]:
+    """The blocking findings of a reviewer's last verdict, by id (#101).  Verdicts from
+    before finding ids have none, and so nothing to settle by id."""
+    if mine is None or mine["data"].get("verdict") != "request_changes":
+        return {}
+    return {f["id"]: f for f in mine["data"].get("findings") or []
+            if isinstance(f, dict) and f.get("id") and f.get("severity") in BLOCKING}
+
+
+def earlier_findings_note(reviewer: str, mine: dict | None, prior: dict[str, dict]) -> str:
+    """The follow-up prompt's list of earlier blocking findings to settle, by id (#101)."""
+    if not prior:
+        return ""
+    rows = []
+    for fid, f in prior.items():
+        loc = f"{f.get('file')}:{f['line']}" if f.get("line") else str(f.get("file"))
+        comment = " ".join(str(f.get("comment") or "").split())
+        rows.append(f"- {fid} [{f.get('severity')}] {loc}: {comment[:300]}{'…' if len(comment) > 300 else ''}")
+    return prompts.EARLIER_FINDINGS.format(head=mine["data"].get("head_commit_id"), example=next(iter(prior)),
+                                           findings=prompts.wrap_peer(reviewer, "\n".join(rows)))
+
+
+def settle_earlier(v: dict | None, prior: dict[str, dict]) -> dict | None:
+    """Keep only the settlements of this reviewer's own earlier blocking findings, at most one
+    per id, and carry a finding it calls still blocking (or that a request for changes leaves
+    unsaid) into "findings" with its id, unless it lists it there itself (#101), so an
+    earlier blocker never drops out of the next round's list.  A finding id that isn't one of
+    its earlier ones is dropped, so the finding gets a new one."""
+    if v is None:
+        return None
+    seen: dict[str, dict] = {}
+    for e in v["earlier"]:
+        if e["id"] in prior and e["id"] not in seen:
+            seen[e["id"]] = e
+    v["earlier"] = list(seen.values())
+    listed = set()
+    for f in v["findings"]:
+        if f["id"] not in prior or f["id"] in listed:
+            f["id"] = None
+        else:
+            listed.add(f["id"])
+    settled = {e["id"]: e["status"] for e in v["earlier"]}
+    for fid, old in prior.items():
+        # Still blocking, or left unsaid by a request for changes: it stays open, carried over
+        # (an approval that leaves one unsaid is refused: settlement_problem).
+        carry = settled.get(fid) == "still_blocking" or (fid not in settled and v["verdict"] == "request_changes")
+        if carry and fid not in listed:
+            v["findings"].append({"file": str(old.get("file") or "?"), "line": old.get("line"),
+                                  "severity": old.get("severity"), "comment": str(old.get("comment") or ""),
+                                  "id": fid})
+    return v
+
+
+def settlement_problem(v: dict, prior: dict[str, dict]) -> str | None:
+    """Why a follow-up verdict doesn't settle the reviewer's earlier blocking findings (#101),
+    or None: an approval must settle each of them (an "earlier" entry, or listed again by
+    id), and an entry must agree with the severity the finding is listed with (call it still
+    blocking and it can't be low; call it fixed or withdrawn and it can't still block).  A
+    request for changes carries whatever it leaves unsaid (settle_earlier), so it stays open.
+    Run after settle_earlier."""
+    settled = {e["id"]: e["status"] for e in v["earlier"]}
+    listed = {f["id"]: f["severity"] for f in v["findings"] if f["id"] in prior}
+    missing = [fid for fid in prior if fid not in settled and fid not in listed]
+    if missing and v["verdict"] == "approve":
+        return (f"settle each earlier blocking finding in \"earlier\" ({', '.join(missing)} "
+                f"{'has' if len(missing) == 1 else 'have'} no entry): fixed, withdrawn or still_blocking")
+    for fid, status in settled.items():
+        sev = listed.get(fid)
+        if status == "still_blocking" and sev == "low":
+            return f"{fid} is still_blocking but listed as low: make it high or medium, or settle it otherwise"
+        if status in ("fixed", "withdrawn") and sev in BLOCKING:
+            return f"{fid} is {status} but still listed as {sev}: drop it from findings, or call it still_blocking"
+    return None
+
+
+def number_findings(reviewer: str, findings: list[dict], earlier: list[dict]) -> None:
+    """Give every new finding the reviewer's next stable id, ``codex-1``, ``codex-2``, ...
+    (#101), counting on from the ids of its earlier verdicts on the thread."""
+    used = [int(f["id"].rsplit("-", 1)[1]) for m in earlier for f in m["data"].get("findings") or []
+            if isinstance(f, dict) and isinstance(f.get("id"), str) and FINDING_ID.fullmatch(f["id"])]
+    n = max(used, default=0)
+    for f in findings:
+        if not f["id"]:
+            n += 1
+            f["id"] = f"{reviewer}-{n}"
 
 
 BLOCKING = ("high", "medium")
@@ -1943,6 +2104,12 @@ def drift_reason(error: str) -> str:
         if what in error:
             return what
     return "without a reply or a session id"
+
+
+def move_field(action: dict) -> str | None:
+    """Which field of a discussion move a ```body block fills (#101)."""
+    kind = action.get("action")
+    return {"propose": "proposal", "vote": "reasons"}.get(kind) if isinstance(kind, str) else None
 
 
 def strip_trailing_json(text: str) -> str:

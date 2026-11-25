@@ -23,6 +23,8 @@ Behaviour is driven by env vars so tests can script outcomes:
   FAKE_COPILOT_MCP_EVENT  the session.mcp_servers_loaded event's data (JSON) in place of the
                   real one; the whole turn is written at once, then it waits to be stopped
   FAKE_APPROVE    comma-separated agents whose review verdicts approve (others request changes)
+  FAKE_REPLY_<AGENT>  the whole reply of that agent (e.g. FAKE_REPLY_CODEX), to every prompt but
+                  a repair or a debrief (FAKE_REPAIR_<AGENT>: its reply to a repair)
   FAKE_CLAUDE_USED / FAKE_CODEX_USED  how full the five_hour / primary usage-limit window is
                   (a fraction for claude's stream, a percentage in codex's rollout file)
   FAKE_RESUME_FAILS  comma-separated agents whose resumed turns fail (exit 1, nothing on
@@ -109,10 +111,17 @@ reviewing = behaviour == "review" or any(k in prompt for k in ("Diff from base t
                                                                  "has not changed the code"))
 if "agent-bus debrief of thread" in prompt:
     reply = f"{agent} debrief: the prompts were clear."
+elif os.environ.get(f"FAKE_REPLY_{agent.upper()}") and not repair:
+    reply = os.environ[f"FAKE_REPLY_{agent.upper()}"]
+elif os.environ.get(f"FAKE_REPAIR_{agent.upper()}") and repair:
+    reply = os.environ[f"FAKE_REPAIR_{agent.upper()}"]
 elif behaviour == "nojson" and not repair:
     reply = "Thinking out loud, no JSON."
 elif reviewing and agent in os.environ.get("FAKE_APPROVE", "").split(","):
-    reply = 'All good.\n{"verdict": "approve", "summary": "fine", "findings": []}'
+    # Settles the earlier blocking findings the prompt lists by id (#101), as fixed.
+    ids = re.findall(r"^- (\S+-\d+) \[(?:high|medium)\]", prompt, re.M)
+    reply = "All good.\n" + json.dumps({"verdict": "approve", "summary": "fine", "findings": [],
+                                        "earlier": [{"id": i, "status": "fixed"} for i in dict.fromkeys(ids)]})
 elif reviewing:
     reply = 'Looks fine.\n{"verdict": "request_changes", "summary": "one bug", "findings": [{"file": "a.txt", "line": 1, "severity": "high", "comment": "typo"}]}'
 elif behaviour == "garbage":
@@ -271,8 +280,8 @@ elif agent == "codex":
         real["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
         with open(roll, "a") as f:
             f.write(json.dumps(real) + "\n")
-    n = session_turns()  # like codex 0.171.0: the session's running total
-    out({"type": "turn.completed", "usage": {"input_tokens": 20 * n, "cached_input_tokens": 200 * n,
+    n = session_turns()  # like codex 0.171.0: the session's running total, cached input included
+    out({"type": "turn.completed", "usage": {"input_tokens": 220 * n, "cached_input_tokens": 200 * n,
                                              "output_tokens": 6 * n, "reasoning_output_tokens": 4 * n}})
 elif agent == "copilot":
     # The shape of copilot 1.0.108's `-p --output-format json` stream (live probes 2026-11-23).

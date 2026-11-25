@@ -52,7 +52,8 @@ def test_codex_reports_a_running_total(env):
     assert ad.session_usage
     res = ad.run("p", str(env["repo"]), 30, lambda k, t: None, resume_id="00000000-0000-4000-8000-000000000001")
     # Includes codex-start's 35031: the session's total, not the turn's.
-    assert res.usage["input"] == 54180 and res.usage["cache_write"] == 0
+    # codex's input_tokens (54180) counts its cached input (45184) too: "input" is the rest (#101).
+    assert res.usage["input"] == 54180 - 45184 and res.usage["cache_read"] == 45184 and res.usage["cache_write"] == 0
 
 
 def test_turn_share():
@@ -88,11 +89,11 @@ def test_each_turn_is_recorded(env, no_spawn):
     assert [counts(r) for r in by["claude"]] == [{"input": 10, "output": 5, "cache_read": 100, "thinking": 3}] * 2
     # The resumed codex turn reported 40 in so far; its own share is 20.
     assert [counts(r) for r in by["codex"]] == [{"input": 20, "output": 6, "cache_read": 200, "thinking": 4}] * 2
-    assert json.loads(by["codex"][1]["session_total"])["input"] == 40
-    assert by["claude"][0]["session_total"] is None
+    assert json.loads(by["codex"][1]["split_total"])["input"] == 40
+    assert by["claude"][0]["split_total"] is None
     assert [counts(r) for r in by["antigravity"]] == [{"input": 30, "output": 7, "cache_read": 0, "thinking": 5}] * 2
     ends = [e["text"] for e in bus.events(tid) if e["kind"] == "turn_end" and e["agent"] == "codex"]
-    assert ends == ["ok · tokens in 20 out 6 cache 200 thinking 4"] * 2
+    assert ends == ["ok · tokens in 220 (200 cached, 20 uncached) out 6 thinking 4"] * 2
 
 
 def test_a_discussion_records_usage(env, no_spawn):
@@ -113,9 +114,9 @@ def test_resumed_session_without_an_earlier_total(env, no_spawn):
     assert w.turn("codex", "Which DB?").ok
     first, last = rows(bus, tid)
     assert counts(first)["input"] == 20
-    assert not counts(last) and json.loads(last["session_total"])["input"] == 40
+    assert not counts(last) and json.loads(last["split_total"])["input"] == 40
     ends = [e["text"] for e in bus.events(tid) if e["kind"] == "turn_end"]
-    assert "session tokens so far in 40" in ends[-1]
+    assert "session tokens so far in 440 (400 cached, 40 uncached)" in ends[-1]
 
 
 def session_turns(bus):
@@ -304,7 +305,7 @@ def test_failed_turns_without_usage_record_nothing(env, no_spawn, monkeypatch):
     run_job(bus, tid)
     assert set(usage.report(bus, thread=tid)["agents"]) == {"claude"}
     # Its turns stay only as started rows, so a later total isn't split across them.
-    assert all(r["session_total"] is None and r["input"] is None for r in rows(bus, tid) if r["agent"] == "codex")
+    assert all(r["split_total"] is None and r["input"] is None for r in rows(bus, tid) if r["agent"] == "codex")
 
 
 def test_old_usage_is_pruned(env):
@@ -328,8 +329,11 @@ def test_usage_command(env, no_spawn, capsys):
 
     assert cli.main(["usage", "--json"]) == 0
     rep = json.loads(capsys.readouterr().out)
-    assert rep["agents"]["claude"] == {"turns": 2, "unreported_turns": 0, "partial_turns": 0, "input": 20, "output": 10,
-                                       "cache_read": 200, "cache_write": 0, "thinking": 6}
+    assert rep["agents"]["claude"] == {"turns": 2, "unreported_turns": 0, "partial_turns": 0, "unsplit_turns": 0,
+                                       "unsplit_input": 0, "unsplit_cache_read": 0, "unsplit_cache_write": 0,
+                                       "input": 20, "output": 10,
+                                       "cache_read": 200, "cache_write": 0, "thinking": 6,
+                                       "cached_input": 200, "uncached_input": 20, "input_total": 220}
     assert rep["agents"]["codex"]["turns"] == 3 and rep["agents"]["codex"]["unreported_turns"] == 1
     assert [t["thread"] for t in rep["threads"]] == ["t-gone", tid]  # most recent first
     assert rep["threads"][0]["kind"] is None
@@ -342,6 +346,7 @@ def test_usage_command(env, no_spawn, capsys):
     assert cli.main(["usage"]) == 0
     out = capsys.readouterr().out
     assert "by agent:" in out and "claude" in out and "(thread no longer exists)" in out
+    assert "CACHED IN" in out and "UNCACHED IN" in out and "cached in 200 uncached in 20" in out
     assert "only a session total: codex 1" in out and f"{tid}  discussion open: Which DB?" in out
     assert cli.main(["usage", "--thread", "t-nope"]) == 2
     assert "NO_SUCH_THREAD" in capsys.readouterr().err
@@ -366,3 +371,22 @@ def test_usage_command_with_nothing_recorded(env, capsys):
                                   ["--limit", "-1"]])
 def test_usage_command_rejects_bad_ranges(env, capsys, args):
     assert cli.main(["usage", *args]) == 2
+
+
+def test_cached_and_uncached_input_mean_the_same_for_every_cli():
+    """#101: each CLI's live usage report (claude 2.1.331, codex-cli 0.172.0, agy 1.5.13, one
+    "reply ok" turn each).  Claude and agy report input other than cache reads and writes;
+    codex's input_tokens counts its cached input too.  turn_end splits input the same way."""
+    from agent_bus.peers import AGY_USAGE, CLAUDE_USAGE, codex_usage, format_usage, usage_from
+    claude = usage_from({"input_tokens": 2, "cache_creation_input_tokens": 17135, "cache_read_input_tokens": 9333,
+                         "output_tokens": 4}, CLAUDE_USAGE)
+    assert format_usage(claude) == " · tokens in 26470 (9333 cached, 17137 uncached) out 4"
+    codex = codex_usage({"input_tokens": 18033, "cached_input_tokens": 13952, "cache_write_input_tokens": 0,
+                         "output_tokens": 5, "reasoning_output_tokens": 0})
+    assert codex["input"] == 4081
+    assert format_usage(codex) == " · tokens in 18033 (13952 cached, 4081 uncached) out 5 thinking 0"
+    agy = usage_from({"input_tokens": 2420, "output_tokens": 37, "thinking_tokens": 35, "cache_read_tokens": 10297,
+                      "total_tokens": 2457}, AGY_USAGE)
+    assert format_usage(agy) == " · tokens in 12717 (10297 cached, 2420 uncached) out 37 thinking 35"
+    assert format_usage({"output": 3}) == " · tokens out 3"
+    assert codex_usage({"input_tokens": 5, "cached_input_tokens": 9})["input"] == 0  # never negative

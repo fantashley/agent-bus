@@ -124,8 +124,13 @@ class Service:
 
     def send(self, body: str | None = None, thread: str | None = None, to: str | None = None,
              kind: str = "message", on: str | None = None, stance: str | None = None,
-             reasons: str | None = None, refs: dict | None = None) -> dict:
+             reasons: str | None = None, refs: dict | None = None, caveats: str | None = None) -> dict:
         reasons = reasons.strip() if reasons and reasons.strip() else None
+        caveats = caveats.strip() if caveats and caveats.strip() else None
+        if caveats and (kind != "vote" or stance != "agree"):
+            # Non-blocking concerns that come with an agreement (#101); an objection's
+            # concerns are its reasons.
+            raise BusError("BAD_VOTE", "caveats go only on an agree vote; put an objection's concerns in reasons")
         if kind == "vote":
             # A vote's on/stance/reasons say everything; a body is optional (#74).  The
             # reasons go into the body too, so every rendering of the vote shows them.
@@ -134,6 +139,8 @@ class Service:
                 body = reasons or f"{stance} on {on}"
             elif reasons and reasons not in text:
                 body = f"{text}\n\nReasons: {reasons}"
+            if caveats:  # shown under the vote wherever it is rendered
+                body += f"\n\nCaveats (non-blocking): {caveats}"
         if not body or not body.strip():
             raise ValueError("body is empty")
         if to is not None:
@@ -154,6 +161,8 @@ class Service:
             data["refs"] = refs
         if kind == "vote":
             data.update(on=on, stance=stance, reasons=reasons or body)
+            if caveats:
+                data["caveats"] = caveats
         m = self.bus.post(thread, self.agent, body, kind=kind, session_id=self.session_id, recipient=to,
                           data=data)
         t = self.bus.thread(thread)

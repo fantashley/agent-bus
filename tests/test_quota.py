@@ -207,7 +207,7 @@ def test_successful_turn_clears_a_block_and_turn_end_reports_tokens(env, no_spaw
     assert bus.thread(tid)["status"] == "resolved"
     assert not bus._all("SELECT * FROM quota_blocks WHERE agent='claude'")
     ends = bus._all("SELECT * FROM events WHERE thread_id=? AND kind='turn_end'", tid)
-    assert ends and "tokens in 10 out 5 cache 100 thinking 3" in ends[0]["text"]
+    assert ends and "tokens in 110 (100 cached, 10 uncached) out 5 thinking 3" in ends[0]["text"]
 
 
 # ------------------------------------------------- review fixes (t-cf74ff pass 1)

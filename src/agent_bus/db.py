@@ -185,7 +185,12 @@ CREATE TABLE IF NOT EXISTS turn_usage (  -- tokens each headless turn used (issu
     partial INTEGER NOT NULL DEFAULT 0, -- 1: counts only for the part of the turn reported before it stopped
     done INTEGER NOT NULL DEFAULT 1,    -- 0 while a started turn (begin_usage) may still report
     started_at REAL,                    -- when the turn started (begin_usage), else when it was recorded
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    -- #101: 1 when "input" is the input not read from or written to a cache, for every CLI.  0
+    -- (the default, so a writer from before #101 still running during an upgrade marks its own
+    -- rows): a codex row's input may count its cached input too.  Old rows are never rewritten.
+    input_split INTEGER NOT NULL DEFAULT 0,
+    split_total TEXT                    -- JSON: session_total in that meaning (session_total stays NULL)
 );
 CREATE INDEX IF NOT EXISTS turn_usage_time ON turn_usage(created_at);
 CREATE INDEX IF NOT EXISTS turn_usage_session ON turn_usage(agent, session, id);
@@ -328,8 +333,10 @@ class Bus:
         tcols = {r["name"] for r in self._all("PRAGMA table_info(threads)")}
         jcols = {r["name"] for r in self._all("PRAGMA table_info(jobs)")}
         jobs_sql = self._one("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'")["sql"]
+        ucols = {r["name"] for r in self._all("PRAGMA table_info(turn_usage)")}
         return (any(c not in scols for c, _ in self.SESSION_COLUMNS) or "blind" not in tcols or "launches" not in jcols
-                or "dedupe_key TEXT UNIQUE" in jobs_sql or not self._has_table("cli_version_timeouts"))
+                or "dedupe_key TEXT UNIQUE" in jobs_sql or not self._has_table("cli_version_timeouts")
+                or "input_split" not in ucols or "split_total" not in ucols)
 
     def _has_table(self, name: str) -> bool:
         return self._one("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", name) is not None
@@ -363,6 +370,12 @@ class Bus:
                 # left behind gets the relaunches any other job would.
                 self.conn.execute("ALTER TABLE jobs ADD COLUMN launches INTEGER NOT NULL DEFAULT 1")
                 self.conn.execute("ALTER TABLE jobs ADD COLUMN launched_at REAL")
+            ucols = {r["name"] for r in self._all("PRAGMA table_info(turn_usage)")}
+            if "input_split" not in ucols:
+                # Rows from before #101 keep their counts, marked as such (see the schema).
+                self.conn.execute("ALTER TABLE turn_usage ADD COLUMN input_split INTEGER NOT NULL DEFAULT 0")
+            if "split_total" not in ucols:
+                self.conn.execute("ALTER TABLE turn_usage ADD COLUMN split_total TEXT")
             if not self._has_table("cli_version_timeouts"):
                 # Older versions cached a timed-out `--version` probe as "unknown" for good,
                 # indistinguishable from other unknowns: drop them all, in the same
@@ -1265,8 +1278,8 @@ class Bus:
         now = _now()
         with self.tx():
             cur = self.conn.execute(
-                "INSERT INTO turn_usage (thread_id, job_id, agent, model, session, ok, done, started_at, created_at)"
-                " VALUES (?,?,?,?,?,0,0,?,?)", (thread_id, job_id, agent, model, session, now, now))
+                "INSERT INTO turn_usage (thread_id, job_id, agent, model, session, ok, done, started_at, created_at,"
+                " input_split) VALUES (?,?,?,?,?,0,0,?,?,1)", (thread_id, job_id, agent, model, session, now, now))
             self._prune_usage(now)
         return cur.lastrowid
 
@@ -1309,9 +1322,11 @@ class Bus:
                     usage = self._session_share(agent, session, row, session_total)
             u = usage or {}
             values = (thread_id, job_id, agent, model, session, int(ok), *(u.get(k) for k in USAGE_KEYS),
-                      json.dumps(session_total) if session_total else None, int(partial), 1)
+                      json.dumps(session_total) if session_total else None, int(partial), 1, 1)
+            # The running total goes in split_total, never session_total: a worker from before
+            # #101 (an upgrade in progress) then finds no baseline it would misread (#101).
             cols = ("thread_id, job_id, agent, model, session, ok, input, output, cache_read, cache_write,"
-                    " thinking, session_total, partial, done")
+                    " thinking, split_total, partial, done, input_split")
             if row is not None and self._one("SELECT 1 FROM turn_usage WHERE id=?", row):
                 # Timed at completion, like every other row; the id keeps the start order.
                 self.conn.execute(f"UPDATE turn_usage SET ({cols}, created_at) ="
@@ -1336,10 +1351,11 @@ class Bus:
         - no earlier total is ahead of that baseline on a counter they share."""
         if not session or row is None:
             return None
-        others = self._all("SELECT id, session_total, done, started_at, created_at FROM turn_usage"
-                           " WHERE agent=? AND session=? AND id<>? ORDER BY id", agent, session, row)
+        others = self._all("SELECT id, session_total, split_total, input_split, done, started_at, created_at"
+                           " FROM turn_usage WHERE agent=? AND session=? AND id<>? ORDER BY id", agent, session, row)
         before = [r for r in others if r["id"] < row]
-        if not before or len(before) < len(others) or before[-1]["session_total"] is None:
+        # A baseline from before #101 may count codex's cached input in "input": not like ours.
+        if not before or len(before) < len(others) or before[-1]["split_total"] is None:
             return None
         base_row = before[-1]
         me = self._one("SELECT started_at FROM turn_usage WHERE id=?", row)
@@ -1347,12 +1363,12 @@ class Bus:
         # may not include it.
         if not me or not base_row["done"] or base_row["created_at"] >= me["started_at"]:
             return None
-        base = _loads(base_row["session_total"])
+        base = _loads(base_row["split_total"])
         for r in before[:-1]:
             # A done row's created_at is when it ended.
             if not r["done"] or r["created_at"] >= base_row["started_at"]:
                 return None
-            t = _loads(r["session_total"]) if r["session_total"] else {}
+            t = _loads(r["split_total"]) or {}  # a total from before #101 counts input otherwise
             if any(k in base and t[k] > base[k] for k in t):
                 return None
         return turn_share(total, base)

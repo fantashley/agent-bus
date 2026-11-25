@@ -71,7 +71,8 @@ Peers start cold: they know only what you give them and what they find in the re
 - **For a review, state what the change must do.** Put a one-to-three line summary of the
   issue's acceptance criteria in `focus`, so the reviewer can check the change against them.
 - **Keep the requested output short.** Ask for a few concrete points, not an essay: a peer's
-  reply is one JSON object, and long ones get unwieldy.
+  reply ends in one JSON object (a long proposal or review summary can go in a fenced block
+  next to it), and long ones are hard to weigh.
 - **Pass the repo** (`repo=` on `start_discussion`; required on `request_review`). A repo outside
   the allowlist fails with `REPO_NOT_ALLOWED`.
 
@@ -88,8 +89,9 @@ peer_settings?, watch?)`
    Proposals get ids `P1`, `P2`, ...
 3. Then loop `wait(thread)`. Later rounds run the peers in turn; each votes or revises.
 4. **Vote with reasons:** `send(thread, kind="vote", on="P2", stance="agree"|"object",
-   reasons="...")`. `body` is optional for a vote. Authoring a proposal counts as agreeing with
-   it. If newer proposals have arrived, `send` says `superseded` and `wait` returns
+   reasons="...")`. `body` is optional for a vote. An agree vote can add `caveats="..."`:
+   concerns that don't block your agreement, or follow-ups; they show under the vote. Authoring
+   a proposal counts as agreeing with it. If newer proposals have arrived, `send` says `superseded` and `wait` returns
    `newer_proposals`: read them and vote on the one you back. To change course, post a revised
    proposal instead.
 5. **Consensus** is every participant agreeing on the same proposal id: the bus posts a `final`
@@ -142,8 +144,12 @@ prev_head_commit_id?, focus?, testing?, thread?, model?, effort?, peer_settings?
 **Severity.** Only `high` and `medium` findings block; `low` never does. Fix the blocking ones;
 low ones are optional (defer them to a follow-up issue if they're real work).
 
+**Finding ids.** Every finding in a verdict gets a stable id such as `codex-1`. On a follow-up,
+the reviewer settles each of its earlier blocking findings by id (fixed, withdrawn or still
+blocking), and the verdict shows how.
+
 **Follow-ups.** After fixing findings:
-1. `send(thread, body=...)` a short note on how each finding was addressed.
+1. `send(thread, body=...)` a short note on how each finding was addressed, by id (`codex-1: ...`).
 2. Call `request_review` again with the same reviewer(s), the new head and
    `prev_head_commit_id` = the thread's current head. This continues the same thread and resumes
    each reviewer's own conversation, so it sees the interdiff (rebase-aware after a rebase) plus
@@ -180,7 +186,7 @@ Errors come back as `{"error": CODE, "message": ...}`. The message usually says 
 | `AUTH_REQUIRED` | the agent's CLI needs signing in again; tell the user (the message gives the command) |
 | `BAD_KIND` | use kind `message`, `proposal`, `vote` or `status`; proposals and votes only in discussions |
 | `BAD_REQUEST` | an argument is wrong (empty question, bad name, bad setting); fix it and retry |
-| `BAD_VOTE` | `stance` must be `agree` or `object`, and `on` an existing proposal id |
+| `BAD_VOTE` | `stance` must be `agree` or `object`, `on` an existing proposal id, and `caveats` only on an agree vote |
 | `CHANGES_REQUESTED` | the reviewer still wants changes on this head: push a fix, or `send` evidence first to push back (once per head) |
 | `DEADLINE_REACHED` | the discussion is past its deadline; stop and tell the user (`agent-bus resume` reopens it) |
 | `DEBRIEF_UNAVAILABLE` | no peer can be debriefed (see the message); nothing more to do |
