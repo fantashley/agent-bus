@@ -310,6 +310,20 @@ def test_snapshot_delta_falls_back_to_the_whole_list(env, monkeypatch):
     h5 = sh(repo, "git", "rev-parse", "HEAD")
     snap5 = snapshot.ensure(str(repo), "t-delta", base, h5, 10**9)
     assert snapshot.delta(str(repo), h4, snap5, True) is None
+    # A symlink added or deleted: the whole list is shown (#134). A deleted one may or may not
+    # have been in the old copy; an added one can change where unchanged ones resolve (codex-2).
+    os.symlink("/etc/hostname", repo / "out")
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "out")
+    h6 = sh(repo, "git", "rev-parse", "HEAD")
+    snap6 = snapshot.ensure(str(repo), "t-delta", base, h6, 10**9)
+    assert "out" not in snap6.files and snapshot.delta(str(repo), h5, snap6, True) is None
+    (repo / "out").unlink()
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "rm out")
+    h7 = sh(repo, "git", "rev-parse", "HEAD")
+    snap7 = snapshot.ensure(str(repo), "t-delta", base, h7, 10**9)
+    assert snapshot.delta(str(repo), h6, snap7, True) is None
     snap.mode = "sparse"
     assert snapshot.delta(str(repo), h1, snap, True) is None
 

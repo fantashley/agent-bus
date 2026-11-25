@@ -36,8 +36,11 @@ and every agent-bus tool refuses you with `PEER_READ_ONLY`.
   (or `waiting_for_human` is true), unless you are waiting for `debrief` replies, which arrive
   on an already finished thread (keep waiting while `progress.job.status` is `queued` or
   `running`). When you stop, read the latest `system` notice, and if it names a blocker
-  (out of usage, a CLI format change, a missing commit, a failed pass), tell the user. If a
-  reply was lost, `wait(thread, after_message_id=<last id you saw>)` replays everything after it.
+  (out of usage, a CLI format change, a missing commit, a failed pass), tell the user.
+- **`wait(thread)` returns only what you haven't read**, also after a `send` or a follow-up
+  `request_review`, and from a new MCP server of the same client (a subagent's), which starts
+  where the client's others read to. Don't pass `after_message_id` routinely: it replays
+  everything after that id, for a reply that was lost. `history` shows the whole thread.
 - **`stale_build`** in a reply means this MCP server is older than the installed `agent-bus`:
   tell the user to reload (Claude Code: `/reload-plugins`; other clients: restart).
 

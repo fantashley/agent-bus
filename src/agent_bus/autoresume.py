@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 from . import config as cfg
-from . import quota
+from . import procinfo, quota
 from .db import SYSTEM, Bus, BusError
 
 # A waiter sweeps at least this often, in case a block was cleared early.
@@ -185,8 +185,9 @@ def spawn_waiter() -> None:
     logs = cfg.state_dir() / "logs"
     logs.mkdir(parents=True, exist_ok=True, mode=0o700)
     with open(logs / "auto-resume.log", "ab") as log:
-        subprocess.Popen([*cfg.self_command(), "auto-resume", "--wait"], stdin=subprocess.DEVNULL, stdout=log,
-                         stderr=subprocess.STDOUT, start_new_session=True, cwd=str(cfg.state_dir()))
+        procinfo.reap_later(subprocess.Popen(
+            [*cfg.self_command(), "auto-resume", "--wait"], stdin=subprocess.DEVNULL, stdout=log,
+            stderr=subprocess.STDOUT, start_new_session=True, cwd=str(cfg.state_dir())))
 
 
 def wait(bus: Bus, until: float | None = None) -> int:

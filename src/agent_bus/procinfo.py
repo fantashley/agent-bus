@@ -17,9 +17,17 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import threading
 from typing import Callable
 
 CODEX_SHARED_DAEMON = "codex_shared_daemon"
+
+
+def reap_later(child: subprocess.Popen) -> None:
+    """Wait for a detached ``child`` on a daemon thread, so a long-running parent (an
+    ``agent-bus mcp`` server) doesn't keep it as a zombie once it exits (#126).  A short-lived
+    parent just exits, leaving the child to init."""
+    threading.Thread(target=child.wait, name=f"reap-{child.pid}", daemon=True).start()
 
 
 def proc(pid: int) -> tuple[int, str] | None:

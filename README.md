@@ -101,7 +101,10 @@ on timeout only the last one to leave takes any quiet notices still unread. Ever
 carries `cursor`, the last message id read. If a reply was lost, e.g. on a dropped connection,
 `wait(thread, after_message_id=<the last id you saw>)` replays everything after it. When a
 client restarts its agent-bus server (after "Connection closed"), the new server continues the
-old session, so read positions and presence on threads it started carry over.
+old session, so read positions and presence on threads it started carry over. A client running
+several servers (Claude Code starts one for a subagent) gets a session per server; a new one
+starts each thread where the client's other sessions read to, so its first `wait` doesn't
+replay what the client has already read.
 
 ## Reviews
 
@@ -1108,6 +1111,7 @@ release-please can occasionally carry a stale copy of a file
 
 ```sh
 nix develop -c pytest      # tests use fake peer CLIs that speak each client's stream format
+nix develop -c pytest -n auto   # the same in parallel (pytest-xdist, in the dev shell)
 nix build                  # package (runs the tests)
 ```
 
