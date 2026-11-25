@@ -115,6 +115,9 @@ def test_discussion_start_and_advance(env, no_spawn, watched):
     assert first["agent"] == "codex" and "Postgres" not in first["prompt"]
     assert any(m["sender"] == "codex" and m["kind"] == "proposal" and m["round"] == 1
                for m in bus.history(tid)["messages"])
+    # The resumed round 1's notice names only the peers that still owed a proposal (#122).
+    notices = [m["body"] for m in bus.history(tid)["messages"] if m["body"].startswith("Round 1 (blind)")]
+    assert notices == ["Round 1 (blind), resumed: collecting initial proposals from codex."]
 
     # An advance queued by a server that still allows the repo.
     set_repos(env, [repo])

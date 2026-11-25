@@ -521,6 +521,8 @@ class Worker:
                 fresh = True
             else:
                 self.drop_usage(row)
+        # Which prompt the reply answered: a fresh session's (no resume, or the fallback ran).
+        self.turn_fresh = fresh or not resume_id
         self.event("turn_end", ("ok" if res.ok else f"failed: {res.error}") + tokens(res), agent)
         self.check()  # a worker that lost its lease records nothing
         if fresh and res.launched:
@@ -858,14 +860,17 @@ class Worker:
     def round_one(self, t: dict, owed_only: bool = False) -> None:
         """``owed_only``: only the peers with no round-1 proposal yet (a resumed round 1)."""
         peers = self.peers(t)
+        owed = t["participants"]
         if owed_only:
             proposed = {m["sender"] for m in self.bus.history(self.thread_id)["messages"]
                         if m["kind"] == "proposal" and m["round"] == 1}
             peers = [p for p in peers if p not in proposed]
             if not peers:
                 return
-        self.system(f"Round 1 (blind): collecting initial proposals from {', '.join(t['participants'])}.",
-                    quiet=True)
+            # The notice names only who still owes one (#122): the initiator too, if it does.
+            owed = [p for p in t["participants"] if p not in proposed]
+        self.system(f"Round 1 (blind){', resumed' if owed_only else ''}: collecting initial proposals from "
+                    f"{', '.join(owed)}.", quiet=True)
         first = self.preamble_and_question(t)
 
         def go(agent: str) -> None:
@@ -1229,6 +1234,16 @@ class Worker:
             self.report_missing(t, e, followup or bool(refs.get("revision")) or len(refs.get("heads") or []) > 1)
             raise
         snap = self.pin_snapshot(t, refs)
+        # Names in backticks in the findings and notes since this reviewer's last pass (and the
+        # request's own notes) are searched too, for a reviewer that can't search (#122).
+        # The newest first: this request's focus, then the notes since its last pass; the
+        # first request's note only on a first pass (later ones would crowd out the new names).
+        texts = [refs.get("focus") or ""] + [m["body"] for m in reversed(notes(everything))
+                                             if mine is None or m["id"] > mine["id"]]
+        if mine is None:
+            texts.append(refs.get("opening_focus") or "")
+        # Uncapped here: usages.terms drops the diff's own names first, then caps (antigravity-1).
+        mention = usages.mentioned(texts, limit=None)
         # The self-contained prompt (first pass, retry, or a follow-up whose session can't be
         # resumed) always has the full base..head diff, the reviewer's earlier verdicts and
         # every note on the thread, so a fresh session never reviews a partial view.
@@ -1255,24 +1270,27 @@ class Worker:
             why_full = "your earlier session can't be resumed, so this pass starts a fresh one"
         fresh = self.review_prompt(t, refs, full_diff, f"{full_heading.rstrip(':')}, because {why_full}:",
                                    notes(everything), earlier, framing=framing, pushback=pushback, snap=snap,
-                                   earlier_note=earlier_note)
+                                   earlier_note=earlier_note, prior=prior, mention=mention)
         replies = "\n\n".join(prompts.render_message(m) for m in notes([m for m in everything
                                                                        if m["id"] > since])) or "(no replies)"
         if resume and pushback:
             prompt = prompts.REVIEW_PUSHBACK.format(head=refs["head_commit_id"], replies=replies,
-                                                    reading=self.reading_note(refs, snap, listing=False),
+                                                    reading=self.reading_note(refs, snap, listing=False,
+                                                                              mention=mention),
                                                     severity=prompts.SEVERITY, budget=budget_note(t),
                                                     time_limit=self.time_limit_note(), earlier=earlier_note,
                                                     testing=("\n" + self.testing_note(t, refs) + "\n"
                                                              if self.testing_note(t, refs) else ""),
-                                                    verdict_format=prompts.VERDICT_FORMAT)
+                                                    verdict_format=verdict_format(prior))
         elif resume:
             prompt = prompts.REVIEW_FOLLOWUP.format(
                 head=refs["head_commit_id"], prev=refs["prev_head_commit_id"], replies=replies,
-                rebase=rebase_note, reading=self.reading_note(refs, snap, diff=inter), converge=framing,
+                rebase=rebase_note, reading=self.reading_note(refs, snap, diff=inter, since=refs["prev_head_commit_id"],
+                                                              mention=mention),
+                converge=framing,
                 severity=prompts.SEVERITY, budget=budget_note(t),
                 time_limit=self.time_limit_note(), overview=self.review_overview(t, refs, inter, "interdiff"),
-                diff_heading=inter_heading, diff=inter, verdict_format=prompts.VERDICT_FORMAT)
+                diff_heading=inter_heading, diff=inter, verdict_format=verdict_format(prior))
         else:
             prompt = fresh
         # The author's follow-up request is one, even for a reviewer seeing the change for the
@@ -1281,6 +1299,7 @@ class Worker:
         self.system(f"Review {what}{'(retry) ' if mode == 'retry' else ''}"
                     f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.{fallback}", quiet=True)
         read_dirs = [snap.path] if snap.path else []
+        self.turn_fresh = None
         res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh, read_dirs=read_dirs)
         if res.quota or res.format_changed or res.config_error:
             # Head, reviewer and session stay pinned for `agent-bus resume` after the reset
@@ -1292,6 +1311,7 @@ class Worker:
             return None
         if res.ok or res.text:
             self.mark_delivered(reviewer, upto)
+            self.record_listing(refs, snap, resume and pushback)
         raw = extract_reply(res.text, "summary") if res.text else None
         verdict = settle_earlier(normalize_verdict(raw), prior)
         gave = res  # the turn the verdict came from
@@ -1414,7 +1434,8 @@ class Worker:
 
     def review_prompt(self, t: dict, refs: dict, diff: str, heading: str, replies: list[dict],
                       earlier: list[dict] | None = None, framing: str = "", pushback: bool = False,
-                      snap: snapshot.Snapshot | None = None, earlier_note: str = "") -> str:
+                      snap: snapshot.Snapshot | None = None, earlier_note: str = "",
+                      prior: dict[str, dict] | None = None, mention: list[str] | None = None) -> str:
         focus = refs.get("focus")
         # A reviewer with an earlier verdict converges on it rather than starting over (#71).
         converge = ""
@@ -1437,10 +1458,11 @@ class Worker:
                   + ("." if earlier else " and look for problems not already raised.")
                   if refs.get("reviewers") else ""),
             focus=self.review_notes(t, refs, notes, focus),
-            overview=self.review_overview(t, refs, diff, "change"), reading=self.reading_note(refs, snap, diff=diff),
+            overview=self.review_overview(t, refs, diff, "change"),
+            reading=self.reading_note(refs, snap, diff=diff, mention=mention),
             time_limit=self.time_limit_note(),
             severity=prompts.SEVERITY, converge=converge,
-            diff_heading=heading, diff=diff, verdict_format=prompts.VERDICT_FORMAT)
+            diff_heading=heading, diff=diff, verdict_format=verdict_format(prior or {}))
 
     def time_limit_note(self) -> str:
         """The reviewer's time limit, as turn() will set it (#93)."""
@@ -1467,26 +1489,29 @@ class Worker:
         return snap
 
     def reading_note(self, refs: dict, snap: snapshot.Snapshot | None = None, listing: bool = True,
-                     diff: str | None = None) -> str:
+                     diff: str | None = None, since: str | None = None, mention: list[str] | None = None) -> str:
         """How the reviewer can read the pinned head: the snapshot's path (#111), with its
         file list for a reviewer that can't list directories or search, and where the names
         ``diff`` defines or edits are used at the head (#117); copyable read-only git
         commands for a reviewer with a shell, in a repository git can read, and jj ones that
         work in a read-only sandbox in a jj repository (#93, #76), with a hint to read a few
         files or a line range at a time; with neither, a note that files on disk may not
-        match the head."""
-        out = self._reading_note(refs, snap, listing)
+        match the head.  ``since``: the head a resumed session's earlier prompt listed the
+        copy of; only the files added or removed since are listed then (#126)."""
+        out = self._reading_note(refs, snap, listing, since)
         try:
             ad = ADAPTERS[self.config.harness_of(refs["reviewer"])]
         except (KeyError, ValueError):
             ad = None
         if ad is not None and ad.shell:
             out += prompts.READ_TIP_SHELL
-        if ad is not None and not ad.lists_files and diff and listing:
-            out += self.usages_note(refs, diff, snap)
+        # A pushback (no listing, no new diff) still searches the names its replies give (codex-5).
+        if ad is not None and not ad.lists_files and ((diff and listing) or mention):
+            out += self.usages_note(refs, diff if listing and diff else "", snap, mention)
         return out
 
-    def usages_note(self, refs: dict, diff: str, snap: snapshot.Snapshot | None = None) -> str:
+    def usages_note(self, refs: dict, diff: str, snap: snapshot.Snapshot | None = None,
+                    mention: list[str] | None = None) -> str:
         """The usages section for a reviewer with no search tool (#117); best effort, and
         searched once per head and diff (a follow-up's prompt and its fresh fallback share it)."""
         # The files the reviewer can read at the head: a full snapshot's are all of them; a
@@ -1494,11 +1519,11 @@ class Worker:
         readable = (None if snap is not None and snap.path and snap.mode == "full"
                     else frozenset(snap.files) if snap is not None and snap.path else frozenset())
         key = (refs["repo"], refs["head_commit_id"], hashlib.sha256(diff.encode("utf-8", "surrogateescape")).hexdigest(),
-               readable)
+               readable, tuple(mention or ()))
         cache = self.__dict__.setdefault("_usages", {})
         if key not in cache:
             try:
-                cache[key] = usages.note(refs["repo"], refs["head_commit_id"], diff, readable)
+                cache[key] = usages.note(refs["repo"], refs["head_commit_id"], diff, readable, mention)
             except Exception as e:  # noqa: BLE001 (never what fails a review)
                 cache[key] = ("", False, False)
                 self.event("usages", f"no usage search: {e!r}")
@@ -1513,7 +1538,28 @@ class Worker:
                                      capped=prompts.USAGES_CUT if cut else "",
                                      outside=prompts.USAGES_OUTSIDE if outside else "")
 
-    def _reading_note(self, refs: dict, snap: snapshot.Snapshot | None, listing: bool) -> str:
+    def record_listing(self, refs: dict, snap: snapshot.Snapshot, pushback: bool) -> None:
+        """After a delivered pass by a reviewer that can't list files: which head's whole file
+        list its session now has (see listed_baseline).  A fresh session got the full list
+        (or a cut or sparse one: "none"); a resumed follow-up got the list or a delta against
+        its baseline, which is as good; a resumed pushback got no list, so its record stands."""
+        try:
+            ad = ADAPTERS[self.config.harness_of(refs["reviewer"])]
+        except (KeyError, ValueError):
+            return
+        if ad.lists_files or (pushback and not getattr(self, "turn_fresh", None)):
+            return
+        whole = snapshot.complete(snap)
+        self.event("listing", refs["head_commit_id"] if whole else "none", refs["reviewer"])
+
+    def listed_baseline(self, reviewer: str) -> str | None:
+        """The head whose whole file list (a full copy's, listed in full, or kept whole by a
+        delta) this reviewer's current session was given, or None (#126, codex-2)."""
+        rows = [e for e in self.bus.events(self.thread_id, agent=reviewer) if e["kind"] == "listing"]
+        return rows[-1]["text"] if rows and rows[-1]["text"] != "none" else None
+
+    def _reading_note(self, refs: dict, snap: snapshot.Snapshot | None, listing: bool,
+                      since: str | None = None) -> str:
         try:
             ad = ADAPTERS[self.config.harness_of(refs["reviewer"])]
         except (KeyError, ValueError):
@@ -1536,7 +1582,20 @@ class Worker:
         if snap.mode == "sparse":
             out += prompts.SNAPSHOT_SPARSE.format(n=len(snap.files), total=snap.tree_files)
         if listing and not lists:
-            out += prompts.SNAPSHOT_LIST.format(n=len(snap.files), files=snapshot.listing(snap))
+            # Only against a baseline this reviewer's session was given whole: its latest
+            # "listing" record (written after each delivered pass) names that head (codex-2).
+            delta = (snapshot.delta(refs["repo"], since, snap, self.listed_baseline(refs["reviewer"]) == since)
+                     if since else None)
+            if delta is None:
+                out += prompts.SNAPSHOT_LIST.format(n=len(snap.files), files=snapshot.listing(snap))
+            else:
+                added, removed = delta
+                changes = "".join(f"\n{what} since head {since[:12]}:\n" + "\n".join(paths)
+                                  for what, paths in (("Added", added), ("Removed", removed)) if paths)
+                count = f"{len(snap.files)} file{'s' if len(snap.files) != 1 else ''}"
+                out += prompts.SNAPSHOT_DELTA.format(
+                    changes=f", with these changes ({count} now):{changes}" if changes
+                    else f", with no files added or removed ({count}).")
         if shell and commands:
             out += prompts.SNAPSHOT_HISTORY.format(commands=commands.format(**ids))
         return out
@@ -2014,6 +2073,25 @@ def earlier_findings_note(reviewer: str, mine: dict | None, prior: dict[str, dic
         rows.append(f"- {fid} [{f.get('severity')}] {loc}: {comment[:300]}{'…' if len(comment) > 300 else ''}")
     return prompts.EARLIER_FINDINGS.format(head=mine["data"].get("head_commit_id"), example=next(iter(prior)),
                                            findings=prompts.wrap_peer(reviewer, "\n".join(rows)))
+
+
+def verdict_format(prior: dict[str, dict]) -> str:
+    """How the verdict ends (#93), with complete follow-up examples when it has earlier
+    blocking findings to settle (#126): "earlier" entries and a finding reused by "id"."""
+    if not prior:
+        return prompts.VERDICT_FORMAT
+    ids = list(prior)
+    first = ids[0]
+    still = {"verdict": "request_changes", "summary": "One paragraph.",
+             "earlier": [{"id": first, "status": "still_blocking", "note": "Why it still blocks."}]
+             + [{"id": i, "status": "fixed", "note": "How it was fixed."} for i in ids[1:]],
+             "findings": [{"id": first, "file": "src/app.py", "line": 12, "severity": "high",
+                           "comment": "What is still wrong."},
+                          {"file": "src/app.py", "line": 30, "severity": "low", "comment": "A new, non-blocking note."}]}
+    done = {"verdict": "approve", "summary": "One paragraph.",
+            "earlier": [{"id": i, "status": "fixed", "note": "How it was fixed."} for i in ids], "findings": []}
+    return prompts.VERDICT_FORMAT + prompts.VERDICT_FOLLOWUP.format(
+        ids=", ".join(ids), example=first, still=json.dumps(still), done=json.dumps(done))
 
 
 def settle_earlier(v: dict | None, prior: dict[str, dict]) -> dict | None:

@@ -76,9 +76,107 @@ def test_render_caps_hits_per_name_and_in_all():
     text = usages.render(u, per_symbol=3)
     assert text.count("alpha x") == 3 and "[... 9 more in f3.py, f4.py" in text and "and 3 more]" in text
     assert "beta: no uses at head" in text and " [...]" in text
-    alpha = text.split("\nbeta")[0][len(usages.OPEN) + 1:]
-    short = usages.render(u, limit=len(alpha) + 2, per_symbol=3)
-    assert "[... 2 more names not shown: beta, gamma]" in short and "gamma (" not in short
+    # Fewest hits first (#122): beta (0), gamma (1), then alpha (12).
+    assert text.index("beta:") < text.index("gamma (") < text.index("alpha (")
+    # Out of room, a changed definition shrinks to one line rather than going.
+    short = usages.render(u, limit=200, per_symbol=3)
+    assert "alpha (12 hits in 12 files): not listed, for space; most in f0.py (1)" in short
+    assert "alpha x" not in short and "beta: no uses at head" in short and "gamma (1 hit" in short
+
+
+def test_generic_names_cannot_crowd_out_the_specific_ones():
+    """#122: `thread` with 1567 hits or `turn` with 554 used the whole budget, and the
+    changed definitions were cut."""
+    T = usages.Term
+    hits = {"thread": [(f"src/m{i % 30}.py", i, "thread = x " + "y" * 100) for i in range(1567)],
+            "ensure": [(f"src/e{i}.py", i, "ensure()") for i in range(57)],
+            "drop_usage": [("src/worker.py", 585, "def drop_usage(self, row):")],
+            "pin_snapshot": [("src/worker.py", 1451, "def pin_snapshot(self, t, refs):"),
+                             ("src/worker.py", 1229, "snap = self.pin_snapshot(t, refs)")],
+            "needs_you": [("src/cli.py", 10, "def needs_you():")]}
+    u = usages.Usages(names=list(hits), hits=hits, terms={
+        "thread": T("thread", "enclosing"), "ensure": T("ensure", "enclosing"),
+        "drop_usage": T("drop_usage"), "pin_snapshot": T("pin_snapshot"), "needs_you": T("needs_you", "mentioned")})
+    text = usages.render(u)
+    assert len(text) < usages.MAX_CHARS + 200
+    assert "  src/worker.py:585: def drop_usage(self, row):" in text
+    assert "  src/worker.py:1229: snap = self.pin_snapshot(t, refs)" in text
+    assert "needs_you (named in the thread's findings or notes; 1 hit in 1 file):" in text
+    # The generic name is one line, with its busiest files, and comes last.
+    line = next(l for l in text.splitlines() if l.startswith("thread ("))
+    assert line.startswith("thread (1567 hits in 30 files): too common to list; most in src/m0.py (53)")
+    assert "thread = x" not in text and text.splitlines()[-2] == line
+    assert [l.split(" ")[0] for l in text.splitlines()[1:-1] if not l.startswith(" ")] == \
+        ["drop_usage", "needs_you", "pin_snapshot", "ensure", "thread"]
+    # Tight on room: the mentioned and enclosing names go first; the definitions stay.
+    tight = usages.render(u, limit=400)
+    assert "drop_usage (" in tight and "pin_snapshot (" in tight
+    assert "not shown: " in tight and "thread" in tight.split("not shown: ")[1]
+
+
+def test_overflow_files_are_marked_when_not_in_the_copy():
+    hits = [("src/a.py", i, "alpha") for i in range(9)] + [("docs/b.md", 1, "alpha"), ("src/c.py", 2, "alpha")]
+    text = usages.render(usages.Usages(names=["alpha"], hits={"alpha": hits}), readable={"src/a.py", "src/c.py"})
+    assert "[... 3 more in src/a.py, docs/b.md (not in the copy), src/c.py]" in text
+
+
+def test_terms_include_fields_method_overrides_and_mentions():
+    diff = ("diff --git a/peers.py b/peers.py\n--- a/peers.py\n+++ b/peers.py\n"
+            "@@ -10,4 +10,5 @@ class TurnResult:\n     ok: bool = False\n-    launched: bool\n"
+            "+    launched: bool = True\n+    attempts: int = 0\n"
+            "@@ -40,3 +40,3 @@ class Adapter:\n     def run(self, prompt):\n-        x = 1\n+        x = 2\n"
+            "         local_var: int = 3\n"
+            # jj's hunk header names the method unindented: still a method (it takes self).
+            "@@ -50,2 +50,2 @@ def invocation(self, prompt, resume_id):\n-        a = 1\n+        a = 2\n"
+            "@@ -55,2 +55,2 @@ def plain_func(x):\n-    b = 1\n+    b = 2\n"
+            "@@ -60,2 +60,2 @@ class Deep:\n-        total: int = 0\n+        total: int = 1\n"
+            "@@ -80,3 +80,3 @@ class Other:\n     def helper(self):\n-        counter: int = 1\n+        counter: int = 2\n")
+    found = usages.terms(diff, usages.mentioned(
+        ["`needs_you` in `cli.py`, `TurnResult.launched`, `Adapter.run()` and `review_standings`"]))
+    by = {t.pattern: t for t in found}
+    assert by["launched"] == usages.Term("launched", "field", "TurnResult") and by["attempts"].kind == "field"
+    assert "counter" not in by and "local_var" not in by and "total" not in by  # a method's locals are not fields
+    assert by["def run"].kind == "override" and by["def helper"].kind == "override"
+    assert by["def invocation"].kind == "override" and "def plain_func" not in by
+    assert by["needs_you"].kind == "mentioned" and by["review_standings"].kind == "mentioned"
+    assert by["Adapter"].kind == "mentioned"  # `Adapter.run`: run is too short, its class is searched
+    assert "cli" not in by and "launched" not in [t.pattern for t in found if t.kind == "mentioned"]
+    assert usages.mentioned(["`a.b`, `x`, `self`, `Foo.bar_baz` `Foo.bar_baz`"]) == ["bar_baz"]
+    # symbols() keeps its contract: names only, no override patterns (antigravity-3).
+    assert not any(n.startswith("def ") for n in usages.symbols(diff))
+
+
+def test_rust_methods_search_their_own_keyword():
+    """antigravity-2: a changed Rust method's other definitions are `fn name`, not `def name`."""
+    diff = ("diff --git a/s.rs b/s.rs\n--- a/s.rs\n+++ b/s.rs\n"
+            "@@ -5,2 +5,2 @@ fn handle(&mut self, req: Req) -> Resp {\n-        1\n+        2\n"
+            "@@ -20,2 +20,2 @@ impl Server {\n-    pub fn serve_one(&self) {}\n+    pub fn serve_one(&self) { x }\n")
+    by = {t.pattern: t for t in usages.terms(diff)}
+    assert by["fn handle"].kind == "override" and by["fn serve_one"].kind == "override"
+    assert not any(p.startswith("def ") for p in by)
+    u = usages.Usages(names=["fn handle"], hits={"fn handle": []}, terms={"fn handle": by["fn handle"]})
+    assert "other definitions of the changed method handle:" in usages.render(u)
+
+
+def test_mentions_are_capped_after_the_diffs_own_names():
+    """antigravity-1: names the diff already searches don't use up the mention budget."""
+    diff = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n" + "".join(
+        f"+def changed_{i}(): pass\n" for i in range(10))
+    mention = usages.mentioned([" ".join(f"`changed_{i}`" for i in range(10)) + " `fresh_name`"], limit=None)
+    found = usages.terms(diff, mention)
+    assert [t.pattern for t in found if t.kind == "mentioned"] == ["fresh_name"]
+
+
+def test_search_finds_method_overrides(env):
+    repo = env["repo"]
+    git_repo(repo)
+    (repo / "m.py").write_text("class Base:\n    def run(self):\n        pass\n\n\nclass Sub(Base):\n"
+                               "    def run(self):\n        return 1\n\n\nx.run()\n")
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "m")
+    head = sh(repo, "git", "rev-parse", "HEAD")
+    u = usages.search(str(repo), head, ["def run"])
+    assert [ln for _, ln, _ in u.hits["def run"]] == [2, 7]
 
 
 def test_render_fences_marks_unreadable_files_and_cut_output():
@@ -114,6 +212,40 @@ def test_search_output_cut_short_is_flagged(env, monkeypatch):
     monkeypatch.setattr(usages, "MAX_OUTPUT", 60)
     u = usages.search(str(repo), head, ["frobnicate", "legacy_frob"])
     assert u.truncated and sum(map(len, u.hits.values())) < 6
+
+
+def test_a_common_name_cannot_use_up_the_search_budget(env, monkeypatch):
+    """codex-4 (#122 review): a name that fills git grep's output cap is left at what was
+    read, and the specific names are searched again without it."""
+    repo = env["repo"]
+    git_repo(repo)
+    (repo / "a_busy.py").write_text("".join(f"thread_x = thread  # {i}\n" for i in range(300)))
+    (repo / "z_rare.py").write_text("def drop_usage(row):\n    pass\n")
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "m")
+    head = sh(repo, "git", "rev-parse", "HEAD")
+    monkeypatch.setattr(usages, "MAX_OUTPUT", 8_000)
+    u = usages.search(str(repo), head, ["thread", "drop_usage"])
+    assert u.truncated and u.cut == {"thread"} and 100 < len(u.hits["thread"]) < 300
+    assert u.hits["drop_usage"] == [("z_rare.py", 1, "def drop_usage(row):")]
+    text = usages.render(u)
+    assert "drop_usage (1 hit in 1 file):" in text and "thread (at least " in text
+    # Two common names, each filling the cap in turn (antigravity-4).
+    (repo / "b_busy.py").write_text("".join(f"ensure_x = ensure  # {i}\n" for i in range(300)))
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "m2")
+    head = sh(repo, "git", "rev-parse", "HEAD")
+    u = usages.search(str(repo), head, ["thread", "ensure", "drop_usage"])
+    assert u.cut == {"thread", "ensure"} and u.hits["drop_usage"] == [("z_rare.py", 1, "def drop_usage(row):")]
+    # One line longer than the cap: nothing parsed, so no culprit is known (codex-4); each
+    # name is searched on its own, and the specific one listed first still has its hit.
+    (repo / "a_aaa_huge.txt").write_text("thread " + "x" * 9_000 + "\n")
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "m3")
+    head = sh(repo, "git", "rev-parse", "HEAD")
+    u = usages.search(str(repo), head, ["drop_usage", "thread"])
+    assert u.hits["drop_usage"] == [("z_rare.py", 1, "def drop_usage(row):")] and "drop_usage" not in u.cut
+    assert "thread" in u.cut
 
 
 def test_sparse_snapshot_marks_hits_outside_it(env, no_spawn, monkeypatch):
@@ -169,12 +301,53 @@ def test_agy_followup_searches_the_interdiff(env, no_spawn, monkeypatch):
                                         "    return frobnicate(3)\n")
     sh(repo, "git", "commit", "-qam", "fix")
     h2 = sh(repo, "git", "rev-parse", "HEAD")
+    # A name only the author's note gives (#122): searched too, marked as from the thread.
+    claude.send("Fixed. `legacy_frob` in `old.py` is still imported; see `pkg.core`.", thread=tid)
     claude.request_review("antigravity", str(repo), base, h2, prev_head_commit_id=h1)
     monkeypatch.setenv("FAKE_APPROVE", "antigravity")
     run_job(bus, tid)
     agy2 = calls(env)[-1]
     assert "--conversation" in agy2["argv"] and "Interdiff" in agy2["prompt"]
     assert f"agent-bus searched head {h2}" in agy2["prompt"] and "shiny_helper (1 hit in 1 file)" in agy2["prompt"]
+    assert ("legacy_frob (named in the thread's findings or notes; 1 hit in 1 file):\n"
+            "  old.py:1: from pkg.core import legacy_frob") in agy2["prompt"]
+    assert "old (" not in agy2["prompt"]  # `old.py` is a file name, not a symbol
+
+
+def test_agy_follow_up_mentions_skip_the_first_requests_note(env, no_spawn):
+    """antigravity-1: on a follow-up, the opening note's names don't crowd out the new ones."""
+    bus, repo = env["bus"], env["repo"]
+    base, h1 = code_change(repo)
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    opening = " ".join(f"`opening_name_{i}`" for i in range(10))
+    tid = claude.request_review(None, str(repo), base, h1, reviewers=["antigravity", "codex"],
+                                focus=opening)["thread"]["id"]
+    run_job(bus, tid)  # antigravity asks for changes
+    first = calls(env)[-1]["prompt"]
+    assert "opening_name_0 (named in the thread" in first
+    claude.send("Not a bug: `legacy_frob` is still used by `old.py` on purpose.", thread=tid)
+    claude.request_review(None, str(repo), base, h1, prev_head_commit_id=h1, reviewers=["antigravity", "codex"])
+    run_job(bus, tid)
+    p = next(c["prompt"] for c in reversed(calls(env)) if c["agent"] == "antigravity")
+    assert "legacy_frob (named in the thread" in p and "opening_name_0 (" not in p
+
+
+def test_agy_pushback_searches_the_names_its_replies_give(env, no_spawn):
+    """codex-5 (#122 review): a same-head pushback has no new diff, but the names in the
+    author's evidence are still searched for a reviewer that can't search."""
+    bus, repo = env["bus"], env["repo"]
+    base, h1 = code_change(repo)
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("antigravity", str(repo), base, h1)["thread"]["id"]
+    run_job(bus, tid)  # asks for changes
+    claude.send("Not a bug: `legacy_frob` is still used by `old.py` on purpose.", thread=tid)
+    claude.request_review("antigravity", str(repo), base, h1, prev_head_commit_id=h1)
+    run_job(bus, tid)
+    p = calls(env)[-1]["prompt"]
+    assert "has not changed the code" in p and f"agent-bus searched head {h1}" in p
+    assert ("legacy_frob (named in the thread's findings or notes; 1 hit in 1 file):\n"
+            "  old.py:1: from pkg.core import legacy_frob") in p
+    assert "frobnicate (" not in p  # no diff names: the code is unchanged
 
 
 def call(server, tool, args):

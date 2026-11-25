@@ -368,6 +368,60 @@ def sweep(bus, only: str | None = None) -> None:
                 remove(p)
 
 
+# The most files a resumed follow-up lists as added to or removed from the copy (#126).
+MAX_DELTA = 200
+
+
+def delta(repo: str, old_head: str, snap: Snapshot, baseline: bool) -> tuple[list[str], list[str]] | None:
+    """The files a full snapshot of ``snap.head`` has that one of ``old_head`` didn't, and the
+    ones it lost (#126), for a resumed follow-up whose session was given the old head's whole
+    list (``baseline``: see complete()); or None when that can't be told exactly enough, so
+    the whole list is shown: no baseline, a sparse copy now, the old list too long to have
+    been listed whole, a symlink or type change, a git error, or over MAX_DELTA files."""
+    if not baseline or snap.mode != "full" or not snap.path or not _ID.fullmatch(old_head):
+        return None
+    env = _git_env(repo)
+    out = _git(repo, env, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", "--no-ext-diff",
+               f"{old_head}^{{commit}}", f"{snap.head}^{{commit}}", "--") if env is not None else None
+    if out is None:
+        return None
+    have = set(snap.files)
+    recs = out.split(b"\0")
+    added, removed = [], []
+    # Records: ":oldmode newmode oldsha newsha status", then the path.
+    for meta, path in zip(recs[0::2], recs[1::2]):
+        fields = meta.split()
+        if len(fields) != 5:
+            return None
+        old_mode, new_mode, status = fields[0].lstrip(b":"), fields[1], fields[4]
+        name = os.fsdecode(path)
+        if b"120000" in (old_mode, new_mode) and status != b"A" and status != b"D":
+            return None  # a symlink changed: whether it is in the copy can change too (codex-7)
+        if status == b"A" and name in have:
+            added.append(name)
+        elif status == b"D" and _safe(name):
+            removed.append(name)
+        elif status not in (b"A", b"D", b"M"):
+            return None  # a type change, or anything else: can't tell (antigravity-5)
+    if len(added) + len(removed) > MAX_DELTA:
+        return None
+    # The earlier prompt listed the old copy whole only if its list fit (see listing).
+    esc = lambda p: p.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")  # noqa: E731
+    old = (have - set(added)) | set(removed)
+    if len("\n".join(map(esc, old))) > MAX_LISTING:  # measured as listing() shows them
+        return None
+    return sorted(map(esc, added)), sorted(map(esc, removed))
+
+
+def complete(snap: Snapshot) -> bool:
+    """Whether a prompt listing ``snap`` lists every file of the head's tree: a full copy
+    whose list fits MAX_LISTING (listing() shows it whole).  A baseline for delta()."""
+    if not snap.path or snap.mode != "full":
+        return False
+    esc = (p.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace") for p in snap.files)
+    return len("\n".join(esc)) <= MAX_LISTING
+
+
 # How much of a snapshot's file list a prompt shows a peer that can't list directories.
 MAX_LISTING = 12_000
 

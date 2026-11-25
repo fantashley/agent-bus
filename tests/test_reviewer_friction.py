@@ -11,7 +11,8 @@ from agent_bus import cli, prompts
 from agent_bus.db import HUMAN, BusError
 from agent_bus.peers import extract_reply, fenced_body
 from agent_bus.service import Service
-from agent_bus.worker import Worker, diff_overview, normalize_verdict, settle_earlier
+from agent_bus.worker import (Worker, diff_overview, normalize_verdict, settle_earlier, settlement_problem,
+                               verdict_problem)
 from test_review_rounds import BOTH, calls, git_repo, run_job
 
 
@@ -96,6 +97,17 @@ def test_findings_get_stable_ids_and_follow_ups_settle_them(env, no_spawn, monke
     p = calls(env)[-1]["prompt"]
     assert "- codex-1 [high] a.txt:1: typo" in p and "- codex-2 [medium] b.txt:1: typo" in p
     assert '"earlier": [{"id": "codex-1", "status": "fixed"' in p
+    # A complete follow-up verdict example (#126): valid JSON, with "earlier" and a finding
+    # listed again by its "id", using this reviewer's own ids, and one that approves.
+    examples = [json.loads(line) for line in p.splitlines() if line.startswith('{"verdict"')]
+    still = next(e for e in examples if e.get("earlier") and e["verdict"] == "request_changes")
+    assert [e["id"] for e in still["earlier"]] == ["codex-1", "codex-2"]
+    assert still["findings"][0]["id"] == "codex-1" and "id" not in still["findings"][1]
+    done = next(e for e in examples if e.get("earlier") and e["verdict"] == "approve")
+    prior = {"codex-1": {"severity": "high"}, "codex-2": {"severity": "medium"}}
+    for e in (still, done):
+        v = settle_earlier(normalize_verdict(e), prior)
+        assert verdict_problem(v) is None and settlement_problem(v, prior) is None
     v2 = bus.last_verdict(tid, "codex")
     assert [(f["id"], f["file"]) for f in v2["data"]["findings"]] == [("codex-3", "c.txt"), ("codex-2", "b.txt")]
     assert [e["id"] for e in v2["data"]["earlier"]] == ["codex-1", "codex-2"]  # not other-9

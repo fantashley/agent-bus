@@ -372,7 +372,13 @@ codex 0.171.0 and 0.172.0, and agy 1.5.13:
   a git worktree in the reviewed repo. An `--agent` (or `-agent`: agy takes single-dash flags too) in `peers.antigravity.args`
   is dropped, and so is `-settings`. agy's `list_dir`, `grep_search` and `find_by_name` aren't
   offered: agy 1.5.13 never declares them to the model, and searching through the shell would
-  mean replacing the blanket command deny with an allowlist of git and rg flags. Turns also
+  mean replacing the blanket command deny with an allowlist of git and rg flags. Instead,
+  agent-bus searches the pinned head for it before a review turn: where the names the diff
+  defines or edits are used (with changed class fields, the other definitions of changed
+  methods, and names in backticks in the thread's findings and notes since its last pass),
+  fewest hits first, with a very common name collapsed to one line. A prompt too long for one
+  argument goes in as far as fits and continues in numbered part files, each small enough for
+  one `read_file` call (agy reads at most 46,080 bytes per call). Turns also
   pass `--disable-slash-commands`, so nothing in the prompt expands as a slash command or skill,
   and plan mode leaves out its `/plan` meta-prompt (plan and walkthrough artifacts and asking
   for approval). agy loads a workspace's own `hooks.json`, `mcp_config.json` and `plugins/`
@@ -620,7 +626,7 @@ peer whose isolation can't be shown for the installed version.
 
 ```sh
 agent-bus threads                 # list open threads
-agent-bus tail t-1a2b3c [--peer codex|--events]
+agent-bus tail t-1a2b3c [--peer codex|--events|--events-only]
 agent-bus reply t-1a2b3c "Prefer the simpler option" [--to codex]
 agent-bus cancel t-1a2b3c
 agent-bus resume t-1a2b3c --rounds 2
@@ -666,16 +672,32 @@ not a security boundary (agreed on agent-bus thread t-fc8b3b). See the trust bou
 2. **Provenance** ([#108](https://github.com/fantashley/agent-bus/issues/108)). Each of those
    commands records where it was run from, in the same transaction as what it did: the
    process's parent chain (pid, executable name and the first few arguments of up to 16
-   ancestors, redacted before it is stored: a long flag keeps its name but not its value, a
-   short flag is kept only alone (its value too becomes `*`), a path (starting `/`, `./`, `../` or `~/`) keeps only its
-   last component, a few known subcommands such as `exec` or `app-server` are kept, and every
-   other argument becomes `*`),
+   ancestors, redacted before it is stored; see [what the redaction keeps](#what-the-redaction-keeps)),
    the terminal on stdin/stdout/stderr and whether it is the process's controlling terminal, whether `AGENT_BUS_ALLOW_HUMAN=1` was set, and which of
    the harness variables above were set (names only, never values). It goes with the
    `trust: "human"` message it posted (`ask`, `reply`), or stands alone as an action
    (`resume`, `cancel`, `debrief`, `agents --clear-quota`).
 
-`history` and `tail` show it under each human message and as `human action: …` lines, and put
+#### What the redaction keeps
+
+Each ancestor keeps its executable's name (`*` if it is over 40 characters or has characters
+other than letters, digits and `._+-`) and its first 4 arguments (then `...`; the whole line is
+cut at 120 characters). Each argument is judged on its own, in this order:
+1. An allowlisted word is kept as it is, wherever it appears (even right after a flag): the
+   subcommands `app-server`, `exec`, `run`, `server`, `serve`, `start`, `daemon`, `resume`,
+   `attach`, `new`, `mcp`, `chat`, `agent` and `login`, and `--`.
+2. An argument right after a flag (one starting `-`, other than `--`, with no `=`) is that
+   flag's value and becomes `*`, unless it starts with `-` itself.
+3. A long flag (`--` and up to 31 letters, digits, `_` or `-`) keeps its name, even right after
+   another flag; `--name=value` becomes `--name=*`.
+4. A short flag (`-` and one letter or digit) is kept; anything else starting with `-` (`-abc`,
+   `-ofile`, a longer flag-like token) becomes `-*`.
+5. A path (starting `/`, `./`, `../` or `~/`, with no whitespace or `:`) becomes `.../<last
+   component>` when that component is at most 24 characters of letters, digits and `._+-`
+   (starting with a letter or digit), and `.../*` otherwise.
+6. Anything else becomes `*`.
+
+`history` and `tail` show provenance under each human message and as `human action: …` lines, and put
 `!!` lines (red on a terminal) above the body when something looks off:
 - `AGENT_BUS_ALLOW_HUMAN=1` overrode the guard;
 - a harness variable was set, or an agent harness (`claude`, `codex`, `agy`, `copilot`) is in
@@ -762,6 +784,9 @@ documents each.
 | `rex-check` | you or an agent, diagnosing Rex status (see Rex sessions) |
 
 `tail <thread> --events --once` is also what agents run to see whether a peer is still working.
+`--events-only` prints just the event lines for tools, turns, errors and retries (no header,
+messages, or the peers' streamed text and thinking), so grepping them for denials, timeouts or
+retries doesn't match what the peers wrote.
 
 ## Notifications: `agent-bus stream`
 

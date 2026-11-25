@@ -141,9 +141,14 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
     last_msg = last_ev = last_act = 0
     last_status = None
     t = bus.thread(args.thread)
-    print(_color(SYSTEM, thread_header(t), color))
-    print(_color(SYSTEM, f"goal: {t['goal']}", color))
-    if args.peer:
+    # --events-only (#122): event lines alone, so grepping for denials or timeouts doesn't
+    # match the text of a review or proposal: no messages, and none of the peers' own
+    # streamed text or thinking either (a verdict also streams as a text event).
+    only = getattr(args, "events_only", False)
+    if not only:
+        print(_color(SYSTEM, thread_header(t), color))
+        print(_color(SYSTEM, f"goal: {t['goal']}", color))
+    if args.peer and not only:
         print(_color(SYSTEM, f"viewing {args.peer} (output only; intervene with `agent-bus reply`)", color))
     from . import worker
     try:
@@ -154,16 +159,18 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
             acts = bus.human_actions(args.thread, after_id=last_act)
             last_msg = msgs[-1]["id"] if msgs else last_msg
             last_act = acts[-1]["id"] if acts else last_act
-            for k, m in _merged(msgs, acts):
+            for k, m in ([] if only else _merged(msgs, acts)):
                 if k == "a":
                     print(format_action(m, color), flush=True)
                 elif not args.peer or m["sender"] in (args.peer, HUMAN, SYSTEM):
                     print(format_message(m, color), flush=True)
-            if args.peer or args.events:
+            if args.peer or args.events or only:
                 for e in bus.events(args.thread, after_id=last_ev, agent=args.peer):
                     last_ev = e["id"]
-                    if e["kind"] in ("text", "tool", "thinking", "turn_start", "turn_end", "error", "format",
-                                       "relaunch", "api_retry", "repair"):
+                    if e["kind"] in (("tool", "turn_start", "turn_end", "error", "format", "relaunch",
+                                      "api_retry", "repair") if only else
+                                     ("text", "tool", "thinking", "turn_start", "turn_end", "error", "format",
+                                      "relaunch", "api_retry", "repair")):
                         who = e["agent"] or "worker"
                         print(_color(SYSTEM, f"  · {who} {e['kind']}: {e['text']}", color), flush=True)
             st = peer_status(bus, args.thread, args.peer) if args.peer else thread_status(bus, args.thread)
@@ -509,6 +516,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("thread")
     s.add_argument("--peer", help="also show what this agent is doing (tools, thinking)")
     s.add_argument("--events", action="store_true", help="also show what every agent is doing")
+    s.add_argument("--events-only", action="store_true",
+                   help="show only what the agents do (tools, turns, errors, retries): no messages and none of "
+                        "their text or thinking, for grepping")
     s.add_argument("--once", action="store_true", help="print what's there now and exit")
     s.add_argument("--no-status", action="store_true", help="don't report the thread's state to Rex (OSC 7501)")
     s.add_argument("--no-color", action="store_true")
