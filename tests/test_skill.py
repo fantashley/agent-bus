@@ -92,3 +92,24 @@ def test_skill_explains_every_next_action_a_review_wait_returns():
     assert kinds == {"wait", "fix", "done", "stop"}
     for k in kinds:
         assert f"`{k}: ...`" in text, k
+
+
+def test_skill_signatures_name_every_mcp_parameter(env):
+    """The skill's signatures for the two initiating tools name each of their MCP parameters,
+    so a new one (such as `evidence`, #114) can't go undocumented."""
+    server = mcp_server.build("claude", bus=env["bus"])
+    tools = {t.name: t for t in asyncio.run(server.list_tools())}
+    text = skill_text()
+    for name in ("start_discussion", "request_review"):
+        start = text.index(f"`{name}(")
+        sig = text[start:text.index(")`", start)]
+        params = set(tools[name].input_schema["properties"])
+        assert "evidence" in params
+        missing = [p for p in params if not re.search(rf"\b{p}\b", sig)]
+        assert not missing, f"SKILL.md's {name} signature doesn't name {missing}"
+
+
+def test_skill_says_when_to_use_evidence_rather_than_focus():
+    text = skill_text()
+    for phrase in ("`evidence` vs `focus`", "fenced as data", "isn't supported yet"):
+        assert phrase in text, phrase

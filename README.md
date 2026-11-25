@@ -89,6 +89,30 @@ with a new deadline.
 To collect feedback from peers, use `debrief` (see [Debriefs](#debriefs)), not a one-round
 discussion: a discussion always ends in consensus or `needs_human`.
 
+### Shared evidence
+
+Peers only see the allow-listed repo (and maybe the web). Facts they can't reach (command
+output, another repo's code, metrics, an issue's text) go in `evidence` on `start_discussion` or
+`request_review` (`agent-bus ask --evidence TITLE=PATH`, `-` for stdin, from the CLI): a list of
+`{"title": ..., "text": ...}` items, at most 8 items, 20,000 characters each and 60,000 in all.
+Over a cap (or with a NUL character), the request is refused and nothing is created; evidence is
+never cut short, and its text is kept verbatim. A repeat of a review request with other evidence
+is refused (naming the review), never reported as seen by reviewers that didn't get it. It is
+text only: the server reads no path for it, so it can't reach past the allowlist.
+
+The evidence is stored once on the thread. Every self-contained prompt shows it in full, fenced
+as data from the initiator, title and text (`[peer_data from …]`, the human user's too): round 1 of a
+discussion, each reviewer's first pass, and any turn that starts a fresh session. A resumed
+session, which already has it, gets a one-line "Evidence unchanged" note instead. `history`
+(and `agent-bus history`, `history --json` and `tail`) show it. Only the request that starts a
+review takes evidence: a follow-up keeps it, and passing more there is refused (adding to it
+isn't supported yet); `send` anything new as a note.
+
+How it relates to the other fields: `focus` (reviews) says what to check, such as the
+acceptance criteria; `evidence` holds the facts to check it against. `context_refs`
+(discussions) and `send(refs=...)` only point at things (a path, a branch, a PR URL) a peer may
+or may not be able to read; `evidence` carries the content itself.
+
 `wait(thread)` blocks for up to 55 s (clients' tool-call timeouts don't allow more). It returns
 as soon as something for you arrives. Routine notices ("Round 2 of 3", "Review requested from
 …") don't end it on their own; they come back with the next message or on timeout. On timeout
