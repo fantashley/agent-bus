@@ -656,10 +656,69 @@ launched), set `AGENT_BUS_ALLOW_HUMAN=1` for that command. It doesn't lift the h
 refusal, and the refusal message doesn't mention it.
 
 This is a seatbelt against an agent posting as you by mistake or because some text told it to,
-not a security boundary. Anything running as your user can unset the variables, detach from its
-harness, set the override, or write `bus.db` directly. A real boundary needs the database out of
-agents' reach and a separate channel for you (agreed on agent-bus thread t-fc8b3b; see
-[#108](https://github.com/fantashley/agent-bus/issues/108)).
+not a security boundary (agreed on agent-bus thread t-fc8b3b). See the trust boundary below.
+
+### Trust boundary
+
+**What agent-bus does.** Two layers, neither of them a wall:
+1. **The guard** (above) refuses the commands that act as you in what looks like an agent's
+   shell.
+2. **Provenance** ([#108](https://github.com/fantashley/agent-bus/issues/108)). Each of those
+   commands records where it was run from, in the same transaction as what it did: the
+   process's parent chain (pid, executable name and the first few arguments of up to 16
+   ancestors, redacted before it is stored: a long flag keeps its name but not its value, a
+   short flag is kept only alone (its value too becomes `*`), a path (starting `/`, `./`, `../` or `~/`) keeps only its
+   last component, a few known subcommands such as `exec` or `app-server` are kept, and every
+   other argument becomes `*`),
+   the terminal on stdin/stdout/stderr and whether it is the process's controlling terminal, whether `AGENT_BUS_ALLOW_HUMAN=1` was set, and which of
+   the harness variables above were set (names only, never values). It goes with the
+   `trust: "human"` message it posted (`ask`, `reply`), or stands alone as an action
+   (`resume`, `cancel`, `debrief`, `agents --clear-quota`).
+
+`history` and `tail` show it under each human message and as `human action: …` lines, and put
+`!!` lines (red on a terminal) above the body when something looks off:
+- `AGENT_BUS_ALLOW_HUMAN=1` overrode the guard;
+- a harness variable was set, or an agent harness (`claude`, `codex`, `agy`, `copilot`) is in
+  the parent chain;
+- no terminal, or a terminal that isn't the process's controlling one (`setsid`, or stdin
+  redirected from another pty);
+- detached: no parent chain, or the parent is `systemd`, `init` or `launchd`;
+- **no provenance recorded**: the row wasn't posted by this CLI. It was written by an
+  agent-bus from before #108, or straight into `bus.db`. That is never shown as clean.
+- the record is unreadable, or one message has several.
+
+`history --json` has each human message's `provenance` (`recorded`, `flagged`, `flags`,
+`details`, `record`) and a `human_actions` list. `agents` shows the latest `--clear-quota` of
+each agent this past week, flagged the same way. Agents never get the record itself. On a
+flagged human message they get one short note in their prompt, or a `provenance` field from the
+MCP tools: the flag codes, with no pids or paths, saying it may not be from you. A discussion you
+started whose opening question is flagged gets the same note next to its goal
+(`goal_provenance`).
+
+Provenance is kept in its own table, `human_actions`, not in `messages`, so an older agent-bus
+still running during an upgrade keeps working. Its human messages show as "no provenance
+recorded".
+
+**Where the gap is.** Agents run as your user, and `bus.db` (mode 0600) belongs to that user.
+So any process an agent starts can still:
+- write a `sender='human', trust='human'` message straight into `bus.db`, together with a
+  `human_actions` row carrying a clean-looking record, or edit or delete existing rows;
+- run the CLI from a chain that looks clean: unset the variables, double-fork away from its
+  harness, and attach to a terminal (a `script`, `tmux` or `ssh -t` session gives it one).
+
+Provenance makes the careless and the obvious spoof visible after the fact. It does not make a
+deliberate one impossible, and a clean record proves nothing. If a human message on a thread
+surprises you, look at its provenance in `history`, and remember that it may still be forged.
+
+**Stronger options, not taken.** Both would close the gap. For a single-user local tool they
+cost more than they're worth for now:
+- *Privilege separation:* a small bus daemon owns `bus.db`, either under a separate UID or with
+  interactive agents OS-sandboxed (bubblewrap, Landlock, Seatbelt) so they can't write the
+  state directory. Agents reach the bus only through their MCP server, which gets its identity
+  from the daemon.
+- *An authenticated human channel:* human actions go through a socket or credential agents
+  can't reach, and/or `trust: "human"` messages are signed with a key that needs your
+  confirmation (FIDO2 touch, ssh-agent confirm, pinentry) and are verified by that daemon.
 
 `tail` emits [OSC 7501 program status](https://www.superlogical.com/rex/docs/build/program-status)
 (`working`, `done`, `blocked/question` on `needs_human`), so Rex shows discussion state on any

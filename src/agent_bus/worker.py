@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from . import config as cfg
-from . import autoresume, prompts, quota, snapshot, unvotable, usages
+from . import autoresume, prompts, provenance, quota, snapshot, unvotable, usages
 from .db import HUMAN, SYSTEM, Bus, BusError, format_dissent, review_progress
 from .peers import (ADAPTERS, Adapter, TurnResult, adapter, cli_version, extract_reply, fenced_body,
                     format_usage)
@@ -744,6 +744,10 @@ class Worker:
         """The question, fenced as peer data when an agent (not the human user) asked it."""
         q = t["goal"] if t["initiator"] == HUMAN else prompts.wrap_peer(t["initiator"], t["goal"])
         who = "the human user" if t["initiator"] == HUMAN else t["initiator"]
+        if t["initiator"] == HUMAN and "opening_provenance" in t:
+            note = provenance.peer_note(t["opening_provenance"]["record"], t["opening_provenance"]["records"])
+            if note:
+                who += f" ({note})"
         return prompts.QUESTION.format(asker=who, question=q) + self.context_note(t)
 
     def context_note(self, t: dict) -> str:
@@ -1789,6 +1793,10 @@ class Worker:
             question = prompts.DEBRIEF_QUESTION
         elif asker != HUMAN:
             question = prompts.wrap_peer(asker, question)
+        else:
+            note = provenance.peer_note(*self.bus._provenance(job_id=self.job["id"]))
+            if note:
+                question = f"({note})\n{question}"
         if t["kind"] == "review":
             role, step = "a reviewer", "review pass"
         else:

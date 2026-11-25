@@ -13,7 +13,7 @@ import textwrap
 import time
 
 from . import config as cfg
-from . import hooks, rex
+from . import hooks, provenance, rex
 from .db import HUMAN, SYSTEM, Bus, BusError, format_progress, is_quiet
 from .service import Service, present, thread_summary
 from .worker import format_review
@@ -41,7 +41,37 @@ def format_message(m: dict, color: bool) -> str:
     to = f" → {m['recipient']}" if m["recipient"] else ""
     head = _color(m["sender"], f"[{when}] #{m['id']} {who}{to} ({tag}, r{m['round'] or '-'})", color)
     body = textwrap.indent(m["body"].rstrip(), "    ")
-    return f"{head}\n{body}"
+    if m["sender"] != HUMAN or "provenance" not in m:
+        return f"{head}\n{body}"
+    warn, info = provenance_lines(m["provenance"], m.get("provenance_records", 1), color)
+    return "\n".join([head, *warn, body, *info])
+
+
+WARN = "\x1b[1;31m"
+
+
+def provenance_lines(rec: dict | None, records: int, color: bool) -> tuple[list[str], list[str]]:
+    """A human action's provenance (#108): flags first and loud, then where it came from."""
+    warn, info = provenance.describe(rec, records)
+    w = [f"    !! {d}" for d in warn]
+    return ([f"{WARN}{x}{RESET}" for x in w] if color else w), [_color(SYSTEM, f"    {x}", color) for x in info]
+
+
+def format_action(a: dict, color: bool) -> str:
+    """A recorded human action that posted no message (#108), e.g. a resume or a cancel."""
+    when = time.strftime("%H:%M:%S", time.localtime(a["created_at"]))
+    detail = ", ".join(f"{k} {v}" for k, v in a["detail"].items() if k in ("rounds", "peers", "job", "agent")
+                       and v not in (None, [], ""))
+    head = _color(HUMAN, provenance.printable(f"[{when}] human action: {a['command']}"
+                                              + (f" ({detail})" if detail else "")), color)
+    warn, info = provenance_lines(a["provenance"], 1, color)
+    return "\n".join([head, *warn, *info])
+
+
+def _merged(msgs: list[dict], actions: list[dict]) -> list[tuple[str, dict]]:
+    """Messages and message-less human actions in the order they happened."""
+    items = [("m", m) for m in msgs] + [("a", a) for a in actions]
+    return sorted(items, key=lambda it: (it[1]["created_at"], it[0] == "m"))
 
 
 def thread_header(t: dict) -> str:
@@ -108,7 +138,7 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
     status = (not args.no_status) and rex.stdout_is_tty() and bool(os.environ.get("REX_SESSION"))
     notify = args.notify and rex.stdout_is_tty()
     notices = hooks.MailNotices()
-    last_msg = last_ev = 0
+    last_msg = last_ev = last_act = 0
     last_status = None
     t = bus.thread(args.thread)
     print(_color(SYSTEM, thread_header(t), color))
@@ -120,11 +150,15 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
         while True:
             bus.expire_discussion(args.thread)  # parked once its deadline passes (#74)
             worker.relaunch_stalled(bus)  # its job's worker may never have started (#64)
-            for m in bus.history(args.thread, after_id=last_msg)["messages"]:
-                last_msg = m["id"]
-                if args.peer and m["sender"] not in (args.peer, HUMAN, SYSTEM):
-                    continue
-                print(format_message(m, color), flush=True)
+            msgs = bus.history(args.thread, after_id=last_msg)["messages"]
+            acts = bus.human_actions(args.thread, after_id=last_act)
+            last_msg = msgs[-1]["id"] if msgs else last_msg
+            last_act = acts[-1]["id"] if acts else last_act
+            for k, m in _merged(msgs, acts):
+                if k == "a":
+                    print(format_action(m, color), flush=True)
+                elif not args.peer or m["sender"] in (args.peer, HUMAN, SYSTEM):
+                    print(format_message(m, color), flush=True)
             if args.peer or args.events:
                 for e in bus.events(args.thread, after_id=last_ev, agent=args.peer):
                     last_ev = e["id"]
@@ -307,6 +341,15 @@ def needs_you(bus: Bus, ts: list[dict]) -> dict[str, str]:
     return out
 
 
+def _with_provenance(m: dict) -> dict:
+    """A message for `history --json`: as agents see it, plus a human message's full
+    provenance (#108), which agents never get."""
+    out = present(m)
+    if m["sender"] == HUMAN and "provenance" in m:
+        out["provenance"] = provenance.summary(m["provenance"], m.get("provenance_records", 1))
+    return out
+
+
 def _one_line(text: str, n: int = 160) -> str:
     """A notice's first line, whitespace collapsed, at most ``n`` characters."""
     line = " ".join((text.strip().splitlines() or [""])[0].split())
@@ -322,8 +365,8 @@ def _print_history(bus: Bus, thread: str, color: bool) -> None:
         st = bus.review_standings(thread)
         print(_color(SYSTEM, f"required reviewers at head {str(st['head_commit_id'])[:12]}"
                      + (" (complete)" if st["complete"] else "") + ":\n" + format_review(st), color))
-    for m in h["messages"]:
-        print(format_message(m, color))
+    for k, m in _merged(h["messages"], bus.human_actions(thread)):
+        print(format_action(m, color) if k == "a" else format_message(m, color))
 
 
 def add_mcp_args(s: argparse.ArgumentParser) -> None:
@@ -380,9 +423,8 @@ INTERNAL = ("mcp", "hook", "run-job")
 # Commands that act as the human user: posting with trust "human", or changing a thread
 # or an agent's state on their behalf (also `agents --clear-quota`, see acts_as_human).
 HUMAN_ONLY = ("ask", "reply", "resume", "cancel", "debrief")
-# Set in the shells agent harnesses run commands in.  Session markers only, never config
-# or auth variables a human may export in their own shell too.
-HARNESS_ENV = ("AI_AGENT", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_CI")
+# Set in the shells agent harnesses run commands in (see provenance.HARNESS_ENV).
+HARNESS_ENV = provenance.HARNESS_ENV
 
 
 def acts_as_human(args: argparse.Namespace) -> bool:
@@ -628,6 +670,10 @@ def main(argv: list[str] | None = None) -> int:
         return worker.main(args.job)
 
     bus = Bus()
+    if acts_as_human(args):
+        # Where this action came from, recorded with it (#108): after the guard, so an
+        # override is visible in history.
+        bus.human_provenance = provenance.collect("agents --clear-quota" if args.cmd == "agents" else args.cmd)
     done = False
     try:
         rc = _dispatch(bus, args)
@@ -685,6 +731,7 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
             with bus.tx():
                 n = bus.conn.execute("DELETE FROM quota_blocks WHERE agent=?", (subj,)).rowcount
                 bus.due_now(quota.sharing(conf, subj))
+                bus.record_human_action(None, detail={"agent": args.clear_quota, "subject": subj, "cleared": n})
             print(f"cleared {n} out-of-usage block(s) for {args.clear_quota}"
                   + (f" ({subj}, shared by {', '.join(quota.sharing(conf, subj))})"
                      if quota.sharing(conf, subj) != [args.clear_quota] else ""))
@@ -708,7 +755,15 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         # Keyed by harness and account: listed under every participant they apply to.
         blocks = quota.by_participant(conf, bus.quota_blocks())
         limits = quota.by_participant(conf, bus.usage_limits())
+        # The latest `--clear-quota` of each agent this past week, and where it came from (#108).
+        cleared = {a["detail"].get("agent"): a for a in bus.human_actions(None)
+                   if a["command"] == "agents --clear-quota" and a["created_at"] > time.time() - 7 * 86400}
         if args.json:
+            for a, c in cleared.items():
+                if a in avail:
+                    avail[a]["quota_cleared"] = {
+                        "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(c["created_at"])),
+                        "provenance": provenance.summary(c["provenance"])}
             for a, v in avail.items():
                 if a in blocks:
                     v["out_of_usage"] = [quota.summary(b) for b in blocks[a]]
@@ -736,6 +791,12 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
             if conf.bedrock(a):
                 print(f"       Amazon Bedrock: AWS_PROFILE {conf.aws_profile(a) or '(default)'}, "
                       f"AWS_REGION {conf.aws_region(a) or '(default)'}")
+            if a in cleared:
+                when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(cleared[a]["created_at"]))
+                warn, _ = provenance_lines(cleared[a]["provenance"], 1, color)
+                print(f"       usage block cleared by the human user at {when}")
+                for w in warn:
+                    print("   " + w)
             for b in blocks.get(a, []):
                 when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(b["until"]))
                 if quota.is_auth(b):
@@ -807,7 +868,12 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
             print(json.dumps({"thread": thread_summary(h["thread"]),
                               **({"review": bus.review_standings(args.thread)}
                                  if h["thread"]["kind"] == "review" else {}),
-                              "messages": [present(m) for m in h["messages"]]}, indent=2))
+                              "messages": [_with_provenance(m) for m in h["messages"]],
+                              "human_actions": [{"id": a["id"], "command": a["command"], "detail": a["detail"],
+                                                 "at": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                                                     time.localtime(a["created_at"])),
+                                                 "provenance": provenance.summary(a["provenance"])}
+                                                for a in bus.human_actions(args.thread)]}, indent=2))
         else:
             _print_history(bus, args.thread, color)
         return 0

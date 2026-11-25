@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 from . import config as cfg
-from . import autoresume, quota
+from . import autoresume, provenance, quota
 from . import rex, unvotable, worker
 from .db import HUMAN, SYSTEM, Bus, BusError, deadline_message, is_quiet, overdue, past_deadline, review_progress, wrap_peer
 
@@ -40,6 +40,11 @@ def present(m: dict) -> dict:
            "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(m["created_at"]))}
     if m["recipient"]:
         out["to"] = m["recipient"]
+    if m["sender"] == HUMAN and "provenance" in m:
+        # Only a short marker when flagged, never the ancestry itself (#108).
+        note = provenance.peer_note(m["provenance"], m.get("provenance_records", 1))
+        if note:
+            out["provenance"] = note
     data = {k: v for k, v in m["data"].items() if k not in ("discussion", "session", "quiet")}
     if data:
         out["data"] = data
@@ -58,8 +63,14 @@ def thread_summary(t: dict, goal: bool = True) -> dict:
     if t["initiator"] not in (HUMAN, SYSTEM, None):
         # An agent wrote the goal; label it so it isn't read as an instruction.
         out["goal"] = wrap_peer(t["initiator"], t["goal"])
+    elif t["initiator"] == HUMAN and "opening_provenance" in t:
+        # The human's question, unless its provenance is flagged (#108): then say so.
+        note = provenance.peer_note(t["opening_provenance"]["record"], t["opening_provenance"]["records"])
+        if note:
+            out["goal_provenance"] = note
     if not goal:
         del out["goal"]
+        out.pop("goal_provenance", None)
     if t["deadline"]:
         out["deadline"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t["deadline"]))
     if t["final_proposal"]:
@@ -264,6 +275,7 @@ class Service:
         delivered = self.poll(thread, wake_quiet=True) if deliver else None
         res: dict[str, Any] = {"status": "timeout", **self.thread_state(thread)}
         res["thread"].pop("goal", None)  # the caller has it already; it can be long
+        res["thread"].pop("goal_provenance", None)  # and its marker with it
         if delivered:
             res["messages"] = delivered["messages"]
         res["cursor"] = delivered["cursor"] if delivered else self.bus.cursor(self.subscriber, thread)
@@ -417,17 +429,20 @@ class Service:
         rounds = max(1, min(int(max_rounds or self.config.max_rounds), 10))
         minutes = max(1, min(int(deadline_minutes or self.config.deadline_minutes), 240))
         participants = list(peers) if self.agent == HUMAN else [self.agent, *peers]
-        t = self.bus.create_thread(
-            "discussion", question.strip(), participants, initiator=self.agent,
-            initiator_session=self.session_id, max_rounds=rounds,
-            max_messages=max(self.config.max_messages, rounds * len(participants) * 3),
-            deadline=time.time() + minutes * 60, repo=repo_path,
-            refs={k: v for k, v in (("context_refs", context_refs), ("peer_settings", settings)) if v} or None)
-        if self.agent == HUMAN:
-            self.bus.post(t["id"], HUMAN, question.strip())
-        else:
-            # The question is the initiator's own text: it stays peer_data, never system.
-            self.bus.post(t["id"], self.agent, question.strip(), session_id=self.session_id)
+        # The thread and its opening question in one transaction, so nothing else is ever
+        # posted before the question (Bus.thread looks its provenance up, #108).
+        with self.bus.tx():
+            t = self.bus.create_thread(
+                "discussion", question.strip(), participants, initiator=self.agent,
+                initiator_session=self.session_id, max_rounds=rounds,
+                max_messages=max(self.config.max_messages, rounds * len(participants) * 3),
+                deadline=time.time() + minutes * 60, repo=repo_path,
+                refs={k: v for k, v in (("context_refs", context_refs), ("peer_settings", settings)) if v} or None)
+            if self.agent == HUMAN:
+                self.bus.post(t["id"], HUMAN, question.strip())
+            else:
+                # The question is the initiator's own text: it stays peer_data, never system.
+                self.bus.post(t["id"], self.agent, question.strip(), session_id=self.session_id)
         self.bus.post(t["id"], SYSTEM, f"Discussion started by {'the human user' if self.agent == HUMAN else self.agent} "
                       f"with {', '.join(participants)}; up to {rounds} rounds."
                       + "".join(f" Left out: {quota.message(p, 'peer', b, self.config)}" for p, b in skipped.items()),
@@ -1223,6 +1238,8 @@ class Service:
                                "no peer can be debriefed: " + " ".join(m + "." for _, m in skipped.values()))
             params = {"peers": chosen, "question": question.strip() if question else None, "asker": self.agent}
             job, created = self.bus.create_job(thread, "debrief", params, None)
+            if self.agent == HUMAN:  # before its worker starts, which reads it (#108)
+                self.bus.record_human_action(thread, detail={"job": job["id"], "peers": chosen})
         if created:
             worker.launch(self.bus, job["id"])
         res: dict[str, Any] = {"thread": thread_summary(self.bus.thread(thread)), "job": self._job_info(job, created),
@@ -1250,6 +1267,7 @@ class Service:
         try:
             with self.bus.tx():
                 res = self._resume(thread, extra_rounds)
+                self.bus.record_human_action(thread, detail={"rounds": extra_rounds})  # #108
             launches = self._launch_later
         finally:
             self._launch_later = None
@@ -1386,7 +1404,7 @@ class Service:
     def cancel(self, thread: str) -> dict:
         if self.agent != HUMAN:
             raise BusError("HUMAN_ONLY", "only the human user can cancel a thread")
-        pids = self.bus.cancel_thread(thread)
+        pids = self.bus.cancel_thread(thread)  # recorded with its provenance there (#108)
         autoresume.forget(self.bus, thread)
         killed = []
         for pid in pids:
