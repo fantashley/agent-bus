@@ -660,7 +660,7 @@ class Bus:
             if timed and (expired or past_deadline(t)):
                 raise BusError("DEADLINE_REACHED", deadline_message(t, parked=expired))
             if is_agent:
-                if t["status"] == "cancelled":
+                if t["status"] == "cancelled" and kind != "debrief":  # a debrief may follow (#145)
                     raise BusError("THREAD_CANCELLED", f"thread {thread_id} was cancelled")
                 if t["limit_reached"] and kind not in UNCOUNTED:
                     raise BusError("THREAD_LIMIT_REACHED",
@@ -1195,8 +1195,13 @@ class Bus:
             self.conn.execute(
                 "UPDATE jobs SET status='cancelled', updated_at=? WHERE thread_id=? AND status IN ('queued','running')",
                 (_now(), thread_id))
-            self.set_thread(thread_id, status="cancelled")
-            self.post(thread_id, SYSTEM, "Cancelled by the human user.", kind="status")
+            if (self.thread(thread_id)["refs"] or {}).get("finished"):
+                # A finished review stays resolved (#145): only what runs on it (a debrief) stops.
+                self.post(thread_id, SYSTEM, "Its running job was cancelled by the human user; the finished "
+                          "review stays resolved.", kind="status")
+            else:
+                self.set_thread(thread_id, status="cancelled")
+                self.post(thread_id, SYSTEM, "Cancelled by the human user.", kind="status")
             self.record_human_action(thread_id)
         return [p for p in pids if p]
 

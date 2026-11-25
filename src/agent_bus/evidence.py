@@ -99,8 +99,9 @@ def unchanged(t: dict) -> str:
     items = of(t)
     if not items:
         return ""
-    return (f"\nEvidence unchanged: the {len(items)} item{'s' if len(items) != 1 else ''} {who(t)} attached"
-            f"{attached_at(t)} are the ones earlier in this conversation.\n")
+    one = len(items) == 1
+    return (f"\nEvidence unchanged: the {len(items)} item{'' if one else 's'} {who(t)} attached"
+            f"{attached_at(t)} {'is the one' if one else 'are the ones'} earlier in this conversation.\n")
 
 
 def present(t: dict) -> list[dict]:

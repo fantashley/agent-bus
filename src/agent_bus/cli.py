@@ -16,7 +16,7 @@ from . import config as cfg
 from . import evidence as ev
 from . import hooks, provenance, rex
 from .db import HUMAN, SYSTEM, Bus, BusError, format_progress, is_quiet
-from .service import Service, present, thread_summary
+from .service import Service, finished_line, present, thread_summary
 from .worker import format_review
 
 COLORS = {"claude": "\x1b[38;5;173m", "codex": "\x1b[38;5;75m", "antigravity": "\x1b[38;5;114m",
@@ -147,6 +147,8 @@ def thread_status(bus: Bus, thread: str) -> tuple[str, str | None, str]:
     t = bus.thread(thread)
     job = bus.active_job(thread)
     if t["status"] == "resolved":
+        if (t["refs"] or {}).get("finished"):  # #145
+            return "done", None, f"{thread}: resolved, {finished_line(t['refs']['finished'])}"
         return "done", None, f"{thread}: resolved" + (f" on {t['final_proposal']}" if t["final_proposal"] else "")
     if t["status"] == "needs_human":
         return "blocked", "question", f"{thread}: needs human"
@@ -437,6 +439,10 @@ def _print_history(bus: Bus, thread: str, color: bool) -> None:
     t = h["thread"]
     rounds = format_progress(t) if t["kind"] == "review" else f"r{t['round']}/{t['max_rounds']}"
     print(_color(SYSTEM, f"{t['id']} [{t['status']}] {t['kind']} {rounds}: {t['goal']}", color))
+    if t["kind"] == "review" and (t["refs"] or {}).get("finished"):  # #145
+        f = t["refs"]["finished"]
+        reason = f"; reason: {provenance.printable(_one_line(f['reason'], 300))}" if f.get("reason") else ""
+        print(_color(SYSTEM, finished_line(f) + reason, color))
     if t["kind"] == "review" and (t["refs"] or {}).get("reviewers"):
         st = bus.review_standings(thread)
         print(_color(SYSTEM, f"required reviewers at head {str(st['head_commit_id'])[:12]}"
@@ -477,7 +483,7 @@ def parse_mcp_args(args: list[str]) -> argparse.Namespace | None:
 
 
 # Commands that act on threads: the lazy sweep runs after them for those threads.
-ACTING = ("cancel", "resume", "reply", "debrief")
+ACTING = ("cancel", "resume", "reply", "debrief", "finish")
 
 EPILOG = """\
 common tasks:
@@ -501,7 +507,7 @@ clients" in the README.
 INTERNAL = ("mcp", "hook", "run-job")
 # Commands that act as the human user: posting with trust "human", or changing a thread
 # or an agent's state on their behalf (also `agents --clear-quota`, see acts_as_human).
-HUMAN_ONLY = ("ask", "reply", "resume", "cancel", "debrief")
+HUMAN_ONLY = ("ask", "reply", "resume", "cancel", "debrief", "finish")
 # Set in the shells agent harnesses run commands in (see provenance.HARNESS_ENV).
 HARNESS_ENV = provenance.HARNESS_ENV
 
@@ -614,6 +620,13 @@ def main(argv: list[str] | None = None) -> int:
                        description="Cancel threads, stopping any agent still working on them.  Use it to "
                                    "dismiss threads you no longer need, including ones stuck waiting for you.")
     s.add_argument("thread", nargs="+")
+
+    s = sub.add_parser("finish", help="end a review without every reviewer's approval",
+                       description="Finish a review that still asks for changes (or waits for a reviewer): it "
+                                   "is resolved with the blocking findings recorded as left open, and can then "
+                                   "be debriefed.")
+    s.add_argument("thread")
+    s.add_argument("--reason", required=True, help="why it ends without every approval")
 
     s = sub.add_parser("debrief", help="ask the agents of a finished thread what got in their way")
     s.add_argument("thread")
@@ -941,6 +954,9 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         for r in rows:
             print(line(r))
             print(indent + " ".join(r[6].split())[:100])
+            finished = (bus.thread(r[0])["refs"] or {}).get("finished") if r[2] == "review" else None
+            if finished:  # #145
+                print(indent + finished_line(finished))
             if r[2] == "review" and (bus.thread(r[0])["refs"] or {}).get("reviewers"):
                 st = bus.review_standings(r[0])
                 print(indent + "; ".join(f"{who} {v['state'].replace('_', ' ')}"
@@ -975,6 +991,12 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         for tid in targets:
             res = svc.cancel(tid)
             print(f"cancelled {tid}" + (f"; signalled worker {res['signalled']}" if res["signalled"] else ""))
+        return 0
+    if args.cmd == "finish":
+        res = svc.finish_review(args.thread, args.reason)
+        f = res["thread"].get("finished")
+        print(f"finished {args.thread}: " + (finished_line(f) if f else "resolved, every reviewer approved")
+              + f"; `agent-bus debrief {args.thread}` to ask the reviewers what got in their way")
         return 0
     if args.cmd == "debrief":
         res = svc.debrief(args.thread, question=args.question, peers=args.peers)

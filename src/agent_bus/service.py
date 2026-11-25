@@ -75,19 +75,54 @@ def thread_summary(t: dict, goal: bool = True) -> dict:
         out["deadline"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t["deadline"]))
     if t["final_proposal"]:
         out["final_proposal"] = t["final_proposal"]
+    if t["kind"] == "review":
+        refs = t["refs"] or {}
+        if refs.get("review_only"):
+            out["review_only"] = True
+        if refs.get("finished"):
+            out["finished"] = finished_summary(t)
     return out
+
+
+def finished_summary(t: dict) -> dict:
+    """How a review's initiator (or the human) finished it without every approval (#145):
+    who, why (fenced when an agent wrote it), at which head, and what was left open."""
+    f = dict((t["refs"] or {})["finished"])
+    if f.get("reason") and f.get("by") not in (HUMAN, None):
+        f["reason"] = wrap_peer(f["by"], f["reason"])
+    return f
+
+
+def finished_line(f: dict) -> str:
+    """One line on a finished review's open business (#145), for next_action and the CLI."""
+    left = []
+    if f.get("open_findings"):
+        left.append(f"blocking findings left open: {', '.join(f['open_findings'])}")
+    if f.get("earlier_open_findings"):
+        left.append("unsettled from an earlier revision: " + ", ".join(
+            f"{fid} (head {str(at.get('head_commit_id'))[:12]} on base {str(at.get('base_commit_id'))[:12]})"
+            for fid, at in f["earlier_open_findings"].items()))
+    if f.get("pending"):
+        left.append(f"not reviewed at that head: {', '.join(f['pending'])}")
+    return (f"finished by {f.get('by')} at head {str(f.get('head_commit_id'))[:12]} without every approval"
+            + (f"; {'; '.join(left)}" if left else ""))
 
 
 def review_next_action(t: dict, st: dict, job: dict | None, last_failed: bool = False,
                        pushback_pending: bool = False) -> str:
-    """A one-line hint for a review's initiator (#117): keep waiting, fix, done, or stop.
+    """A one-line hint for a review's initiator (#117): keep waiting, fix, done, or stop, or,
+    on a review-only review (#145), await_head: the change's author fixes it, not the initiator.
     ``st`` is the thread's review_standings, ``job`` its active job (or None),
     ``last_failed`` whether its latest review job failed with nothing running (a worker that
     died, say), and ``pushback_pending`` whether the current pass is a pushback still due
     its verdict."""
     head = st.get("head_commit_id") or ""
+    review_only = bool((t.get("refs") or {}).get("review_only"))
+    tid = t.get("id") or "<thread>"
     if job is not None and job["kind"] == "debrief":
         return "wait: debrief replies are on their way"
+    if (t.get("refs") or {}).get("finished"):
+        return f"done: {finished_line(t['refs']['finished'])}"
     if t["status"] == "cancelled":
         return "stop: the review was cancelled"
     if t["status"] == "needs_human":
@@ -100,18 +135,25 @@ def review_next_action(t: dict, st: dict, job: dict | None, last_failed: bool = 
     # shows, but only a resume reruns that pass.
     if last_failed and (pushback_pending or not st["changes_requested"]):
         return (f"stop: the last review pass failed and nothing is running; tell the human user, who can run "
-                f"`agent-bus resume {t['id']}` to retry it")
+                f"`agent-bus resume {tid}` to retry it")
     # A request for changes on the current head ends the pass, even while its worker is
     # still closing the job: nobody else reviews this head until there is a fix.  Past the
     # follow-up limit the worker parks the thread (or died before it could): a new request
     # would fail with REVIEW_LIMIT_REACHED.
     if st["changes_requested"] and st.get("follow_ups", 0) >= st.get("followup_limit", float("inf")):
         return ("stop: the review still asks for changes after its follow-up limit (REVIEW_LIMIT_REACHED); "
-                "tell the human user")
+                "tell the human user" + (f", or finish_review(\"{tid}\", reason) to end it" if review_only else ""))
+    if st["changes_requested"] and review_only:
+        # The initiator isn't the change's author (#145): nothing for it to fix.
+        return (f"await_head: {', '.join(st['changes_requested'])} asked for changes on head {head}. This review is "
+                "review-only, so the change's author fixes them, not you: stop waiting. When the author pushes "
+                f"a new head, request_review again with it and prev_head_commit_id={head} (send their replies "
+                f"as a note first); or call finish_review(\"{tid}\", reason) to end the review now")
     if st["changes_requested"]:
         return (f"fix: {', '.join(st['changes_requested'])} asked for changes on head {head}. Address the blocking "
                 "findings, send a note on each, then request_review again with the new head and "
-                f"prev_head_commit_id={head} (or send evidence and request the same head to push back)")
+                f"prev_head_commit_id={head} (or send evidence and request the same head to push back; "
+                f"or finish_review(\"{tid}\", reason) to end the review without every approval)")
     if job is not None:
         who = [r for r, v in st["reviewers"].items() if v["state"] == "reviewing"] or st["pending"]
         return f"wait: {', '.join(who) or 'a reviewer'} is reviewing head {head}"
@@ -527,7 +569,7 @@ class Service:
                        focus: str | None = None, model: str | None = None, effort: str | None = None,
                        reviewers: list[str] | None = None, peer_settings: dict | None = None,
                        thread: str | None = None, testing: str | None = None,
-                       evidence: list | None = None) -> dict:
+                       evidence: list | None = None, review_only: bool | None = None) -> dict:
         """``model``/``effort`` override the config for this reviewer on this thread; a
         follow-up pass keeps the thread's settings unless it gives new ones.
 
@@ -536,7 +578,14 @@ class Service:
 
         ``reviewers`` (instead of ``reviewer``) names several required reviewers: they review
         one at a time on one thread, and the change is ready once all approve the same head
-        (#47).  Their model/effort go in ``peer_settings``, e.g. {"codex": {"effort": "high"}}."""
+        (#47).  Their model/effort go in ``peer_settings``, e.g. {"codex": {"effort": "high"}}.
+
+        ``review_only`` marks a review whose initiator isn't the change's author (#145), say a
+        colleague's pull request: a request for changes waits for the author's next head (which
+        the initiator requests as a follow-up) or for finish_review, not for the initiator's
+        fix.  It is set when the review starts and kept by its follow-ups."""
+        if review_only is not None and not isinstance(review_only, bool):
+            raise ValueError("review_only must be true or false")
         if testing is not None and (not isinstance(testing, str) or len(testing) > MAX_TESTING_NOTE):
             raise ValueError(f"testing must be a note of at most {MAX_TESTING_NOTE} characters")
         testing = (testing.strip() or None) if testing is not None else None
@@ -563,7 +612,7 @@ class Service:
             else:
                 return self._request_reviews(reviewers, repo, base_commit_id, head_commit_id, change_id,
                                              prev_head_commit_id, focus, peer_settings, thread, testing,
-                                             evidence)
+                                             evidence, review_only)
         elif peer_settings:
             raise ValueError("peer_settings goes with `reviewers`; use model/effort with a single `reviewer`")
         if thread is not None:
@@ -584,6 +633,8 @@ class Service:
                 **self._budget_refs()}
         if evidence:
             refs["evidence"] = evidence
+        if review_only:
+            refs["review_only"] = True
         if override:
             refs["peer_settings"] = {reviewer: override}
         self.bus.reap()
@@ -591,15 +642,19 @@ class Service:
         # The lineage lookup and every busy/stale decision and write happen in one IMMEDIATE
         # transaction, so concurrent follow-ups serialize and a loser changes nothing.
         with self.bus.tx():
-            previous = (self._previous_review(reviewer, repo_path, prev_head_commit_id, request)
+            previous = (self._previous_review(reviewer, repo_path, prev_head_commit_id, request, review_only)
                         if prev_head_commit_id else None)
             if previous:
                 t = previous
                 old = t["refs"] or {}
                 self._no_followup_evidence(t, evidence)
+                self._same_review_only(t, review_only)
                 refs.pop("evidence", None)
                 if old.get("evidence"):
                     refs["evidence"] = old["evidence"]  # kept for every later pass and fresh session
+                refs.pop("review_only", None)
+                if old.get("review_only"):
+                    refs["review_only"] = True  # set when the review started (#145)
                 current = old.get("head_commit_id")
                 active = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND status IN ('queued','running')",
                                        t["id"])
@@ -607,14 +662,16 @@ class Service:
                 # revision (#59); an older request is new work, or stale.
                 repeat = self._pinned_request(t) == request
                 same = self._revision_pass(t) if repeat else None
-                if same and same["status"] == "done" and prev_head_commit_id == head_commit_id:
+                if same and self._pass_gave_verdict(t, same) and prev_head_commit_id == head_commit_id:
                     # Evidence since this pass asked for changes makes the same-head request a
                     # new pushback (#71), not a retry of the one that pinned this pass: a note
-                    # since the verdict, or a focus if it hasn't been pushed back on yet.
+                    # since the verdict, or a focus if it hasn't been pushed back on yet.  A pass
+                    # whose worker failed after posting its verdict counts as given (#146).
                     mine = self.bus.last_verdict(t["id"], reviewer)
                     fresh = (old.get("pushbacks") or {}).get(reviewer) != current
                     if self._single_pushback(t, mine, base_commit_id, head_commit_id) and (
-                            self._note_since(t, mine["id"]) is not None or (fresh and focus and focus.strip())):
+                            self._note_since(t, mine["id"]) is not None
+                            or (fresh and self._new_focus(focus, old.get("focus")))):
                         repeat, same = False, None
                 if repeat and same is None:
                     # Pinned to this request with no pass for it (a thread #59 left without
@@ -679,7 +736,7 @@ class Service:
                                                            f"review:{t['id']}:{t['round'] + 1}")
                     self.bus.set_thread(t["id"], refs=json.dumps(refs))
             else:
-                t, job_row, created = self._fresh_review(reviewer, repo_path, refs, override, request)
+                t, job_row, created = self._fresh_review(reviewer, repo_path, refs, override, request, review_only)
         if created:
             worker.launch(self.bus, job_row["id"])
         job = self._job_info(job_row, created)
@@ -696,6 +753,45 @@ class Service:
                              f"with send(thread=\"{t['id']}\", ...) or in focus")
 
     @staticmethod
+    def _same_review_only(t: dict, review_only: bool | None) -> None:
+        """``review_only`` is set when a review starts (#145): a follow-up or repeat that gives
+        it must agree; one that leaves it out keeps the thread's."""
+        if review_only is not None and review_only != bool((t["refs"] or {}).get("review_only")):
+            raise ValueError(f"{t['id']} is {'' if review_only is False else 'not '}a review-only review, and "
+                             "review_only can't change once a review has started; leave it out to keep the "
+                             "thread's, or start a new review (a request without prev_head_commit_id)")
+
+    @classmethod
+    def _pick_mode(cls, ts: list[dict], review_only: bool | None, prev_head: str) -> list[dict]:
+        """``_prefer_mode`` for a single reviewer's candidate threads, which must all be able to
+        take the request; with the mode left out and reviews of both modes among them, the
+        request has to say which (#145)."""
+        if review_only is None and len({bool((t["refs"] or {}).get("review_only")) for t in ts}) > 1:
+            raise BusError("REVIEW_AMBIGUOUS", "a review-only review and a regular one have both been at head "
+                           f"{prev_head[:12]} ({', '.join(t['id'] for t in ts)}); pass review_only=true or false "
+                           "to say which one to continue")
+        return cls._prefer_mode(ts, review_only)
+
+    @classmethod
+    def _prefer_mode(cls, ts: list[dict], review_only: bool | None) -> list[dict]:
+        """Of the reviews a follow-up could continue, those of the mode it names, if any (#145):
+        reviews of both modes can exist for one diff.  With none of that mode, all of them, so a
+        mode change on the one review is refused rather than starting a new one."""
+        same = [t for t in ts if not cls._other_mode(t, review_only)]
+        return same or ts
+
+    @staticmethod
+    def _other_mode(t: dict, review_only: bool | None) -> bool:
+        """A fresh request that says which kind of review it is doesn't repeat one of the other
+        kind (#145); left out, it repeats either."""
+        return review_only is not None and review_only != bool((t["refs"] or {}).get("review_only"))
+
+    @staticmethod
+    def _closed(t: dict) -> bool:
+        """A review no request continues: cancelled, or finished by its initiator (#145)."""
+        return t["status"] == "cancelled" or bool((t.get("refs") or {}).get("finished"))
+
+    @staticmethod
     def _same_evidence(t: dict, evidence: list | None) -> None:
         """A repeat of a request is idempotent only with the evidence its review started with
         (#114): other evidence is refused rather than reported as seen by reviewers that never
@@ -707,7 +803,7 @@ class Service:
                              f"anything new with send(thread=\"{t['id']}\", ...)")
 
     def _fresh_review(self, reviewer: str, repo_path: str, refs: dict, override: dict,
-                      request: list) -> tuple[dict, dict, bool]:
+                      request: list, review_only: bool | None = None) -> tuple[dict, dict, bool]:
         """Start a single-reviewer thread, or return the one this exact request started while it
         is still pinned to this request and its pass hasn't failed (a failed one is retried on a
         new thread).  Runs inside the caller's transaction."""
@@ -719,11 +815,17 @@ class Service:
         for row in self.bus._all("SELECT thread_id FROM jobs WHERE dedupe_key=? GROUP BY thread_id"
                                  " ORDER BY MAX(created_at) DESC", key):
             t = self.bus.thread(row["thread_id"])
-            if t["status"] == "cancelled" or self._pinned_request(t) != request:
-                continue  # moved on to another diff: new work
+            if self._closed(t) or self._pinned_request(t) != request or self._other_mode(t, review_only):
+                continue  # moved on to another diff, ended, or another kind of review: new work
             # Checked whatever its pass's state: a failed one stays resumable, so a retry with
             # other evidence on a new thread would leave two reviews of this head.
             self._same_evidence(t, refs.get("evidence"))
+            if review_only is None:
+                # Left out: the newest matching review's mode, kept by a retry of it, and older
+                # reviews of the other mode aren't this one (#145).
+                review_only = bool((t["refs"] or {}).get("review_only"))
+                if review_only:
+                    refs["review_only"] = True
             latest = self._revision_pass(t)
             if latest and (latest["status"] in ("queued", "running", "done") or self._has_verdict_for_head(t)):
                 # Idempotent, including a pass `agent-bus resume` restarted, and a failed one that
@@ -814,7 +916,14 @@ class Service:
         if (t["refs"] or {}).get("pushback_round") == t["round"] and verdict["round"] < t["round"]:
             return False  # the pushback pass this request started gave no verdict: a retry
         fresh = target not in ((t["refs"] or {}).get("pushbacks") or {})
-        return self._note_since(t, verdict["id"]) is not None or bool(fresh and focus and focus.strip())
+        return (self._note_since(t, verdict["id"]) is not None
+                or bool(fresh and self._new_focus(focus, (t["refs"] or {}).get("focus"))))
+
+    @staticmethod
+    def _new_focus(focus: str | None, pinned: str | None) -> bool:
+        """A focus that is evidence for a pushback: given, and not just the focus of the
+        request that pinned the pass being repeated (#146)."""
+        return bool(focus and focus.strip()) and focus.strip() != (pinned or "").strip()
 
     def _check_pushback(self, t: dict, reviewer: str, verdict: dict, focus: str | None, used: bool) -> None:
         """A same-head re-request after ``reviewer`` asked for changes (#71) needs the author's
@@ -929,7 +1038,8 @@ class Service:
     def _request_reviews(self, reviewers: list[str], repo: str, base_commit_id: str, head_commit_id: str,
                          change_id: str | None, prev_head_commit_id: str | None, focus: str | None,
                          peer_settings: dict | None, thread: str | None = None,
-                         testing: str | None = None, evidence: list | None = None) -> dict:
+                         testing: str | None = None, evidence: list | None = None,
+                         review_only: bool | None = None) -> dict:
         """Several required reviewers on one thread, one per round (#47).
 
         The first request starts the first reviewer in the list.  Each approval hands the
@@ -968,17 +1078,18 @@ class Service:
         with self.bus.tx():
             if prev_head_commit_id:
                 t = self._previous_review_set(order, repo_path, prev_head_commit_id, base_commit_id, head_commit_id,
-                                              change_id, thread)
+                                              change_id, thread, review_only)
                 if t:
                     self._no_followup_evidence(t, evidence)
+                    self._same_review_only(t, review_only)
                     job_row, created = self._followup_reviews(t, order, request, settings, focus, goal, change_id,
                                                               testing)
                 else:  # no lineage: a fresh review that happens to name a previous head
                     t, job_row, created = self._fresh_reviews(order, repo_path, request, settings, focus, goal,
-                                                              change_id, testing, evidence)
+                                                              change_id, testing, evidence, review_only)
             else:
                 t, job_row, created = self._fresh_reviews(order, repo_path, request, settings, focus, goal,
-                                                          change_id, testing, evidence)
+                                                          change_id, testing, evidence, review_only)
             t = self.bus.thread(t["id"])
             st = self.bus.review_standings(t["id"])
         if created:
@@ -988,12 +1099,14 @@ class Service:
             nxt = f"Every required reviewer has already approved head {head_commit_id[:12]}; nothing to run."
         else:
             nxt = (f"Call wait(\"{t['id']}\"): {t['refs']['reviewer']} reviews first; each approval hands the "
-                   "head to the next reviewer, and a request for changes waits for your fix.")
+                   "head to the next reviewer, and a request for changes waits for "
+                   + ("the author's next head (or finish_review)." if t["refs"].get("review_only") else "your fix."))
         return {"thread": thread_summary(t), "job": job, "review": st, "next": nxt}
 
     def _fresh_reviews(self, order: list[str], repo_path: str, request: list, settings: dict,
                        focus: str | None, goal: str, change_id: str | None,
-                       testing: str | None = None, evidence: list | None = None) -> tuple[dict, dict, bool]:
+                       testing: str | None = None, evidence: list | None = None,
+                       review_only: bool | None = None) -> tuple[dict, dict, bool]:
         """Start a several-reviewer thread, or return the one this exact request started while
         it is still pinned to this diff (retrying its pass if that failed)."""
         base, prev, head = request
@@ -1001,9 +1114,9 @@ class Service:
         for row in self.bus._all("SELECT thread_id FROM jobs WHERE dedupe_key=? GROUP BY thread_id"
                                  " ORDER BY MAX(created_at) DESC", key):
             t = self.bus.thread(row["thread_id"])
-            if (t["status"] == "cancelled" or (t["refs"] or {}).get("request") != request
-                    or (t["refs"] or {}).get("change_id") != change_id):
-                continue  # moved on to another diff, or another change's review: new work
+            if (self._closed(t) or (t["refs"] or {}).get("request") != request
+                    or (t["refs"] or {}).get("change_id") != change_id or self._other_mode(t, review_only)):
+                continue  # moved on to another diff, another change's or kind of review, or ended: new work
             self._same_evidence(t, evidence)
             latest = self._revision_job(t)
             if latest and latest["status"] in ("queued", "running", "done"):
@@ -1030,6 +1143,8 @@ class Service:
             refs["peer_settings"] = settings
         if evidence:
             refs["evidence"] = evidence
+        if review_only:
+            refs["review_only"] = True
         t = self.bus.create_thread("review", goal, [self.agent, *order], initiator=self.agent,
                                    initiator_session=self.session_id, max_rounds=1,
                                    max_messages=self.config.max_messages, repo=repo_path, refs=refs)
@@ -1054,7 +1169,7 @@ class Service:
         if repeat and old.get("request_job") is None:
             return None, False  # it pinned a revision with nothing to run
         same = self._revision_job(t) if repeat else None
-        if same and same["status"] == "done" and prev == head and self._new_pushback(t, focus):
+        if same and self._pass_gave_verdict(t, same) and prev == head and self._new_pushback(t, focus):
             # The same head again, after its pass asked for changes and the author sent
             # evidence: a pushback (#71), not a repeat of the request that pinned it.
             same = None
@@ -1155,7 +1270,8 @@ class Service:
         return self.bus._job(row) if row else None
 
     def _previous_review_set(self, reviewers: list[str], repo: str, prev_head: str, base: str, head: str,
-                             change_id: str | None, thread: str | None) -> dict | None:
+                             change_id: str | None, thread: str | None,
+                             review_only: bool | None = None) -> dict | None:
         """The requester's several-reviewer thread (same reviewers, same repo) to continue.
 
         ``thread`` names it outright.  Otherwise, among the threads that have seen
@@ -1168,6 +1284,9 @@ class Service:
             if (t["kind"] != "review" or t["initiator"] != self.agent or t["repo"] != repo
                     or set(refs.get("reviewers") or []) != set(reviewers) or t["status"] == "cancelled"):
                 raise ValueError(f"{thread} is not your review of this repo by {', '.join(reviewers)}")
+            if refs.get("finished"):
+                raise BusError("THREAD_CLOSED", f"{thread} was finished with finish_review; start a new review "
+                               "(without `thread`) to review this change again")
             if prev_head not in self._heads(t):
                 raise BusError("REVIEW_STALE", f"{thread} has never been at head {prev_head[:12]}")
             return t
@@ -1176,7 +1295,7 @@ class Service:
                                " ORDER BY created_at DESC", self.agent, repo):
             t = self.bus.thread(r["id"])
             refs = t["refs"] or {}
-            if set(refs.get("reviewers") or []) == set(reviewers) and t["status"] != "cancelled" \
+            if set(refs.get("reviewers") or []) == set(reviewers) and not self._closed(t) \
                     and prev_head in self._heads(t):
                 found.append(t)
         if change_id is not None:
@@ -1184,6 +1303,7 @@ class Service:
             # request adds the label), never threads labelled otherwise.
             found = ([t for t in found if t["refs"].get("change_id") == change_id]
                      or [t for t in found if t["refs"].get("change_id") is None])
+        found = self._prefer_mode(found, review_only)
         exact = [t for t in found if t["refs"].get("request") == [base, prev_head, head]]
         if exact:
             found = exact
@@ -1198,7 +1318,8 @@ class Service:
         refs = t["refs"] or {}
         return list(refs.get("heads") or [refs.get("head_commit_id")])
 
-    def _previous_review(self, reviewer: str, repo: str, prev_head: str, request: list) -> dict | None:
+    def _previous_review(self, reviewer: str, repo: str, prev_head: str, request: list,
+                         review_only: bool | None = None) -> dict | None:
         """The requester's review thread with this reviewer to continue: the one this exact
         request pinned (a repeat, even if a newer thread has since seen ``prev_head``), else
         the newest that has reviewed ``prev_head`` at any point (not only as its current
@@ -1209,14 +1330,94 @@ class Service:
                                " ORDER BY created_at DESC", self.agent, repo):
             t = self.bus.thread(r["id"])
             if (t["refs"] or {}).get("reviewer") == reviewer and not (t["refs"] or {}).get("reviewers") \
-                    and t["status"] != "cancelled":
+                    and not self._closed(t):
                 mine.append(t)
-        exact = [t for t in mine if self._pinned_request(t) == request]
+        # Among the threads that could take this request (a repeat or a lineage), the mode it
+        # names, before a repeat is preferred (#145).
+        mine = [t for t in mine if self._pinned_request(t) == request or prev_head in self._heads(t)]
+        mine = self._prefer_mode(mine, review_only)
+        exact = self._pick_mode([t for t in mine if self._pinned_request(t) == request], review_only, prev_head)
         if exact:
             # A fresh review that named this previous head without any lineage is pinned to
             # this request but never saw prev_head: its repeat is the fresh path's.
             return exact[0] if prev_head in self._heads(exact[0]) else None
-        return next((t for t in mine if prev_head in self._heads(t)), None)
+        lineage = self._pick_mode([t for t in mine if prev_head in self._heads(t)], review_only, prev_head)
+        return lineage[0] if lineage else None
+
+    def finish_review(self, thread: str, reason: str) -> dict:
+        """End a review without every required reviewer's approval (#145): the initiator (or the
+        human user) has what it needs, say from a review-only review of someone else's change.
+        The thread is resolved, with a record of who finished it, why, and the blocking findings
+        and unreviewed reviewers it left open, so it can be debriefed.  Nothing may be running."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason is required: say why the review ends without every approval")
+        if len(reason) > MAX_TESTING_NOTE:
+            raise ValueError(f"reason must be at most {MAX_TESTING_NOTE} characters")
+        reason = " ".join(reason.split())
+        t = self.bus.thread(thread)
+        if t["kind"] != "review":
+            raise ValueError(f"{thread} is a {t['kind']} thread; only reviews can be finished")
+        if self.agent not in (t["initiator"], HUMAN):
+            raise BusError("NOT_INITIATOR", "only the review's initiator (or the human user) can finish it")
+        self.bus.reap()
+        with self.bus.tx():
+            t = self.bus.thread(thread)  # decided again inside the transaction
+            refs = t["refs"] or {}
+            if refs.get("finished"):
+                raise BusError("THREAD_CLOSED", f"{thread} is already finished; debrief it or read its history")
+            if t["status"] == "cancelled":
+                raise BusError("THREAD_CANCELLED", f"{thread} was cancelled")
+            if t["status"] == "resolved":
+                raise BusError("THREAD_CLOSED", f"{thread} is already resolved: every required reviewer approved")
+            if self.bus.active_job(thread):
+                raise BusError("THREAD_BUSY", f"{thread} has a pass running; wait for its verdict, then finish it "
+                               "(or ask the human user to cancel it)")
+            st = self.bus.review_standings(thread)
+            if st["complete"]:
+                # Every approval is in (a worker died before resolving it): it is simply approved.
+                self._finish_complete(t, refs.get("head_commit_id") or "")
+            else:
+                self._record_finish(t, st, reason)
+            if self.agent == HUMAN:  # in the same transaction, on either path (#108)
+                self.bus.record_human_action(thread, detail={"finish": reason})
+        t = self.bus.thread(thread)
+        return {"thread": thread_summary(t), **self.review_state(t),
+                "next": f"Call debrief(\"{thread}\") to ask the reviewers what got in their way."}
+
+    def _record_finish(self, t: dict, st: dict, reason: str) -> None:
+        """Resolve ``t`` as finished without every approval (#145), inside the caller's
+        transaction: the record (who, why, the head, the blocking findings and reviewers left
+        open) and its notice."""
+        thread, refs = t["id"], t["refs"] or {}
+        # Each reviewer's blocking findings from its latest verdict, unless it has approved the
+        # current head since: confirmed at this head, or left unsettled at an earlier one (a
+        # reviewer that hadn't reached the new head yet).
+        left, earlier = [], {}
+        for r, state in st["reviewers"].items():
+            verdict = self.bus.last_verdict(thread, r)
+            if state["state"] == "approved" or verdict is None or verdict["data"].get("verdict") != "request_changes":
+                continue
+            ids = [f["id"] for f in (verdict["data"].get("findings") or [])
+                   if isinstance(f, dict) and f.get("id") and worker.blocks(f)]
+            if state["state"] == "changes_requested":
+                left += ids
+            else:
+                at = {"head_commit_id": verdict["data"].get("head_commit_id"),
+                      "base_commit_id": verdict["data"].get("base_commit_id")}
+                earlier.update({fid: at for fid in ids})
+        finished = {"by": self.agent, "reason": reason, "head_commit_id": refs.get("head_commit_id"),
+                    "open_findings": left, "earlier_open_findings": earlier, "approved": st["approved"],
+                    "changes_requested": st["changes_requested"], "pending": st["pending"],
+                    "at": round(time.time())}
+        note = provenance.peer_note(self.bus.human_provenance) if self.agent == HUMAN else ""
+        if note:  # the marker a flagged human message gets (#108), never the provenance itself
+            finished["reason_provenance"] = note
+        autoresume.forget(self.bus, thread)  # finished: no automatic resume either
+        self.bus.set_thread(thread, status="resolved", refs=json.dumps({**refs, "finished": finished}))
+        by = "the human user" if self.agent == HUMAN else self.agent
+        self.bus.post(thread, SYSTEM, f"Review {finished_line({**finished, 'by': by})}.\n{worker.format_review(st)}\n"
+                      "It is resolved now and can be debriefed; a new head needs a new review.", kind="status",
+                      recipient=None if t["initiator"] in (HUMAN, self.agent) else t["initiator"])
 
     def debrief(self, thread: str, question: str | None = None, peers: list[str] | None = None) -> dict:
         """Ask a finished review's or discussion's headless peers for feedback, each in its own
@@ -1246,11 +1447,11 @@ class Service:
         self.bus.reap()
         with self.bus.tx():
             t = self.bus.thread(thread)  # decided again inside the transaction
-            if t["status"] not in ("resolved", "needs_human"):
-                fix = (" (a review that asked for changes stays open until it is approved)"
-                       if t["kind"] == "review" and t["status"] == "open" else "")
-                raise BusError("THREAD_NOT_FINISHED", f"{thread} is {t['status']}; only a resolved or needs_human "
-                               f"thread can be debriefed{fix}")
+            # A cancelled thread too, for the peers that finished a turn there (#145): they have
+            # a session that remembers it.
+            turned = self._finished_turns(t, headless) if t["status"] == "cancelled" else set(headless)
+            if t["status"] not in ("resolved", "needs_human", "cancelled") or not turned:
+                raise BusError("THREAD_NOT_FINISHED", self._not_finished(t))
             if self.bus.active_job(thread):
                 raise BusError("THREAD_BUSY", f"{thread} has a job running; wait for it to finish")
             done = self._debriefed(t)
@@ -1263,6 +1464,9 @@ class Service:
                 elif self.bus.peer_session(thread, p) is None:
                     why = ("NO_SESSION", f"{p} has no stored session on {thread} to resume, and a fresh session "
                            "would not remember the thread")
+                elif p not in turned:
+                    why = ("NO_SESSION", f"{p} finished no turn on {thread} before it was cancelled, so it has "
+                           "nothing to debrief")
                 else:
                     try:
                         self.config.require_available(p, "peer")
@@ -1298,6 +1502,29 @@ class Service:
                        "thread's status or verdicts.")
         return res
 
+    def _finished_turns(self, t: dict, peers: list[str]) -> set[str]:
+        """The peers that finished a turn on ``t``: a worker posted that turn's outcome there (a
+        verdict, a proposal or vote, a debrief), not just a note sent under the peer's name."""
+        return {r["sender"] for r in self.bus._all(
+            "SELECT DISTINCT sender FROM messages WHERE thread_id=? AND session_id LIKE 'job:%'"
+            " AND kind IN ('review_verdict','proposal','vote','debrief')", t["id"]) if r["sender"] in peers}
+
+    @staticmethod
+    def _not_finished(t: dict) -> str:
+        """THREAD_NOT_FINISHED's message: why ``t`` can't be debriefed yet, and how it gets
+        there (#145)."""
+        tid, head = t["id"], f"{t['id']} is {t['status']}"
+        if t["status"] == "cancelled":
+            return (f"{head} and no peer finished a turn on it before that, so none has anything to debrief")
+        if t["kind"] == "review":
+            return (f"{head}: only a resolved, needs_human or cancelled thread can be debriefed. A review that "
+                    "asked for changes stays open until every required reviewer approves; to end it now, call "
+                    f"finish_review(\"{tid}\", reason) (the human user: `agent-bus finish {tid} --reason ...`) "
+                    "once no pass is running, then debrief it")
+        return (f"{head}: only a resolved, needs_human or cancelled thread can be debriefed. A discussion "
+                "finishes when every participant agrees on a proposal (resolved) or when it runs out of rounds "
+                "or passes its deadline (needs_human): wait for that, or ask the human user to cancel it")
+
     def _debriefed(self, t: dict) -> set[str]:
         """Peers whose debrief on ``t`` already counts: an answer since the human user last
         resumed the thread.  A debrief that got no answer can be asked for again."""
@@ -1328,6 +1555,8 @@ class Service:
         t = self.bus.thread(thread)
         if t["status"] in ("resolved",):
             raise BusError("THREAD_CLOSED", "thread is already resolved")
+        if (t["refs"] or {}).get("finished"):
+            raise BusError("THREAD_CLOSED", f"{thread} was finished with finish_review; a new head needs a new review")
         job = self.bus.active_job(thread)
         if job and job["kind"] == "debrief":
             # Its job would stand in for the resumed thread's own (one job per thread).
@@ -1447,6 +1676,12 @@ class Service:
             # worker died before doing so) resolves a complete review and posts the outcome.
             return False
         return self._has_verdict_for_head(t)
+
+    def _pass_gave_verdict(self, t: dict, job: dict) -> bool:
+        """Whether ``job``, the current revision's pass, is over with a verdict to push back on:
+        done, or failed (or cancelled) after posting its verdict on the current head (#146)."""
+        return job["status"] == "done" or (job["status"] not in ("queued", "running")
+                                           and self._has_verdict_for_head(t))
 
     def _has_verdict_for_head(self, t: dict) -> bool:
         """A verdict on the current head in the current round (a thread can return to a head

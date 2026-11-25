@@ -139,8 +139,8 @@ Severity, and what blocks approval:
   choice that would be hard to reverse.
 - low (non-blocking): style or naming, minor cleanup, speculative hardening, rare edge cases,
   or ideas for a follow-up.
-Use "request_changes" if and only if at least one finding is high or medium; otherwise
-"approve", listing any low findings as non-blocking notes."""
+Use "request_changes" if and only if at least one finding is high or medium and not
+pre_existing; otherwise "approve", listing any low or pre-existing findings as non-blocking notes."""
 
 # How every review pass ends (#93).  Not a .format() template: it goes in as a value, and
 # its example is valid JSON, with the alternatives in prose rather than inside the JSON.
@@ -150,7 +150,9 @@ fields are posted to the thread: any text before the object is dropped, so put e
 author needs in "summary" and "findings". For example:
 {"verdict": "request_changes", "summary": "One paragraph.", "findings": [{"file": "src/app.py", "line": 12, "severity": "high", "comment": "What is wrong and why."}]}
 "verdict" is "approve" or "request_changes"; "line" is an integer, or null for a whole-file
-finding; "severity" is "high", "medium" or "low"; "findings" may be an empty list. The object
+finding; "severity" is "high", "medium" or "low"; "findings" may be an empty list. Add
+"pre_existing": true to a finding about a problem already in the base that the change neither
+introduces nor makes worse: it is listed apart and never blocks. The object
 may span several lines. A long "summary" can go in a block instead, so it needs no JSON escaping:
 leave "summary" out of the JSON and put the text just before the JSON object, between a line
 ~~~~body and a line ~~~~ (four tildes each)."""
