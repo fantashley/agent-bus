@@ -2,6 +2,19 @@
 
 ## [0.3.0](https://github.com/fantashley/agent-bus/compare/v0.2.1...v0.3.0) (2026-11-25)
 
+### Behaviour changes
+
+Check these when upgrading from 0.2.x:
+
+1. **Some checkouts are refused.** A peer turn fails, rather than running, when the checkout's own config could act outside a read-only turn: for Antigravity, the workspace's own hooks, MCP servers or plugins (a non-empty `plugins.json`); for Codex, a `.codex/config.toml` that sets `sqlite_home`, `log_dir` or the `js_repl` node path or modules; for Copilot CLI, repository hooks (unless `disableAllHooks` is set in `.github/copilot/settings.json` or `settings.local.json`) or a non-empty `.github/lsp.json`. Switch them off in the checkout, or review it some other way.
+2. **Codex peer turns run no hooks, rules or plugins**, your own included (`--ignore-rules`, and the `hooks` and `plugins` features off).
+3. **A single-reviewer review stays `open` after `request_changes`**, waiting for your fix or pushback, as multi-reviewer reviews already did (until the follow-up limit, when it goes to `needs_human`). It used to resolve.
+4. **`docs/AGENTS-section.md` is gone**: the `agent-bus` skill and the MCP server's instructions replace it. If you pasted that section into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` or similar, delete it after upgrading.
+5. **Claude Code peers run with `--permission-mode dontAsk`**, which denies any tool call that isn't allowed instead of prompting.
+6. **Antigravity peers no longer pass `--mode plan`**; they keep `--sandbox` and a read-only custom agent.
+7. **Review-only reviews** (`review_only=true`) follow someone else's change across their pushes with no follow-up limit (a usage limit can still pause them), and the new `agent-bus-pr-review` skill relays them as a draft GitHub review that you approve before anything is posted.
+8. **Provenance and evidence.** Every human action records where it came from, and `history` flags a suspicious one with `!!` lines (posted from an agent's shell, with `AGENT_BUS_ALLOW_HUMAN=1`, or without a terminal). `start_discussion` and `request_review` take `evidence`: read-only facts every peer gets in full.
+
 
 ### Features
 
@@ -13,6 +26,7 @@
 * let reviewers read files exactly as of the pinned head from a read-only snapshot ([#116](https://github.com/fantashley/agent-bus/issues/116)) ([335daaa](https://github.com/fantashley/agent-bus/commit/335daaa7218b8a199aa8d167cde4199886e057e1))
 * per-participant codex_home for Codex usage readings ([#78](https://github.com/fantashley/agent-bus/issues/78)) ([44838a9](https://github.com/fantashley/agent-bus/commit/44838a98d1ceef776881770dc5b42d6dc943b0e6))
 * per-repo peer web search switch and headless tool hardening ([#77](https://github.com/fantashley/agent-bus/issues/77)) ([2f3e35b](https://github.com/fantashley/agent-bus/commit/2f3e35bf9522e43721f2b74897f9be51da003fa4))
+* PR review bridge skill (agent-bus-pr-review); review-only reviews have no follow-up limit ([#150](https://github.com/fantashley/agent-bus/issues/150)) ([393b71b](https://github.com/fantashley/agent-bus/commit/393b71b70a2977e973ebd9b2b2c529b648395449))
 * record provenance with every human action and flag suspicious ones ([#131](https://github.com/fantashley/agent-bus/issues/131)) ([742b029](https://github.com/fantashley/agent-bus/commit/742b0296be7c1856db4d9e8d399fada76200d978))
 * record token usage per turn and add agent-bus usage ([#61](https://github.com/fantashley/agent-bus/issues/61)) ([38ce49a](https://github.com/fantashley/agent-bus/commit/38ce49a0737fba3fefb92244019890ba5fc25ee6))
 * resume threads parked by a usage limit once it resets ([#63](https://github.com/fantashley/agent-bus/issues/63)) ([8fdfe77](https://github.com/fantashley/agent-bus/commit/8fdfe775a0ce5b4d8976ce7e5f577a17ca06a980))
@@ -42,7 +56,6 @@
 * give shell reviewers read-only jj commands in jj repos ([#104](https://github.com/fantashley/agent-bus/issues/104)) ([faba6f1](https://github.com/fantashley/agent-bus/commit/faba6f1f606b83d1a6988b3a8b5214b566a4fc16))
 * headless peers' rules outrank their harness's interactive-mode instructions ([#112](https://github.com/fantashley/agent-bus/issues/112)) ([616e982](https://github.com/fantashley/agent-bus/commit/616e98203e2f5bdda9cd1835952bc8b93a863e9c))
 * keep a reviewed checkout's own hooks and config out of peer turns ([#123](https://github.com/fantashley/agent-bus/issues/123)) ([b60db49](https://github.com/fantashley/agent-bus/commit/b60db49a0d6a8f7f5cde4a0e4a8314606f2d1a98))
-* keep a single-reviewer review open after request_changes ([#144](https://github.com/fantashley/agent-bus/issues/144)) ([ccb6aa4](https://github.com/fantashley/agent-bus/commit/ccb6aa4f89b07367d3ccc34a9366355696b5150e))
 * keep a single-reviewer review open after request_changes ([#144](https://github.com/fantashley/agent-bus/issues/144)) ([28c704d](https://github.com/fantashley/agent-bus/commit/28c704d06f24374bb842dc37dabe7bdb57c7a1f5))
 * keep Claude Code on the current agent-bus build after upgrades ([#85](https://github.com/fantashley/agent-bus/issues/85)) ([59df08d](https://github.com/fantashley/agent-bus/commit/59df08db7f5ab66ea576aa86bf473afeae806966))
 * keep session state when the deadline gate skips a turn; hedge the headless final-message note ([#128](https://github.com/fantashley/agent-bus/issues/128)) ([bb6bb07](https://github.com/fantashley/agent-bus/commit/bb6bb07024187e650288b042640696e9f0c5df7b))
