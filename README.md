@@ -50,6 +50,7 @@ run are left out of it (see [Wiring up clients](#wiring-up-clients)).
 | `reply` | your say on a thread, as the human user |
 | `resume` | a stuck thread moving again: more rounds, or a retry of what failed |
 | `cancel` | threads stopped and dismissed, several at once |
+| `finish` | a review ended without every approval, its open findings recorded |
 | `debrief` | a finished thread's agents on what got in their way |
 | `agents`, `usage` | which agents you have, whether they're out of usage, and tokens used |
 | `watch` | inside Rex: panes following a thread and each agent on it |
@@ -149,9 +150,32 @@ commit made with plain git is found through git, so `jj git import` is only need
 has no `.git`. A commit that goes missing after the request (an amend and `git gc`, say) is still
 reported on the thread by the worker, which then waits for the human user.
 
-A review thread is `resolved` only once its reviewer approves. After a request for changes it
-stays `open`, waiting for your fix or pushback (`next_action` says `fix: ...`), the same with one
-reviewer as with several; a debrief has to wait until it is resolved (or `needs_human`).
+A review thread is `resolved` once its reviewer approves, or when its initiator finishes it
+(below). After a request for changes it stays `open`, waiting for your fix or pushback
+(`next_action` says `fix: ...`), the same with one reviewer as with several; a debrief has to
+wait until it is resolved (or `needs_human`).
+
+**Reviewing someone else's change** (#145). `request_review(..., review_only=true)` marks a
+review whose initiator isn't the change's author, say a colleague's pull request. A request for
+changes then waits for the author's next head instead of the initiator's fix: `next_action` says
+`await_head: ...`, and the multi-reviewer notice says the same. When the author pushes, the
+initiator requests the new head as an ordinary follow-up (`prev_head_commit_id`), so the
+interdiff and finding settlement work as usual. The flag is set when the review starts and kept
+by its follow-ups (a fresh request of the other kind for the same diff is a separate review);
+`threads` and `history` show `review_only: true`.
+
+**Finishing a review without every approval** (#145). The initiator calls
+`finish_review(thread, reason)` (the human user: `agent-bus finish <thread> --reason …`), once no
+pass is running (`THREAD_BUSY` otherwise). The thread becomes `resolved` with a `finished` record:
+who, the reason (fenced as peer data when an agent wrote it; a human reason whose provenance is
+flagged carries `reason_provenance`), the head, the blocking finding ids left open at that head,
+any a reviewer left unsettled at an earlier head (`earlier_open_findings`, with that head), and
+any required reviewer that hadn't reviewed the head. `threads`, `history`, `tail` and `wait`'s
+`next_action` (`done: finished by … without every approval; blocking findings left open:
+codex-2`) all show it. A finished review is terminal: it takes no more follow-ups (one naming
+it with `thread` is refused with `THREAD_CLOSED`; one without starts a new review), `agent-bus
+resume` refuses it, and `agent-bus cancel` only stops
+a debrief running on it. It can be debriefed.
 
 For the next pass, request again with `prev_head_commit_id` set to the thread's current head.
 That continues the **same thread** and **resumes the reviewer's own conversation**, so it remembers
@@ -228,6 +252,11 @@ verdict requests changes if and only if it has a `high` or `medium` finding. One
 that rule gets one repair turn, then the thread goes to `needs_human`. Verdicts show each
 finding as e.g. `[medium, blocking]` or `[low, non-blocking]`.
 
+A reviewer can mark a finding `"pre_existing": true`: a problem already in the base that the
+change neither introduces nor makes worse (#145). It never blocks, whatever its severity, and the
+verdict lists it apart, under "Pre-existing", as e.g. `[high, pre-existing]`, with its own stable
+id. The flag stays in the verdict's `data.findings`.
+
 After a reviewer's first verdict, its later passes converge: they settle each earlier blocking
 finding (fixed, withdrawn or still blocking), and a new blocking finding must come from behavior
 the latest changes introduced or exposed, unless it is a newly substantiated `high`.
@@ -255,10 +284,13 @@ tool access and denials, the sandbox, diffs, the verdict or vote format), the th
 calls `debrief(thread, question?, peers?)`, or the human runs `agent-bus debrief <thread>
 [--question …] [--peer codex]`:
 
-- It works on a finished thread (`resolved` or `needs_human`) with no job running. A review
-  that asked for changes is still `open` (it waits for the author's fix), so it can't be
-  debriefed until it is approved or parked. Agents can debrief only threads they started; the
-  human user can debrief any.
+- It works on a finished thread (`resolved`, including a finished review, or `needs_human`)
+  with no job running, and on a `cancelled` one for the peers that finished a turn there (each
+  posted a verdict, proposal, vote or debrief; the rest are left out with `NO_SESSION`). A
+  review that asked for changes is still `open` (it waits for the author's fix), so it can't be
+  debriefed until it is approved or parked, or until `finish_review` ends it; the
+  `THREAD_NOT_FINISHED` error says so. Agents can debrief only threads they started; the human
+  user can debrief any.
 - Each peer (default: every headless peer on the thread) gets **one turn in its own resumed
   session** on the thread, so it answers from memory. It is an ordinary turn: the same
   participant settings, env and `CODEX_HOME`, the same read-only hardening for each harness,
@@ -666,6 +698,7 @@ agent-bus tail t-1a2b3c [--peer codex|--events|--events-only]
 agent-bus reply t-1a2b3c "Prefer the simpler option" [--to codex]
 agent-bus cancel t-1a2b3c
 agent-bus resume t-1a2b3c --rounds 2
+agent-bus finish t-1a2b3c --reason "merged upstream"   # end a review without every approval
 agent-bus debrief t-1a2b3c        # a finished thread's peers give feedback (see Debriefs)
 agent-bus watch t-1a2b3c          # inside Rex: open viewer panes
 ```
@@ -684,7 +717,7 @@ failure as each arrives.
 
 ### Commands only you can run
 
-`ask`, `reply`, `resume`, `cancel`, `debrief` and `agents --clear-quota` act as you: what
+`ask`, `reply`, `resume`, `cancel`, `finish`, `debrief` and `agents --clear-quota` act as you: what
 `reply` posts carries `trust: "human"`. So they refuse to run (`HUMAN_ONLY`, exit 2) in what
 looks like an agent's shell: one of `AI_AGENT`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
 `CODEX_THREAD_ID`, `CODEX_SANDBOX` or `CODEX_CI` is set, or a parent process is `claude`,
@@ -712,7 +745,7 @@ not a security boundary (agreed on agent-bus thread t-fc8b3b). See the trust bou
    the terminal on stdin/stdout/stderr and whether it is the process's controlling terminal, whether `AGENT_BUS_ALLOW_HUMAN=1` was set, and which of
    the harness variables above were set (names only, never values). It goes with the
    `trust: "human"` message it posted (`ask`, `reply`), or stands alone as an action
-   (`resume`, `cancel`, `debrief`, `agents --clear-quota`).
+   (`resume`, `cancel`, `finish`, `debrief`, `agents --clear-quota`).
 
 #### What the redaction keeps
 

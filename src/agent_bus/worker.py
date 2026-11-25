@@ -283,7 +283,8 @@ class Worker:
             return True
         t = self.bus.thread(self.thread_id)
         j = self.bus.job(self.job["id"])
-        if t["status"] == "cancelled" or j["status"] == "cancelled":
+        # A debrief may run on a cancelled thread (#145): only cancelling its own job stops it.
+        if (t["status"] == "cancelled" and not self.debriefing) or j["status"] == "cancelled":
             self._stop.set()
         elif j["lease_owner"] != self.owner or j["status"] != "running":
             self._lost.set()  # reaped or taken over
@@ -1156,6 +1157,15 @@ class Worker:
         who = ', '.join(st['changes_requested']) or refs['reviewer']
         if self.park_over_budget(t, f"{who} requested changes at head {head[:12]}.\n{board}"):
             return
+        if refs.get("review_only"):
+            # The initiator isn't the change's author (#145): it waits for the author's next head.
+            self.system(f"{who} requested changes at head {head[:12]}.\n{board}\nThis review is review-only: the "
+                        "change's author addresses the findings. When they push a new head, call request_review "
+                        f"with the same reviewers, the new head_commit_id and prev_head_commit_id={head} (send "
+                        "their replies here as a note first); a new head makes every earlier approval stale. To "
+                        f"end the review now, call finish_review(\"{self.thread_id}\", reason)."
+                        + budget_warning(t), recipient=to)
+            return
         self.system(f"{who} requested changes at head "
                     f"{head[:12]}.\n{board}\nAddress the findings, `send` a note here on each by id, then call "
                     f"request_review with the same reviewers, the new head_commit_id and prev_head_commit_id="
@@ -1328,7 +1338,10 @@ class Worker:
             self.mark_delivered(reviewer, upto)
             self.record_listing(refs, snap, resume and pushback)
         raw = extract_reply(res.text, "summary") if res.text else None
-        verdict = settle_earlier(normalize_verdict(raw), prior)
+        # Its earlier pre-existing findings keep their ids when it lists them again (#145).
+        reusable = {f["id"] for m in earlier for f in m["data"].get("findings") or []
+                    if isinstance(f, dict) and f.get("pre_existing") and isinstance(f.get("id"), str)}
+        verdict = settle_earlier(normalize_verdict(raw), prior, reusable)
         gave = res  # the turn the verdict came from
         problem = (verdict_problem(verdict) or settlement_problem(verdict, prior)) if verdict else None
         if (verdict is None or problem) and res.ok:
@@ -1360,7 +1373,7 @@ class Worker:
                 if "earlier" not in raw2:
                     relisted = {f["id"] for f in verdict["findings"] if f["id"]}
                     verdict["earlier"] = [e for e in first["earlier"] if e["id"] not in relisted]
-            verdict = settle_earlier(verdict, prior)
+            verdict = settle_earlier(verdict, prior, reusable)
             problem = (verdict_problem(verdict) or settlement_problem(verdict, prior)) if verdict else None
         elif problem:
             verdict = None  # an inconsistent verdict with no repair turn: not usable
@@ -1377,11 +1390,19 @@ class Worker:
             lines += ["", "Earlier findings:"]
             lines += [f"- {e['id']} {e['status'].replace('_', ' ')}" + (f": {e['note']}" if e["note"] else "")
                       for e in verdict["earlier"]]
-        if verdict["earlier"] and verdict["findings"]:
+        # Problems already in the base are listed apart, and never block (#145).
+        introduced = [f for f in verdict["findings"] if not f.get("pre_existing")]
+        pre = [f for f in verdict["findings"] if f.get("pre_existing")]
+        if verdict["earlier"] and introduced:
             lines += ["", "Findings:"]
-        for f in verdict["findings"]:
+        for f in introduced:
             loc = f"{f['file']}:{f['line']}" if f["line"] else f["file"]
             lines.append(f"- [{severity_tag(f['severity'])}] {f['id']} {loc}: {f['comment']}")
+        if pre:
+            lines += ["", "Pre-existing (already in the base, not introduced by this change; non-blocking):"]
+        for f in pre:
+            loc = f"{f['file']}:{f['line']}" if f["line"] else f["file"]
+            lines.append(f"- [{severity_tag(f['severity'], pre_existing=True)}] {f['id']} {loc}: {f['comment']}")
         # The session that gave the verdict, so a later pass resumes it only if it is still
         # the saved one (see interdiff_from).  That turn's own id: a turn that failed without
         # reporting one leaves an older session saved, which never saw this pass.
@@ -2124,7 +2145,9 @@ def normalize_verdict(v: object) -> dict | None:
                       "severity": f.get("severity") if f.get("severity") in ("high", "medium", "low") else "?",
                       "comment": str(f.get("comment") or "")[:4000],
                       # An earlier finding's id, when it raises that one again (#101); checked later.
-                      "id": f["id"] if isinstance(f.get("id"), str) and FINDING_ID.fullmatch(f["id"]) else None})
+                      "id": f["id"] if isinstance(f.get("id"), str) and FINDING_ID.fullmatch(f["id"]) else None,
+                      # Already in the base, not introduced by the change: never blocks (#145).
+                      **({"pre_existing": True} if f.get("pre_existing") is True else {})})
     earlier = []
     for e in v.get("earlier") if isinstance(v.get("earlier"), list) else []:
         if (isinstance(e, dict) and isinstance(e.get("id"), str) and FINDING_ID.fullmatch(e["id"])
@@ -2146,7 +2169,7 @@ def prior_blocking(mine: dict | None) -> dict[str, dict]:
     if mine is None or mine["data"].get("verdict") != "request_changes":
         return {}
     return {f["id"]: f for f in mine["data"].get("findings") or []
-            if isinstance(f, dict) and f.get("id") and f.get("severity") in BLOCKING}
+            if isinstance(f, dict) and f.get("id") and blocks(f)}
 
 
 # How much of the earlier blocking findings' text a follow-up prompt quotes in all (#126):
@@ -2202,12 +2225,13 @@ def verdict_format(prior: dict[str, dict]) -> str:
         ids=", ".join(ids), example=first, still=json.dumps(still), done=json.dumps(done))
 
 
-def settle_earlier(v: dict | None, prior: dict[str, dict]) -> dict | None:
+def settle_earlier(v: dict | None, prior: dict[str, dict], reusable: set[str] = frozenset()) -> dict | None:
     """Keep only the settlements of this reviewer's own earlier blocking findings, at most one
     per id, and carry a finding it calls still blocking (or that a request for changes leaves
     unsaid) into "findings" with its id, unless it lists it there itself (#101), so an
     earlier blocker never drops out of the next round's list.  A finding id that isn't one of
-    its earlier ones is dropped, so the finding gets a new one."""
+    its earlier ones is dropped, so the finding gets a new one, except the id of one of its
+    earlier pre-existing findings (``reusable``, #145): that stays stable too."""
     if v is None:
         return None
     seen: dict[str, dict] = {}
@@ -2217,7 +2241,7 @@ def settle_earlier(v: dict | None, prior: dict[str, dict]) -> dict | None:
     v["earlier"] = list(seen.values())
     listed = set()
     for f in v["findings"]:
-        if f["id"] not in prior or f["id"] in listed:
+        if (f["id"] not in prior and f["id"] not in reusable) or f["id"] in listed:
             f["id"] = None
         else:
             listed.add(f["id"])
@@ -2229,7 +2253,7 @@ def settle_earlier(v: dict | None, prior: dict[str, dict]) -> dict | None:
         if carry and fid not in listed:
             v["findings"].append({"file": str(old.get("file") or "?"), "line": old.get("line"),
                                   "severity": old.get("severity"), "comment": str(old.get("comment") or ""),
-                                  "id": fid})
+                                  "id": fid})  # a blocking one: never pre-existing (prior_blocking)
     return v
 
 
@@ -2241,17 +2265,23 @@ def settlement_problem(v: dict, prior: dict[str, dict]) -> str | None:
     request for changes carries whatever it leaves unsaid (settle_earlier), so it stays open.
     Run after settle_earlier."""
     settled = {e["id"]: e["status"] for e in v["earlier"]}
-    listed = {f["id"]: f["severity"] for f in v["findings"] if f["id"] in prior}
+    listed = {f["id"]: f for f in v["findings"] if f["id"] in prior}
     missing = [fid for fid in prior if fid not in settled and fid not in listed]
     if missing and v["verdict"] == "approve":
         return (f"settle each earlier blocking finding in \"earlier\" ({', '.join(missing)} "
                 f"{'has' if len(missing) == 1 else 'have'} no entry): fixed, withdrawn or still_blocking")
     for fid, status in settled.items():
-        sev = listed.get(fid)
-        if status == "still_blocking" and sev == "low":
+        f = listed.get(fid)
+        if f is None:
+            continue
+        if status == "still_blocking" and not blocks(f):
+            if f.get("pre_existing"):
+                return (f"{fid} is still_blocking but listed as pre_existing, which never blocks: drop "
+                        "pre_existing, or settle it otherwise")
             return f"{fid} is still_blocking but listed as low: make it high or medium, or settle it otherwise"
-        if status in ("fixed", "withdrawn") and sev in BLOCKING:
-            return f"{fid} is {status} but still listed as {sev}: drop it from findings, or call it still_blocking"
+        if status in ("fixed", "withdrawn") and blocks(f):
+            return (f"{fid} is {status} but still listed as {f['severity']}: drop it from findings, or call it "
+                    "still_blocking")
     return None
 
 
@@ -2270,21 +2300,29 @@ def number_findings(reviewer: str, findings: list[dict], earlier: list[dict]) ->
 BLOCKING = ("high", "medium")
 
 
+def blocks(f: dict) -> bool:
+    """Whether a finding blocks approval: high or medium, and not pre-existing (#145)."""
+    return f.get("severity") in BLOCKING and not f.get("pre_existing")
+
+
 def verdict_problem(v: dict) -> str | None:
     """Why a verdict breaks the severity rule (#71), or None: it requests changes if and
-    only if a finding is high or medium."""
+    only if a finding is high or medium and not pre-existing (#145)."""
     if any(f["severity"] not in (*BLOCKING, "low") for f in v["findings"]):
         return "every finding needs a severity of high, medium or low"
-    blocking = any(f["severity"] in BLOCKING for f in v["findings"])
+    blocking = any(blocks(f) for f in v["findings"])
     if v["verdict"] == "request_changes" and not blocking:
-        return "request_changes needs at least one high or medium finding; with none, approve"
+        return ("request_changes needs at least one high or medium finding the change introduces (pre_existing "
+                "ones don't block); with none, approve")
     if v["verdict"] == "approve" and blocking:
         return "a high or medium finding blocks approval; request changes, or downgrade it to low"
     return None
 
 
-def severity_tag(severity: str) -> str:
-    """``high, blocking`` / ``low, non-blocking`` for a rendered finding."""
+def severity_tag(severity: str, pre_existing: bool = False) -> str:
+    """``high, blocking`` / ``low, non-blocking`` / ``high, pre-existing`` for a rendered finding."""
+    if pre_existing:
+        return f"{severity}, pre-existing"
     if severity in BLOCKING:
         return f"{severity}, blocking"
     return f"{severity}, non-blocking" if severity == "low" else severity

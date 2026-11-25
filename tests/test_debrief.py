@@ -59,7 +59,9 @@ def reviewed(env, reviewer):
     assert bus.thread(tid)["status"] == "open"  # changes requested: not debriefable yet (#143)
     with pytest.raises(BusError) as e:
         svc.debrief(tid)
-    assert e.value.code == "THREAD_NOT_FINISHED" and "stays open until it is approved" in str(e.value)
+    assert e.value.code == "THREAD_NOT_FINISHED"
+    assert "stays open until every required reviewer approves" in str(e.value)
+    assert f"finish_review(\"{tid}\"" in str(e.value)
     svc.send("fixed it", thread=tid)
     assert svc.request_review(reviewer, str(repo), base, head2, prev_head_commit_id=head1)["thread"]["id"] == tid
     with pytest.MonkeyPatch.context() as mp:

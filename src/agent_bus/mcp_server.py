@@ -41,6 +41,8 @@ discussion, request a review or debrief a thread.
   `focus`, and facts the reviewers can't read themselves (command output, another repo's code) in
   `evidence` (start_discussion takes it too). For the next head, `send` a note on how
   you addressed each finding, then request again with prev_head_commit_id = the thread's current head.
+- To review someone else's change (you won't push the fixes), pass review_only=true; call
+  finish_review(thread, reason) to end any review of yours without every approval.
 - To ask a finished review's or discussion's peers for feedback, call debrief(thread): each answers
   in its own resumed session, and the thread's status and verdicts don't change.
 - Don't ping-pong: reply only when you have something new. Threads have hard message and round caps.
@@ -50,7 +52,8 @@ discussion, request a review or debrief a thread.
 
 
 # Service methods behind tools that change threads (see call()).
-ACTING_TOOLS = frozenset({"send", "reply", "request_review", "start_discussion", "advance_discussion", "debrief"})
+ACTING_TOOLS = frozenset({"send", "reply", "request_review", "start_discussion", "advance_discussion", "debrief",
+                          "finish_review"})
 
 
 def resolve(harness: str, participant: str | None, config: cfg.Config) -> str:
@@ -214,7 +217,7 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         {"status": "timeout"} with the thread's state and `progress`: per peer working on
         it, the turn's state, elapsed time, latest activity and tool calls. On a review thread
         every result also has `review` (approved / changes_requested / pending per reviewer at
-        the current head) and `next_action` (wait, fix, done or stop). Call again to
+        the current head) and `next_action` (wait, fix, await_head, done or stop). Call again to
         keep waiting; one wait at a time is enough (concurrent waits on a thread share what
         wakes them). after_message_id replays everything after that message, e.g. a reply lost
         when the connection dropped.
@@ -280,7 +283,8 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
                        prev_head_commit_id: str | None = None, focus: str | None = None,
                        model: str | None = None, effort: str | None = None,
                        peer_settings: dict | None = None, thread: str | None = None,
-                       testing: str | None = None, evidence: list[dict] | None = None) -> dict[str, Any]:
+                       testing: str | None = None, evidence: list[dict] | None = None,
+                       review_only: bool | None = None) -> dict[str, Any]:
         """Ask other agents for a read-only review of a pinned change in an allow-listed repo.
 
         Pin full commit ids (`git rev-parse HEAD`, or `jj log --no-graph -r @ -T commit_id` in a jj
@@ -323,18 +327,38 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         fresh session), fenced as data from you. Only the request that starts a review takes it;
         a follow-up keeps it (passing it again is refused): post anything new with send.
         `focus` says what to check; `evidence` holds the facts to check it against.
+
+        `review_only=true` is for a change you didn't write and won't fix (a colleague's pull
+        request): a request for changes then waits for the author's next head (`next_action`
+        says await_head), which you request as a follow-up with prev_head_commit_id, instead of
+        your fix. It is set when the review starts; follow-ups keep it. End such a review (or any
+        of yours) with finish_review.
         """
         return flag_stale(call(svc.request_review, reviewer=reviewer, repo=repo, change_id=change_id,
                                base_commit_id=base_commit_id, head_commit_id=head_commit_id,
                                prev_head_commit_id=prev_head_commit_id, focus=focus, model=model, effort=effort,
                                reviewers=reviewers, peer_settings=peer_settings, thread=thread,
-                               testing=testing, evidence=evidence))
+                               testing=testing, evidence=evidence, review_only=review_only))
+
+    @mcp.tool()
+    def finish_review(thread: str, reason: str) -> dict[str, Any]:
+        """End a review you started without every reviewer's approval, e.g. a review_only review
+        once the change has merged, or when you have the feedback you need.
+
+        The thread becomes resolved, with a `finished` record (who, the reason, the head, the
+        blocking finding ids left open and any reviewer that hadn't reviewed that head), and
+        `next_action` says done. A finished review takes no more follow-ups (a new head needs a
+        new review) and can be debriefed. Refused with THREAD_BUSY while a pass is running: wait
+        for its verdict first.
+        """
+        return flag_stale(call(svc.finish_review, thread=thread, reason=reason))
 
     @mcp.tool()
     def debrief(thread: str, question: str | None = None, peers: list[str] | None = None) -> dict[str, Any]:
         """Ask the peers of a finished review or discussion you started for feedback.
 
-        Works once the thread is resolved or needs_human. Each peer (default: all of them) answers
+        Works once the thread is resolved (including a finished review) or needs_human, and on a
+        cancelled thread for the peers that finished a turn there. Each peer (default: all of them) answers
         in its own resumed session on the thread, so it remembers the prompts, tool denials and
         diffs it got, and runs with the same read-only hardening and usage accounting as any turn.
         The default question asks about friction with prompts, tool access, the sandbox, diffs and

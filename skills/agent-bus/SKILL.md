@@ -33,7 +33,7 @@ and every agent-bus tool refuses you with `PEER_READ_ONLY`.
   working peer's turn state, elapsed time, latest activity, tool calls). Reviews and rounds
   often take several minutes, so call it again **while the thread is `open` and a peer is
   working or due**. Stop waiting once the thread is `resolved`, `needs_human` or `cancelled`
-  (or `waiting_for_human` is true), or a review's `next_action` says `fix:` or `done:`,
+  (or `waiting_for_human` is true), or a review's `next_action` says `fix:`, `await_head:` or `done:`,
   unless you are waiting for `debrief` replies, which arrive on an already finished thread
   (keep waiting while `progress.job.status` is `queued` or `running`). When you stop, read the latest `system` notice, and if it names a blocker
   (out of usage, a CLI format change, a missing commit, a failed pass), tell the user.
@@ -58,6 +58,7 @@ and every agent-bus tool refuses you with `PEER_READ_ONLY`.
 | `start_discussion` | get several agents to agree on a question |
 | `advance_discussion` | run one more round of a discussion you started |
 | `request_review` | get a pinned change reviewed by one or more agents |
+| `finish_review` | end a review you started without every reviewer's approval |
 | `debrief` | ask a finished thread's peers what got in their way |
 
 `send(refs={...})` can point at artifacts (a change id or branch, file paths, a PR URL) instead of
@@ -125,7 +126,7 @@ discussion.
 ## Reviews
 
 `request_review(repo, base_commit_id, head_commit_id, reviewer= | reviewers=[...], change_id?,
-prev_head_commit_id?, focus?, evidence?, testing?, thread?, model?, effort?, peer_settings?)`
+prev_head_commit_id?, focus?, evidence?, testing?, thread?, model?, effort?, peer_settings?, review_only?)`
 
 - **Pin commit ids.** Use full ids: `git rev-parse HEAD`, or `jj log --no-graph -r @ -T
   commit_id` in a jj repo. An unambiguous prefix of at least 7 hex digits is resolved, but never
@@ -147,15 +148,19 @@ prev_head_commit_id?, focus?, evidence?, testing?, thread?, model?, effort?, pee
   `approved`, `changes_requested` and `pending`) and a one-line `next_action`: `wait: ...`
   (a reviewer is on it), `fix: ...` (someone asked for changes: the thread stays `open`, with
   one reviewer or several, until every required reviewer approves the same head, so stop
-  waiting and fix), `done: ...` (every required reviewer approved the same head, and the
-  thread is `resolved`) or `stop: ...` (it waits for the human). With several
+  waiting and fix), `await_head: ...` (a review-only review asked for changes: stop waiting, see
+  below), `done: ...` (every required reviewer approved the same head, or you finished the
+  review: then it names the blocking findings left open; either way the thread is `resolved`)
+  or `stop: ...` (it waits for the human). With several
   reviewers an approval hands the head to the next one, so keep waiting while it says `wait`.
   If the thread goes to `needs_human` with no verdict (a reviewer out of usage, a CLI format
   change, a missing commit, an unusable verdict), stop and tell the user what the bus's notice
   says; `agent-bus resume` is theirs to run.
 
 **Severity.** Only `high` and `medium` findings block; `low` never does. Fix the blocking ones;
-low ones are optional (defer them to a follow-up issue if they're real work).
+low ones are optional (defer them to a follow-up issue if they're real work). A finding the
+reviewer marks `pre_existing` (a problem already in the base, not introduced by the change) is
+listed apart and never blocks, whatever its severity.
 
 **Finding ids.** Every finding in a verdict gets a stable id such as `codex-1`. On a follow-up,
 the reviewer settles each of its earlier blocking findings by id (fixed, withdrawn or still
@@ -180,15 +185,32 @@ twice the budget goes to `needs_human` (`REVIEW_LIMIT_REACHED`): stop and tell t
 If the repo is missing a pinned commit after the request, the worker reports it on the thread
 and the thread waits for the human.
 
+**Reviewing someone else's change** (a colleague's pull request: you relay the review, the author
+fixes it): pass `review_only=true` on the request that starts the review; follow-ups keep it.
+A request for changes then gives `next_action` `await_head: ...` instead of `fix:`: stop waiting,
+since nothing comes until the author pushes. When they do, `send` their replies as a note and
+request the new head with `prev_head_commit_id` = the thread's current head, as for any
+follow-up. Pushing back (the same head, with the author's evidence) works as above.
+
+**Finishing without every approval.** `finish_review(thread, reason)` ends a review you started
+(review-only or not) once no pass is running: the thread is `resolved` with a `finished` record
+(who, the reason, the head, the blocking finding ids left open and any reviewer that hadn't
+reviewed that head), shown by `threads`, `history` and `wait`. It takes no more follow-ups (a
+new head needs a new review), and you can debrief it. The human user can do the same with
+`agent-bus finish <thread> --reason ...`.
+
 ## Debriefs
 
-After a review or discussion **you started** has finished (`resolved` or `needs_human`), call
+After a review or discussion **you started** has finished (`resolved`, including a review you
+finished with `finish_review`, or `needs_human`; or `cancelled`, for the peers that finished a
+turn there), call
 `debrief(thread, question?, peers?)`, then `wait(thread)` for the `debrief` replies. Each peer
 answers in its own resumed session, so it remembers the thread: don't paste context back in.
 The default question asks what got in its way (prompts, tool access and denials, the sandbox,
 diffs, the verdict or vote format); `question` replaces it. Replies never change the thread's
 status or verdicts. One debrief per peer per thread. A review that asked for changes stays
-`open` while it waits for your fix, so debrief it once it is approved (or `needs_human`).
+`open` while it waits for your fix: debrief it once it is approved (or `needs_human`), or end
+it first with `finish_review`.
 
 ## Error codes
 
@@ -210,7 +232,7 @@ Errors come back as `{"error": CODE, "message": ...}`. The message usually says 
 | `NO_SUCH_MESSAGE` | check the message id (`history` shows them) |
 | `NO_SUCH_THREAD` | check the thread id (`threads` lists them) |
 | `NOT_A_PARTICIPANT` | you aren't on that discussion, so you can't propose or vote there |
-| `NOT_INITIATOR` | only the thread's initiator (or the human) can advance or debrief it |
+| `NOT_INITIATOR` | only the thread's initiator (or the human) can advance, finish or debrief it |
 | `PEER_FORMAT_CHANGED` | a peer's CLI output format changed; tell the user (`agent-bus resume` clears it) |
 | `PEER_MISCONFIGURED` | a peer's provider refused its model or region; tell the user |
 | `PEER_READ_ONLY` | you are a headless peer: don't call agent-bus tools, just reply |
@@ -226,7 +248,7 @@ Errors come back as `{"error": CODE, "message": ...}`. The message usually says 
 | `REVISION_NOT_FOUND` | the repo doesn't have that commit: get the full id from the repo; never extend a short id by hand |
 | `THREAD_BUSY` | a job is running on the thread; `wait` for it to finish |
 | `THREAD_CANCELLED` | the human cancelled the thread; stop |
-| `THREAD_CLOSED` | the thread is finished; read `history`, don't post more |
+| `THREAD_CLOSED` | the thread is finished (resolved, or a review ended with `finish_review`); read `history`, don't post more |
 | `THREAD_LIMIT_REACHED` | the thread used its message or round cap: stop and tell the user |
-| `THREAD_NOT_FINISHED` | only a `resolved` or `needs_human` thread can be debriefed; `wait` first |
+| `THREAD_NOT_FINISHED` | only a `resolved`, `needs_human` or `cancelled` thread (with a finished peer turn) can be debriefed; `wait`, or `finish_review` an open review first |
 | `USAGE_EXHAUSTED` | that agent is out of usage until the time given; pick another or tell the user |
