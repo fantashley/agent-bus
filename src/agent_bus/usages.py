@@ -24,6 +24,12 @@ Names the added lines only read (#126) are searched too, so a reviewer finds who
 string keys (``refs.get("opening_focus")``, ``refs["opening_focus"]``) first, then attributes
 read but not called (``t.launched``), at most MAX_READ of them, with the mentioned names'
 low priority.
+
+Ranking (#135): names the change touches only in test files (``tests/``, ``test_*.py``,
+``*_test.go``, ``*.spec.ts`` ...; a removed line is in the file's old path) come after the
+ones it touches elsewhere, and get room after every other name, so a change's test helpers can't
+crowd out its production names; and a definition keyword inside a string literal on its
+line (a fake diff in a test, ``"+def key_0(): pass"``) defines nothing.
 """
 
 from __future__ import annotations
@@ -58,6 +64,14 @@ KINDS = {"defined": 0, "field": 0, "enclosing": 1, "override": 1, "read": 2, "me
 # A definition on a changed line: Python, JS/TS, Rust, Go (methods too), C-like type keywords.
 _DEF = re.compile(r"\b(?:def|class|function|fn|func|struct|enum|interface|trait|type|macro_rules!)\s+"
                   r"(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)")
+# A string literal on one line, or from its opening quote to the end of the line (a multi-line
+# one starting there): a definition keyword inside one defines nothing.  Rust's lifetimes
+# ('a) aren't quotes, so a .rs file's single quotes are left alone.
+_STRING = re.compile(r"""("{3}|'{3}|["'`])(?:\\.|(?!\1).)*(?:\1|$)""")
+_STRING_RS = re.compile(r"""(["`])(?:\\.|(?!\1).)*(?:\1|$)""")
+# A test file: under a tests/ (test/, __tests__/, spec/) directory, or named like one.
+_TEST_PATH = re.compile(r"(?:^|/)(?:tests?|__tests__|spec)/|(?:^|/)(?:test_[^/]*|[^/]*_test\.[^/]+"
+                        r"|[^/]*\.(?:test|spec)\.[^/]+|conftest\.py)$")
 # A module-level constant (FOO_BAR = ..., FOO: int = ...), assigned at the start of the line.
 _CONST = re.compile(r"^([A-Z][A-Z0-9_]+)\s*(?::[^=]*)?=(?!=)")
 # The function or class git names in a hunk header, failing a definition: the first call-like name.
@@ -89,10 +103,32 @@ _EXT = frozenset({"py", "js", "ts", "tsx", "jsx", "md", "json", "toml", "txt", "
 @dataclass(frozen=True)
 class Term:
     """One thing to search for: ``pattern`` (a name, or ``def name`` / ``fn name`` for a method's
-    definitions), its ``kind`` (see KINDS), and for a field the class it is in."""
+    definitions), its ``kind`` (see KINDS), for a field the class it is in, and whether the
+    change touches it only in test files (then it gets room after every other name, #135)."""
     pattern: str
     kind: str = "defined"
     owner: str = ""
+    test: bool = False
+
+
+def priority(t: Term) -> int:
+    """How much room ``t`` gets (see KINDS): a name touched only in tests, after all the rest."""
+    return 3 if t.test else KINDS.get(t.kind, 1)
+
+
+def is_test(path: str) -> bool:
+    """Whether ``path`` (relative to the repository root) is a test file."""
+    return bool(_TEST_PATH.search(path))
+
+
+def _mask(text: str, path: str) -> str:
+    """``text`` (one line of ``path``) with its string literals emptied."""
+    return (_STRING_RS if path.endswith(".rs") else _STRING).sub('""', text)
+
+
+def _defs(text: str, path: str) -> list[str]:
+    """The names ``text`` (one line of ``path``) defines, outside string literals."""
+    return [d.group(1) for d in _DEF.finditer(_mask(text, path))]
 
 
 def _ok(name: str) -> bool:
@@ -100,11 +136,13 @@ def _ok(name: str) -> bool:
             and not (name.startswith("__") and name.endswith("__")))
 
 
-def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], dict[str, str], dict[str, None]]:
+def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], dict[str, str], dict[str, None],
+                              set[str]]:
     """The names ``diff`` touches: definitions and constants on changed lines, changed class
     fields (name -> class), the definitions the changed lines sit in, the changed methods
-    (indented definitions on changed lines, or the method a changed line sits in), and the
-    names added lines read (string keys first, then attributes not called)."""
+    (indented definitions on changed lines, or the method a changed line sits in), the
+    names added lines read (string keys first, then attributes not called), and which of
+    them it touches in a file that isn't a test file."""
     keys: dict[str, None] = {}
     attrs: dict[str, None] = {}
     defined: dict[str, None] = {}
@@ -114,13 +152,32 @@ def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], 
     current = None
     method = ""  # ``current``'s keyword if it is a method (def or fn), else ""
     cls: tuple[int, str] | None = None  # the class a changed line sits in directly: (indent, name)
+    from .worker import _header_paths, git_unquote  # here: worker imports this module
+
+    old = new = ""  # the file's old and new paths: removed lines are in the old one (#135)
+    prod: set[str] = set()  # the names touched in a file that isn't a test file
+    in_hunk = False  # past the file's first hunk header: a "+++ x" line is content (codex-7)
     for line in diff.splitlines():
-        if line.startswith(("+++", "---", "diff --git ")):
+        if line.startswith("diff --git ") or (not in_hunk and line.startswith(("+++", "---"))):
+            if line.startswith("diff --git "):
+                old, new = _header_paths(line[len("diff --git "):]) or ("", "")
+                in_hunk = False
+            elif line.startswith(("--- ", "+++ ")):
+                # A path with a space ends in a tab; a tab in a path itself is quoted.
+                try:
+                    p = git_unquote(line[4:].split("\t", 1)[0])
+                except ValueError:
+                    p = ""
+                if p.startswith("a/") and line[0] == "-":
+                    old = p[2:]
+                elif p.startswith("b/") and line[0] == "+":
+                    new = p[2:]
             current, method, cls = None, "", None
             continue
         m = _HUNK.match(line)
         if m:
-            text = m.group(1)
+            in_hunk = True
+            text = _mask(m.group(1), new)
             d = _DEF.search(text) or _CALL.search(text) if text else None
             current = d.group(1) if d else None
             mm = _METHOD.match(text)
@@ -131,26 +188,35 @@ def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], 
         if not line.startswith(("+", "-", " ")):
             continue
         body = line[1:]
-        found = [d.group(1) for d in _DEF.finditer(body)]
+        path = old if line[0] == "-" else new
+        found = _defs(body, path)
         c = _CLASS.match(body)
         meth = _METHOD.match(body)
+        touched: list[str] = []  # the names this line touches, whatever they turn out to be
         if line[0] == "+" and not body.lstrip().startswith(("#", "//")):
-            keys.update(dict.fromkeys(k.group(1) for k in _KEY.finditer(body)))
-            attrs.update(dict.fromkeys(a.group(1) for a in _ATTR.finditer(body)))
+            read = [k.group(1) for k in _KEY.finditer(body)], [a.group(1) for a in _ATTR.finditer(body)]
+            keys.update(dict.fromkeys(read[0]))
+            attrs.update(dict.fromkeys(read[1]))
+            touched += read[0] + read[1]
         if line[0] in "+-":
             defined.update(dict.fromkeys(found))
+            touched += found
             k = _CONST.match(body)
             if k:
                 defined.setdefault(k.group(1))
+                touched.append(k.group(1))
             f = _FIELD.match(body)
             # One level into the class (a hunk headed by the class line can sit deep in a
             # method, whose annotated locals are further in).
             if f and cls is not None and 0 < len(f.group(1).expandtabs(4)) - cls[0] <= 4 and not found:
                 fields.setdefault(f.group(2), cls[1])
+                touched.append(f.group(2))
             if meth:
                 methods.setdefault(meth.group(3), meth.group(2))
+                touched.append(meth.group(3))
             elif current and not found:
                 enclosing.setdefault(current)
+                touched.append(current)
                 if method:
                     methods.setdefault(current, method)
         if c:
@@ -162,7 +228,9 @@ def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], 
         if found:
             current = found[-1]
             method = meth.group(2) if meth else ""
-    return defined, fields, enclosing, methods, {**keys, **attrs}
+        if touched and not is_test(path):
+            prod.update(touched)
+    return defined, fields, enclosing, methods, {**keys, **attrs}, prod
 
 
 def symbols(diff: str, limit: int = MAX_SYMBOLS) -> list[str]:
@@ -170,7 +238,7 @@ def symbols(diff: str, limit: int = MAX_SYMBOLS) -> list[str]:
     added or removed lines (a removed one's remaining uses are bugs), changed class fields,
     then the functions or classes the changed lines sit in (their callers see the change):
     the last definition above them in the hunk, or failing that the one git names in the
-    hunk header."""
+    hunk header; the names it touches only in test files last."""
     return [t.pattern for t in terms(diff, limit=limit) if t.kind not in ("override", "read")]
 
 
@@ -195,8 +263,13 @@ def terms(diff: str, mention: list[str] | None = None, limit: int = MAX_SYMBOLS)
     """What to search for ``diff``: its names (see symbols, at most ``limit``), the other
     definitions of its changed methods (at most MAX_METHODS), the names its added lines only
     read (at most MAX_READ), and the names in ``mention`` that aren't among them (at most
-    MAX_MENTIONED)."""
-    defined, fields, enclosing, methods, reads = _scan(diff)
+    MAX_MENTIONED).  Within each group, the names it touches outside test files come first;
+    its own names and changed methods touched only in tests are marked ``test`` (#135)."""
+    defined, fields, enclosing, methods, reads, prod = _scan(diff)
+
+    def first(name: str) -> bool:  # a sort key: False (outside tests) sorts first; sorted() is stable
+        return name not in prod
+
     out: dict[str, Term] = {}
     for n in defined:
         out.setdefault(n, Term(n, "defined"))
@@ -204,13 +277,15 @@ def terms(diff: str, mention: list[str] | None = None, limit: int = MAX_SYMBOLS)
         out.setdefault(n, Term(n, "field", owner))
     for n in enclosing:
         out.setdefault(n, Term(n, "enclosing"))
-    found = [t for t in out.values() if _ok(t.pattern)][:limit]
+    found = [Term(t.pattern, t.kind, t.owner, test=first(t.pattern))
+             for t in sorted(out.values(), key=lambda t: first(t.pattern)) if _ok(t.pattern)][:limit]
     # A method's other definitions: short names too (``def run`` is specific), but not dunders.
-    meths = [Term(f"{kw} {n}", "override") for n, kw in methods.items()
+    meths = [Term(f"{kw} {n}", "override", test=first(n))
+             for n, kw in sorted(methods.items(), key=lambda i: first(i[0]))
              if not (n.startswith("__") and n.endswith("__")) and n not in _SKIP and not n.startswith("test")]
     found += meths[:MAX_METHODS]
     have = {t.pattern for t in found} | set(out)
-    found += [Term(n, "read") for n in reads if n not in have and _ok(n)][:MAX_READ]
+    found += [Term(n, "read", test=first(n)) for n in sorted(reads, key=first) if n not in have and _ok(n)][:MAX_READ]
     have = {t.pattern for t in found}
     found += [Term(n, "mentioned") for n in (mention or []) if n not in have][:MAX_MENTIONED]
     return found
@@ -370,7 +445,7 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
     short: dict[str, str] = {}
     for n in u.names:
         t = u.terms.get(n) or Term(n)
-        desc = _desc(t)
+        desc = ", ".join(d for d in (_desc(t), "only in tests" if t.test else "") if d)
         hits = u.hits.get(n) or []
         if not hits:
             full[n] = short[n] = (f"{n}{f' ({desc})' if desc else ''}: "
@@ -399,7 +474,7 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
         if len(hits) > GENERIC_HITS:
             full[n] = short[n]
     index = {n: i for i, n in enumerate(u.names)}
-    prio = {n: KINDS.get((u.terms.get(n) or Term(n)).kind, 1) for n in u.names}
+    prio = {n: priority(u.terms.get(n) or Term(n)) for n in u.names}
     size = {n: len(u.hits.get(n) or []) for n in u.names}
     # Room is handed out by priority, fewest hits first within one, with the one-line form of
     # every changed definition still to come kept in reserve.
