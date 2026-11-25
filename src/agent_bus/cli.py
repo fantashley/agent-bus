@@ -152,7 +152,7 @@ def thread_status(bus: Bus, thread: str) -> tuple[str, str | None, str]:
         return "blocked", "question", f"{thread}: needs human"
     if t["status"] == "cancelled":
         return "idle", None, f"{thread}: cancelled"
-    if not job and t["kind"] == "review" and (t["refs"] or {}).get("reviewers"):
+    if not job and t["kind"] == "review":
         st = bus.review_standings(thread)
         if st["changes_requested"]:
             return "idle", None, f"{thread}: changes requested by {', '.join(st['changes_requested'])}"
@@ -180,6 +180,11 @@ def peer_status(bus: Bus, thread: str, peer: str) -> tuple[str, str | None, str]
         if t["kind"] == "review":
             return "done", None, f"{peer}: review posted"
         return "done", None, f"{peer}: agreed on {t['final_proposal']}"
+    if t["kind"] == "review":
+        # An open review: only a verdict on the current head counts (#143); an older one is stale.
+        mine = bus.review_standings(thread)["reviewers"].get(peer) or {}
+        if mine.get("state") in ("approved", "changes_requested"):
+            return "idle", None, f"{peer}: {mine['state'].replace('_', ' ')}"
     if st:
         return "idle", None, f"{peer}: {st['stance']} {st['proposal_id']}"
     return "idle", None, f"{peer}: waiting"
@@ -250,7 +255,8 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
     """One line per notable event: verdicts, finals, status changes, failed jobs.
 
     Built for notification hooks (each stdout line is one event).  Starts from now
-    unless --from-start; with --threads it exits once all of them are closed.
+    unless --from-start; with --threads it exits once all of them are closed, failed or
+    waiting for the author's fix to a review.
     """
     kinds = set(args.kinds.split(","))
     wanted = set(args.threads or [])
@@ -285,13 +291,20 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
                     print(one_line(f"JOB_FAILED {tid} {j['id']}: {j['error'] or ''}", 300), flush=True)
 
     def settled(tid: str) -> bool:
-        """Closed, or open with no worker left and its last job failed (nothing more will come)."""
+        """Closed, or open with no worker left and nothing more to come: its last job failed,
+        or it is a review waiting for the author's fix (#143)."""
         if bus.active_job(tid):
             return False
-        if status.get(tid) in ("resolved", "needs_human", "cancelled"):
+        try:
+            t = bus.thread(tid)
+        except BusError:
+            return False  # not (yet) a thread
+        if t["status"] in ("resolved", "needs_human", "cancelled"):
             return True
         js = bus.jobs(tid)
-        return bool(js) and js[-1]["status"] == "failed"
+        if bool(js) and js[-1]["status"] == "failed":
+            return True
+        return t["kind"] == "review" and bool(bus.review_standings(tid)["changes_requested"])
 
     try:
         from . import autoresume
@@ -300,6 +313,9 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
             # a job it fails (out of launch attempts, #64) is reported like any other.
             autoresume.sweep_quietly(bus)
             bus.reap()
+            # Judged before this poll's reports, so whatever settled them (a verdict, its mail,
+            # a status change) is reported below before the stream exits.
+            done = bool(wanted) and all(settled(t) for t in wanted)
             drain()
             for t in bus.threads(include_closed=True, limit=200):
                 if wanted and t["id"] not in wanted:
@@ -313,11 +329,7 @@ def cmd_stream(bus: Bus, args: argparse.Namespace) -> int:
                     print(one_line(f"MAIL {hooks.describe_mail(w)}", 300), flush=True)
             failures()
             first = False
-            if wanted and all(settled(t) for t in wanted):
-                # Settling may itself have reaped a job, and a verdict may have landed just
-                # before the thread closed: report both before exiting.
-                failures()
-                drain()
+            if done:
                 return 0
             time.sleep(args.interval)
     except KeyboardInterrupt:
@@ -661,7 +673,8 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("stream", description="Print one line per verdict, final answer, status change, failed "
                                              "job or idle session with mail, for notification hooks.")
-    s.add_argument("threads", nargs="*", help="only these threads; exit once they're all closed")
+    s.add_argument("threads", nargs="*", help="only these threads; exit once they're all closed, failed or "
+                                              "(a review) waiting for the author's fix")
     s.add_argument("--kinds", default="review_verdict,final,mail",
                    help="message kinds to report, plus `mail` for interactive sessions with unread mail "
                         "(default: review_verdict,final,mail)")

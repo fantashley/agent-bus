@@ -33,9 +33,9 @@ and every agent-bus tool refuses you with `PEER_READ_ONLY`.
   working peer's turn state, elapsed time, latest activity, tool calls). Reviews and rounds
   often take several minutes, so call it again **while the thread is `open` and a peer is
   working or due**. Stop waiting once the thread is `resolved`, `needs_human` or `cancelled`
-  (or `waiting_for_human` is true), unless you are waiting for `debrief` replies, which arrive
-  on an already finished thread (keep waiting while `progress.job.status` is `queued` or
-  `running`). When you stop, read the latest `system` notice, and if it names a blocker
+  (or `waiting_for_human` is true), or a review's `next_action` says `fix:` or `done:`,
+  unless you are waiting for `debrief` replies, which arrive on an already finished thread
+  (keep waiting while `progress.job.status` is `queued` or `running`). When you stop, read the latest `system` notice, and if it names a blocker
   (out of usage, a CLI format change, a missing commit, a failed pass), tell the user.
 - **`wait(thread)` returns only what you haven't read**, also after a `send` or a follow-up
   `request_review`, and from a new MCP server of the same client (a subagent's), which starts
@@ -145,9 +145,10 @@ prev_head_commit_id?, focus?, evidence?, testing?, thread?, model?, effort?, pee
 - Then `wait(thread)` until a `review_verdict` arrives. Every `wait` on a review thread (a
   wake-up or a timeout) carries `review` (each reviewer's state at the current head, plus
   `approved`, `changes_requested` and `pending`) and a one-line `next_action`: `wait: ...`
-  (a reviewer is on it), `fix: ...` (someone asked for changes: the thread can still be
-  `open` with several reviewers, but stop waiting and fix), `done: ...` (every required
-  reviewer approved the same head) or `stop: ...` (it waits for the human). With several
+  (a reviewer is on it), `fix: ...` (someone asked for changes: the thread stays `open`, with
+  one reviewer or several, until every required reviewer approves the same head, so stop
+  waiting and fix), `done: ...` (every required reviewer approved the same head, and the
+  thread is `resolved`) or `stop: ...` (it waits for the human). With several
   reviewers an approval hands the head to the next one, so keep waiting while it says `wait`.
   If the thread goes to `needs_human` with no verdict (a reviewer out of usage, a CLI format
   change, a missing commit, an unusable verdict), stop and tell the user what the bus's notice
@@ -186,7 +187,8 @@ After a review or discussion **you started** has finished (`resolved` or `needs_
 answers in its own resumed session, so it remembers the thread: don't paste context back in.
 The default question asks what got in its way (prompts, tool access and denials, the sandbox,
 diffs, the verdict or vote format); `question` replaces it. Replies never change the thread's
-status or verdicts. One debrief per peer per thread.
+status or verdicts. One debrief per peer per thread. A review that asked for changes stays
+`open` while it waits for your fix, so debrief it once it is approved (or `needs_human`).
 
 ## Error codes
 

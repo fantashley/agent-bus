@@ -62,7 +62,8 @@ def test_a_review_parked_by_quota_resumes_once_the_limit_resets(env, no_spawn, m
         in bus.history(tid)["messages"][-1]["body"]
     assert bus.jobs(tid)[-1]["params"]["mode"] == "retry" and len(no_spawn) == 2
     run_job(bus, tid)
-    assert bus.thread(tid)["status"] == "resolved"  # the verdict came in
+    # The verdict came in; it asks for changes, so the review waits for the fix (#143).
+    assert bus.thread(tid)["status"] == "open" and bus.review_standings(tid)["changes_requested"] == ["codex"]
     assert autoresume.sweep(bus) == []  # nothing left to do
 
 

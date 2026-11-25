@@ -11,7 +11,7 @@ directly, instead of a human relaying messages between windows. Designed in
 - **On-demand worker, no daemon.** Typed actions (`start_discussion`, `advance_discussion`, `debrief`,
   `request_review`) queue a job and spawn `agent-bus run-job <id>`, which holds an SQLite lease and
   runs the peers headless and read-only (`claude -p --permission-mode dontAsk`,
-  `codex exec` with a read-only sandbox, `agy --mode plan --sandbox`), resuming each peer's
+  `codex exec` with a read-only sandbox, `agy --sandbox` with a read-only custom agent), resuming each peer's
   conversation every round.
 - **Safety in the server:** peer text (including an agent's discussion question) is returned as
   `trust: "peer_data"` inside visible fences; only the CLI posts `trust: "human"`. Round caps,
@@ -149,6 +149,10 @@ commit made with plain git is found through git, so `jj git import` is only need
 has no `.git`. A commit that goes missing after the request (an amend and `git gc`, say) is still
 reported on the thread by the worker, which then waits for the human user.
 
+A review thread is `resolved` only once its reviewer approves. After a request for changes it
+stays `open`, waiting for your fix or pushback (`next_action` says `fix: ...`), the same with one
+reviewer as with several; a debrief has to wait until it is resolved (or `needs_human`).
+
 For the next pass, request again with `prev_head_commit_id` set to the thread's current head.
 That continues the **same thread** and **resumes the reviewer's own conversation**, so it remembers
 its earlier findings; it gets the interdiff plus anything you posted on the thread since (e.g. a
@@ -186,9 +190,10 @@ same things in parallel:
   files such as `node_modules`) under `~/.local/state/agent-bus/snapshots/<bus db>/<thread>/<head>`, and
   the prompt says files there are exactly that head. Claude, Antigravity and Copilot get it as
   an added directory (`--add-dir`); Codex reads it in its read-only sandbox. Antigravity, which
-  can't list directories or search, also gets the snapshot's file list (capped). A thread's
-  later turns on the same head reuse the snapshot; it is removed once the thread is no longer
-  open, and each worker sweeps stale ones when it starts. Over `max_snapshot_bytes` (256 MiB, or
+  can't list directories or search, also gets the snapshot's file list (capped). A pass's
+  later turns on the same head reuse the snapshot; it is removed once no job is running on the
+  thread (the next pass makes it again), and each worker sweeps stale ones when it starts.
+  Over `max_snapshot_bytes` (256 MiB, or
   50,000 files) the snapshot holds only the changed files and the other files in their
   directories, and the prompt says so; over that too, or with `max_snapshot_bytes` set to 0,
   there is none and the prompt says files on disk may not match. Codex also gets copyable
@@ -250,8 +255,10 @@ tool access and denials, the sandbox, diffs, the verdict or vote format), the th
 calls `debrief(thread, question?, peers?)`, or the human runs `agent-bus debrief <thread>
 [--question …] [--peer codex]`:
 
-- It works on a finished thread (`resolved` or `needs_human`) with no job running. Agents can
-  debrief only threads they started; the human user can debrief any.
+- It works on a finished thread (`resolved` or `needs_human`) with no job running. A review
+  that asked for changes is still `open` (it waits for the author's fix), so it can't be
+  debriefed until it is approved or parked. Agents can debrief only threads they started; the
+  human user can debrief any.
 - Each peer (default: every headless peer on the thread) gets **one turn in its own resumed
   session** on the thread, so it answers from memory. It is an ordinary turn: the same
   participant settings, env and `CODEX_HOME`, the same read-only hardening for each harness,
@@ -300,7 +307,7 @@ else stays read-only:
 |---|---|---|---|
 | Claude Code | WebSearch, WebFetch | `--tools` (the session's whole built-in set) and `--allowedTools` | removed and `--disallowedTools` |
 | Codex | hosted `web_search`: search and open pages | `-c web_search="cached"`, unless `peers.codex.args` sets another mode | `-c web_search="disabled"` (also when `peers.codex.args` sets it) |
-| Antigravity | `search_web` only: plan mode has no page fetch | needs no approval in plan mode | the turn's agent (`--agent`) has no `search_web` |
+| Antigravity | `search_web` only: agy has no page fetch | needs no approval | the turn's agent (`--agent`) has no `search_web` |
 | Copilot CLI | `web_fetch` only: Copilot has no search tool | `web_fetch` in `--available-tools`, and `--allow-all-urls` (`-p` denies an unapproved fetch) | `web_fetch` left out of `--available-tools`, no URL rule |
 
 To turn it off for an agent, set `peers.<agent>.web_search = false` in `config.json` (or
@@ -389,7 +396,7 @@ codex 0.171.0 and 0.172.0, and agy 1.5.13:
 - **Antigravity:** every turn passes `--settings` with deny rules for `command(*)`,
   `write_file(*)` (which covers edits) and `execute_url(*)` (the browser subagent). Deny wins over
   any allow rule in your own settings, so a `--settings` in `peers.antigravity.args` is dropped.
-  Without these rules, plan mode writes files without asking under the system temp directory,
+  Without these rules, agy writes files without asking under the system temp directory,
   and a terminal command is auto-denied and ends the turn with no reply. With them, either one
   is a tool error the model answers past. Sub-agents inherit the rules. Each turn also runs as
   a custom agent (`--agent`, defined under `~/.local/state/agent-bus/antigravity-agent`, which
@@ -407,8 +414,10 @@ codex 0.171.0 and 0.172.0, and agy 1.5.13:
   argument goes in as far as fits and continues in numbered part files, each small enough for
   one `read_file` call (agy reads at most 46,080 bytes per call). Turns also
   pass `--disable-slash-commands`, so nothing in the prompt expands as a slash command or skill,
-  and plan mode leaves out its `/plan` meta-prompt (plan and walkthrough artifacts and asking
-  for approval). agy loads a workspace's own `hooks.json`, `mcp_config.json` and `plugins/`
+  and there is no `/plan` meta-prompt (plan and walkthrough artifacts and asking for approval).
+  That flag makes `--mode` a no-op, so turns pass none: the agent's tool list, the deny rules
+  and `--sandbox` are what isolate it.
+  agy loads a workspace's own `hooks.json`, `mcp_config.json` and `plugins/`
   from its `.agents` (or `.agent`, `_agents`, `_agent`) directories, from the turn's directory
   up to the repository root and from every added directory, a review's snapshot of the head
   and any `--add-dir` in `peers.antigravity.args` included. In print mode they load whatever the folder trust list says, and `--settings` has no
@@ -821,7 +830,8 @@ retries doesn't match what the peers wrote.
 lines into alerts (or a plain `while read`) hears about each reviewer as it finishes. It reports
 verdicts and final answers (`--kinds`), threads changing status, failed jobs and idle sessions
 with mail (`MAIL`, see "When an idle session has mail"). With thread ids it exits once they're
-all closed; `--from-start` also reports messages from before it started.
+all closed, failed or (a review) waiting for the author's fix; `--from-start` also reports
+messages from before it started.
 
 ## Rex sessions and wake-ups
 

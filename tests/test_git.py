@@ -225,7 +225,7 @@ def test_missing_previous_head_on_followup_needs_human(env, no_spawn, unchecked_
     claude = Service(bus, "claude", bus.register_session("claude"))
     tid = claude.request_review("codex", str(repo), base, head1)["thread"]["id"]
     Worker(bus, bus.jobs(tid)[-1]["id"]).run()
-    assert bus.thread(tid)["status"] == "resolved"
+    assert bus.thread(tid)["status"] == "open"  # changes requested: waits for the fix (#143)
     env["calls"] = len(env["log"].read_text().splitlines())
     # Rewrite the reviewed head away entirely, as after an amend plus gc.
     (repo / "a.txt").write_text("hi\n")
