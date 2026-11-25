@@ -181,16 +181,22 @@ blocking), and the verdict shows how.
 (`review_followup_budget`, default 3). Once it's spent, reviewers are told the review has run
 long: defer non-blocking work to a follow-up issue. A review still asking for changes after
 twice the budget goes to `needs_human` (`REVIEW_LIMIT_REACHED`): stop and tell the user.
+A review-only review (below) keeps the warning but never parks: it has no follow-up limit.
 
 If the repo is missing a pinned commit after the request, the worker reports it on the thread
 and the thread waits for the human.
 
 **Reviewing someone else's change** (a colleague's pull request: you relay the review, the author
 fixes it): pass `review_only=true` on the request that starts the review; follow-ups keep it.
-A request for changes then gives `next_action` `await_head: ...` instead of `fix:`: stop waiting,
-since nothing comes until the author pushes. When they do, `send` their replies as a note and
+With several reviewers, each one reviews every head (a request for changes doesn't end the
+round), so you can relay all their findings at once. A request for changes then gives
+`next_action` `await_head: ...` instead of `fix:` once every reviewer has given its verdict: stop
+waiting, since nothing comes until the author pushes. When they do, `send` their replies as a note and
 request the new head with `prev_head_commit_id` = the thread's current head, as for any
-follow-up. Pushing back (the same head, with the author's evidence) works as above.
+follow-up. Pushing back (the same head, with the author's evidence) works as above. Such a
+review follows the author's pushes for as long as the change lives, so it is exempt from the
+follow-up limit (`followup_limit` is `null`); past the soft budget you still get the warning.
+To relay a GitHub pull request's review, use the `agent-bus-pr-review` skill.
 
 **Finishing without every approval.** `finish_review(thread, reason)` ends a review you started
 (review-only or not) once no pass is running: the thread is `resolved` with a `finished` record

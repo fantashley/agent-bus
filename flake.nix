@@ -49,25 +49,30 @@
             skill() {
               check "$1/SKILL.md"
               head -n 1 "$1/SKILL.md" | grep -qx -- '---'
-              grep -qx 'name: agent-bus' "$1/SKILL.md"
+              grep -qx "name: ''${2:-agent-bus}" "$1/SKILL.md"
               grep -q '^description: ' "$1/SKILL.md"
             }
+            prskill() { skill "$1" agent-bus-pr-review; check "$1/pr_review.py"; }
             c=${built.claudeMarketplace}
             check $c/.claude-plugin/marketplace.json
             check $c/plugins/agent-bus/.claude-plugin/plugin.json
             check $c/plugins/agent-bus/.mcp.json
             check $c/plugins/agent-bus/hooks/hooks.json
             skill $c/plugins/agent-bus/skills/agent-bus
+            prskill $c/plugins/agent-bus/skills/agent-bus-pr-review
             a=${built.antigravityPlugin}
             check $a/plugin.json
             check $a/mcp_config.json
             check $a/hooks.json
             skill $a/skills/agent-bus
+            prskill $a/skills/agent-bus-pr-review
             skill ${built.skill}
+            prskill ${built.prReviewSkill}
             # A package without its own copy of the skill (an older or custom one) falls back
             # to this tree's.
             skill ${bare.skill}
             skill ${bare.claudeMarketplace}/plugins/agent-bus/skills/agent-bus
+            prskill ${bare.prReviewSkill}
             touch $out
           '';
       });

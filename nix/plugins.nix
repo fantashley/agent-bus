@@ -6,6 +6,8 @@
 # - antigravityPlugin: the Antigravity plugin directory (MCP server, optional hooks, skill).
 # - skill: the agent-bus skill directory (SKILL.md), from the package, for clients that load
 #   skills from a directory (Codex and Copilot CLI read ~/.agents/skills).
+# - prReviewSkill: the agent-bus-pr-review skill (SKILL.md and its pr_review.py helper, #148),
+#   shipped the same way.
 { lib, pkgs, package, profileBin, claudeHooks ? false, antigravityHooks ? false }:
 
 let
@@ -18,6 +20,13 @@ let
       cp -r ${package}/share/agent-bus/skills/agent-bus $out
     else
       cp -r ${../skills/agent-bus} $out
+    fi
+  '';
+  prReviewSkill = pkgs.runCommand "agent-bus-pr-review-skill" { } ''
+    if [ -f ${package}/share/agent-bus/skills/agent-bus-pr-review/SKILL.md ]; then
+      cp -r ${package}/share/agent-bus/skills/agent-bus-pr-review $out
+    else
+      cp -r ${../skills/agent-bus-pr-review} $out
     fi
   '';
 
@@ -57,7 +66,7 @@ let
   };
 in
 {
-  inherit skill;
+  inherit skill prReviewSkill;
 
   claudeMarketplace = pkgs.runCommand "agent-bus-claude-marketplace" { } (''
     mkdir -p $out/.claude-plugin $out/plugins/agent-bus/.claude-plugin $out/plugins/agent-bus/skills
@@ -88,6 +97,7 @@ in
     }} \
       $out/plugins/agent-bus/.mcp.json
     cp -r ${skill} $out/plugins/agent-bus/skills/agent-bus
+    cp -r ${prReviewSkill} $out/plugins/agent-bus/skills/agent-bus-pr-review
   '' + lib.optionalString claudeHooks ''
     mkdir -p $out/plugins/agent-bus/hooks
     cp ${claudeHooksFile} $out/plugins/agent-bus/hooks/hooks.json
@@ -103,6 +113,7 @@ in
     cp ${json.generate "mcp_config.json" { mcpServers.agent-bus = mcpEntry "antigravity"; }} \
       $out/mcp_config.json
     cp -r ${skill} $out/skills/agent-bus
+    cp -r ${prReviewSkill} $out/skills/agent-bus-pr-review
   '' + lib.optionalString antigravityHooks ''
     cp ${antigravityHooksFile} $out/hooks.json
   '');

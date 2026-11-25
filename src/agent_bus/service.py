@@ -15,7 +15,8 @@ from typing import Any
 from . import config as cfg
 from . import autoresume, evidence as ev, provenance, quota
 from . import rex, unvotable, worker
-from .db import HUMAN, SYSTEM, Bus, BusError, deadline_message, is_quiet, overdue, past_deadline, review_progress, wrap_peer
+from .db import (HUMAN, SYSTEM, Bus, BusError, deadline_message, is_quiet, over_followup_limit, overdue,
+                 past_deadline, review_progress, wrap_peer)
 
 # A pinned commit id: the full 40 hex digits, or a prefix of at least 7 that request_review
 # resolves to one commit in the repo (#73).  Upper case is accepted and lowered.
@@ -133,16 +134,22 @@ def review_next_action(t: dict, st: dict, job: dict | None, last_failed: bool = 
         return f"done: {'every required reviewer' if several else next(iter(st['reviewers']))} approved head {head}"
     # A failed pass with no verdict to act on: a pushback's earlier request for changes still
     # shows, but only a resume reruns that pass.
-    if last_failed and (pushback_pending or not st["changes_requested"]):
+    unreviewed = [r for r, v in st["reviewers"].items() if v["state"] in ("reviewing", "pending", "stale")]
+    # A review-only pass that failed before every reviewer gave a verdict (#148) is resumable too.
+    if last_failed and (pushback_pending or not st["changes_requested"] or (review_only and unreviewed)):
         return (f"stop: the last review pass failed and nothing is running; tell the human user, who can run "
                 f"`agent-bus resume {tid}` to retry it")
     # A request for changes on the current head ends the pass, even while its worker is
     # still closing the job: nobody else reviews this head until there is a fix.  Past the
     # follow-up limit the worker parks the thread (or died before it could): a new request
     # would fail with REVIEW_LIMIT_REACHED.
-    if st["changes_requested"] and st.get("follow_ups", 0) >= st.get("followup_limit", float("inf")):
+    if st["changes_requested"] and over_followup_limit(st):
         return ("stop: the review still asks for changes after its follow-up limit (REVIEW_LIMIT_REACHED); "
                 "tell the human user" + (f", or finish_review(\"{tid}\", reason) to end it" if review_only else ""))
+    if st["changes_requested"] and review_only and job is not None and unreviewed:
+        # Every reviewer gives a verdict on each head of a review-only review (#148).
+        return (f"wait: {', '.join(st['changes_requested'])} asked for changes on head {head}; "
+                f"{', '.join(unreviewed)} still to review it")
     if st["changes_requested"] and review_only:
         # The initiator isn't the change's author (#145): nothing for it to fix.
         return (f"await_head: {', '.join(st['changes_requested'])} asked for changes on head {head}. This review is "
@@ -856,10 +863,12 @@ class Service:
         if t["kind"] != "review":
             return False
         refs = t["refs"] or {}
+        if refs.get("review_only"):
+            return False  # no follow-up limit (#148), even if an older build parked it for one
         if t["status"] == "needs_human" and refs.get("budget_parked"):
             return True
         p = review_progress(t)
-        if p["follow_ups"] < p["followup_limit"]:
+        if not over_followup_limit(p):
             return False
         if resuming and self._pushback_pending(t):
             return False  # a pushback still to give its verdict: let it finish (a quota resume retries it)
@@ -911,13 +920,27 @@ class Service:
         standing = self.bus.review_standings(t["id"])
         if not standing["changes_requested"]:
             return False
-        target = standing["changes_requested"][0]
+        target = self._pushback_target(t, standing)
         verdict = self.bus.last_verdict(t["id"], target)
-        if (t["refs"] or {}).get("pushback_round") == t["round"] and verdict["round"] < t["round"]:
-            return False  # the pushback pass this request started gave no verdict: a retry
+        if (t["refs"] or {}).get("pushback_round") == t["round"]:
+            # The pushback pass this request started gave no verdict yet: a retry, not new.
+            ran = self.bus.last_verdict(t["id"], (t["refs"] or {}).get("reviewer") or target)
+            if ran is None or ran["round"] < t["round"]:
+                return False
         fresh = target not in ((t["refs"] or {}).get("pushbacks") or {})
-        return (self._note_since(t, verdict["id"]) is not None
+        # Evidence must postdate the latest pass: a note that started an earlier pushback (to
+        # another reviewer, #148) isn't evidence for this one.
+        return (self._note_since(t, self._latest_verdict_id(t, verdict["id"])) is not None
                 or bool(fresh and self._new_focus(focus, (t["refs"] or {}).get("focus"))))
+
+    @staticmethod
+    def _pushback_target(t: dict, standing: dict) -> str:
+        """The reviewer a same-head pushback goes to: the first that asked for changes and
+        hasn't reconsidered on this revision yet (on a review-only review several may ask at
+        once, #148), else the first that asked."""
+        used = (t["refs"] or {}).get("pushbacks") or {}
+        fresh = [r for r in standing["changes_requested"] if r not in used]
+        return (fresh or standing["changes_requested"])[0]
 
     @staticmethod
     def _new_focus(focus: str | None, pinned: str | None) -> bool:
@@ -925,14 +948,22 @@ class Service:
         request that pinned the pass being repeated (#146)."""
         return bool(focus and focus.strip()) and focus.strip() != (pinned or "").strip()
 
-    def _check_pushback(self, t: dict, reviewer: str, verdict: dict, focus: str | None, used: bool) -> None:
+    def _latest_verdict_id(self, t: dict, at_least: int) -> int:
+        row = self.bus._one("SELECT MAX(id) AS id FROM messages WHERE thread_id=? AND kind='review_verdict'", t["id"])
+        return max(at_least, (row["id"] if row and row["id"] else 0))
+
+    def _check_pushback(self, t: dict, reviewer: str, verdict: dict, focus: str | None, used: bool,
+                        latest: bool = False) -> None:
         """A same-head re-request after ``reviewer`` asked for changes (#71) needs the author's
-        evidence (a note sent since that verdict, or ``focus``), once per reviewer and head."""
+        evidence (a note sent since that verdict, or ``focus``), once per reviewer and head.
+        With ``latest``, the note must postdate the thread's latest verdict (several reviewers
+        asking for changes on one head, #148)."""
         head = str(verdict["data"].get("head_commit_id"))[:12]
         if used:
             raise BusError("CHANGES_REQUESTED", f"{reviewer} already reconsidered its findings at head {head} "
                            "after a pushback and still asks for changes; push a fix, or ask the human user")
-        if not (focus and focus.strip()) and self._note_since(t, verdict["id"]) is None:
+        after = self._latest_verdict_id(t, verdict["id"]) if latest else verdict["id"]
+        if not (focus and focus.strip()) and self._note_since(t, after) is None:
             raise BusError("CHANGES_REQUESTED", f"{reviewer} asked for changes at head {head}; push a fix and "
                            "request review of the new head, or, to push back on a finding, `send` a note "
                            "here with your evidence and request the same head again")
@@ -1196,9 +1227,9 @@ class Service:
         if not new_revision and standing["changes_requested"]:
             # The same head after a request for changes: a pushback (#71).  The first reviewer
             # that asked for changes reconsiders; every approval of this revision stands.
-            pushback = standing["changes_requested"][0]
+            pushback = self._pushback_target(t, standing)
             verdict = self.bus.last_verdict(t["id"], pushback)
-            self._check_pushback(t, pushback, verdict, focus, pushback in (old.get("pushbacks") or {}))
+            self._check_pushback(t, pushback, verdict, focus, pushback in (old.get("pushbacks") or {}), latest=True)
         kept = old.get("peer_settings") or {}
         merged = {a: {**kept.get(a, {}), **settings.get(a, {})} for a in order if kept.get(a) or settings.get(a)}
         heads = self._heads(t)

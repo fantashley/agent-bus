@@ -488,3 +488,140 @@ def test_history_prints_a_finish_reason_without_terminal_controls(env, no_spawn,
     assert cli.main(["history", tid]) == 0
     out = capsys.readouterr().out
     assert "\x1b[2J" not in out and "cleared" in out
+
+
+# ------------------------------------------------------------------ follow-up budget (#148)
+
+
+def test_review_only_reviews_warn_past_the_budget_but_never_park(env, no_spawn):
+    """#148: a review-only review follows a colleague's pull request for as long as it lives,
+    so it keeps only the soft budget's warning; a normal review still parks at twice it."""
+    from test_review_convergence import set_config
+    from agent_bus.service import thread_summary
+    set_config(env, review_followup_budget=1)
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    res = claude.request_review(None, str(repo), base, h1, reviewers=BOTH, review_only=True)
+    tid = res["thread"]["id"]
+    assert res["thread"]["followup_budget"] == 1 and res["thread"]["followup_limit"] is None
+    run_job(bus, tid)
+    prev = h1
+    for n in range(2, 6):  # well past twice the budget
+        h = commit(f"{n}\n")
+        claude.request_review(None, str(repo), base, h, prev_head_commit_id=prev, reviewers=BOTH)
+        run_job(bus, tid)
+        prev = h
+        t = bus.thread(tid)
+        assert t["status"] == "open" and not t["refs"].get("budget_parked")
+        assert thread_summary(t)["budget_warning"] and not thread_summary(t)["waiting_for_human"]
+        state = claude.thread_state(tid)
+        assert state["next_action"].startswith("await_head:"), state["next_action"]
+    notice = [m for m in bus.history(tid)["messages"] if m["sender"] == "system"][-1]["body"]
+    assert "run long" in notice and "never parks" in notice and "waits for them" not in notice
+    assert bus.thread(tid)["refs"]["follow_ups"] == 4
+    assert claude.finish_review(tid, "done")["thread"]["status"] == "resolved"
+
+
+def test_review_only_hands_each_head_to_every_reviewer(env, no_spawn, monkeypatch):
+    """#148: on a colleague's pull request every reviewer's findings go into one draft, so a
+    request for changes doesn't end a review-only round; a normal review still stops there."""
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review(None, str(repo), base, h1, reviewers=BOTH, review_only=True)["thread"]["id"]
+    run_job(bus, tid)  # codex asks for changes, then antigravity still reviews h1
+    st = bus.review_standings(tid)
+    assert st["changes_requested"] == BOTH and st["pending"] == []
+    assert claude.thread_state(tid)["next_action"].startswith("await_head: codex, antigravity asked")
+    # The next head: both again; one approval doesn't skip the other.
+    h2 = commit("two\n")
+    claude.request_review(None, str(repo), base, h2, prev_head_commit_id=h1, reviewers=BOTH)
+    monkeypatch.setenv("FAKE_APPROVE", "antigravity")
+    run_job(bus, tid)
+    st = bus.review_standings(tid)
+    assert st["approved"] == ["antigravity"] and st["changes_requested"] == ["codex"]
+    verdicts = [m for m in bus.history(tid)["messages"] if m["kind"] == "review_verdict"]
+    assert [m["sender"] for m in verdicts] == ["codex", "antigravity", "codex", "antigravity"]
+    # A normal review still stops at the first request for changes.
+    monkeypatch.delenv("FAKE_APPROVE")
+    other = claude.request_review(None, str(repo), base, h1, reviewers=BOTH)["thread"]["id"]
+    run_job(bus, other)
+    assert bus.review_standings(other)["pending"] == ["antigravity"]
+
+
+def test_review_only_says_wait_while_another_reviewer_is_still_on_the_head():
+    st = {"head_commit_id": "h", "complete": False, "changes_requested": ["codex"], "pending": [],
+          "reviewers": {"codex": {"state": "changes_requested"}, "antigravity": {"state": "reviewing"}},
+          "follow_ups": 0, "followup_limit": None}
+    t = {"status": "open", "refs": {"review_only": True}}
+    assert review_next_action(t, st, {"kind": "review"}).startswith("wait: codex asked for changes")
+    assert review_next_action(t, st, None).startswith("await_head:")
+
+
+def test_a_review_only_pass_that_failed_before_every_verdict_says_stop_and_resume():
+    """#148 (codex-6): a request for changes from one reviewer doesn't hide a failed pass that
+    left another reviewer without a verdict on the head."""
+    st = {"head_commit_id": "h", "complete": False, "changes_requested": ["codex"], "pending": ["antigravity"],
+          "reviewers": {"codex": {"state": "changes_requested"}, "antigravity": {"state": "pending"}},
+          "follow_ups": 0, "followup_limit": None}
+    t = {"id": "t-1", "status": "open", "refs": {"review_only": True}}
+    nxt = review_next_action(t, st, None, last_failed=True)
+    assert nxt.startswith("stop: the last review pass failed") and "agent-bus resume t-1" in nxt
+    done = {**st, "pending": [], "reviewers": {**st["reviewers"], "antigravity": {"state": "approved"}}}
+    assert review_next_action(t, done, None, last_failed=True).startswith("await_head:")
+
+
+def test_a_review_only_review_an_older_build_parked_takes_a_new_head(env, no_spawn):
+    """#148 (codex-14): a review-only thread parked for its budget before the exemption
+    isn't held by that parking any more."""
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(repo), base, h1, review_only=True)["thread"]["id"]
+    run_job(bus, tid)
+    refs = bus.thread(tid)["refs"]
+    bus.set_thread(tid, status="needs_human", refs=json.dumps({**refs, "budget_parked": True, "follow_ups": 6}))
+    h2 = commit("two\n")
+    res = claude.request_review("codex", str(repo), base, h2, prev_head_commit_id=h1)
+    assert res["thread"]["id"] == tid and res["job"] and bus.thread(tid)["status"] == "open"
+
+
+def test_review_only_pushbacks_reach_each_reviewer_that_asked_for_changes(env, no_spawn):
+    """#148 (codex-8): with several requests for changes on one head, a second pushback goes
+    to the next reviewer that hasn't reconsidered, not back to the first."""
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review(None, str(repo), base, h1, reviewers=BOTH, review_only=True)["thread"]["id"]
+    run_job(bus, tid)
+    assert bus.review_standings(tid)["changes_requested"] == BOTH
+    claude.send("The author says codex-1 is intended", thread=tid)
+    claude.request_review(None, str(repo), base, h1, prev_head_commit_id=h1, reviewers=BOTH, thread=tid)
+    assert bus.thread(tid)["refs"]["reviewer"] == "codex"
+    run_job(bus, tid)  # codex still asks for changes
+    # Repeating that request without new evidence is a repeat, not antigravity's pushback.
+    jobs = len(bus.jobs(tid))
+    claude.request_review(None, str(repo), base, h1, prev_head_commit_id=h1, reviewers=BOTH, thread=tid)
+    assert len(bus.jobs(tid)) == jobs and bus.thread(tid)["refs"]["reviewer"] == "codex"
+    claude.send("The author says antigravity-1 is intended too", thread=tid)
+    claude.request_review(None, str(repo), base, h1, prev_head_commit_id=h1, reviewers=BOTH, thread=tid)
+    assert bus.thread(tid)["refs"]["reviewer"] == "antigravity"
+
+
+def test_carried_over_findings_are_marked():
+    """#148: a still-blocking finding the reviewer doesn't relist is carried with its old
+    location, marked so the PR bridge doesn't anchor it on the new head's lines."""
+    prior = {"codex-1": {"id": "codex-1", "file": "a.py", "line": 3, "severity": "high", "comment": "x"},
+             "codex-2": {"id": "codex-2", "file": "b.py", "line": 4, "severity": "high", "comment": "y"}}
+    v = {"verdict": "request_changes", "summary": "", "earlier": [{"id": "codex-1", "status": "still_blocking",
+                                                                   "note": ""}],
+         "findings": [{"id": "codex-2", "file": "b.py", "line": 9, "severity": "high", "comment": "y"}]}
+    out = settle_earlier(v, prior)
+    by = {f["id"]: f for f in out["findings"]}
+    assert by["codex-1"]["carried"] is True and by["codex-1"]["line"] == 3
+    assert "carried" not in by["codex-2"]
