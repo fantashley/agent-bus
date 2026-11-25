@@ -1,6 +1,7 @@
 """#75: a follow-up after a rebase gets a rebase-aware interdiff, not main's changes."""
 import json
 import os
+import re
 import shutil
 import subprocess
 
@@ -121,6 +122,64 @@ def test_rebase_with_a_change_of_its_own_shows_only_that(env, no_spawn, repo):
     assert last["argv"][:3] == ["exec", "resume", "--json"] and FOLLOWUP in p
     assert "Interdiff since the head you last reviewed (rebase-aware: old head" in p and f"base moved from {repo.m1}" in p
     assert "-FEATURE\n+FEATURE-V2" in p and "MAIN-CHANGE" not in p and "pure rebase" not in p
+    # The commits, old against new (#135): this one is rewritten, so it is dropped and added.
+    assert f"git range-diff of {repo.m1[:12]}..{f1[:12]} against {m2[:12]}..{f2[:12]}" in p
+    assert re.search(r"1:  [0-9a-f]+ < -:  -+ change\n-:  -+ > 1:  [0-9a-f]+ change", p)
+    assert "main moves on" not in p
+
+
+def test_range_diff_marks_a_commit_changed_in_the_rebase(env, no_spawn, repo):
+    body = "".join(f"line {i}\n" for i in range(20))
+    bus, claude, tid, f1 = reviewed(env, repo, {"b.txt": body})
+    m2 = repo.commit({"c.txt": "MAIN-CHANGE\n"}, "main moves on", parent=repo.m1)
+    f2 = repo.commit({"b.txt": body.replace("line 7\n", "line seven\n")}, "change", parent=m2)
+    p = followup(env, claude, bus, tid, repo, m2, f2, f1)["prompt"]
+    assert re.search(r"1:  [0-9a-f]+ ! 1:  [0-9a-f]+ change\n", p) and "-+line 7\n    ++line seven" in p
+
+
+def test_pure_rebase_range_diff_pairs_the_commits_and_is_capped(env, no_spawn, repo, monkeypatch):
+    bus, claude, tid, f1 = reviewed(env, repo, {"b.txt": "FEATURE\n"})
+    f1b = repo.commit({"d.txt": "MORE\n"}, "second commit", parent=f1)
+    claude.request_review("codex", str(repo.path), repo.m1, f1b, prev_head_commit_id=f1)
+    run_job(bus, tid)
+    assert "range-diff" not in calls(env)[-1]["prompt"]  # same base: no rebase, no range-diff
+    m2 = repo.commit({"c.txt": "MAIN-CHANGE\n"}, "main moves on", parent=repo.m1)
+    f2 = repo.commit({"b.txt": "FEATURE\n"}, "change", parent=m2)
+    f2b = repo.commit({"d.txt": "MORE\n", "e.txt": "ADDED\n"}, "second commit, ```reworked```", parent=f2)
+    monkeypatch.setattr("agent_bus.worker.RANGE_DIFF_MAX", 120)
+    p = followup(env, claude, bus, tid, repo, m2, f2b, f1b)["prompt"]
+    assert "rebase-aware" in p and re.search(r"1:  [0-9a-f]+ = 1:  [0-9a-f]+ change\n", p)
+    assert "[... range-diff truncated; the diff below has the content ...]" in p
+    assert "\n````text\n" in p and "```reworked```" in p  # a commit message can't close the fence
+    monkeypatch.setattr("agent_bus.worker.RANGE_DIFF_COMMITS", 1)  # f2b's change has two commits
+    w = Worker(bus, bus.jobs(tid)[-1]["id"])
+    refs = {"repo": str(repo.path), "prev_head_commit_id": f1b, "base_commit_id": m2, "head_commit_id": f2b}
+    assert w.range_diff_note(refs, repo.m1) == ""
+    monkeypatch.setattr("agent_bus.worker.RANGE_DIFF_COMMITS", 2)
+    assert "````text" in w.range_diff_note(refs, repo.m1)
+    # Commit messages come out as UTF-8 whatever the log encoding (codex-5).
+    repo.git("config", "i18n.logOutputEncoding", "UTF-16")
+    monkeypatch.setattr("agent_bus.worker.RANGE_DIFF_MAX", 4_000)
+    assert "second commit, ```reworked```" in w.range_diff_note(refs, repo.m1)
+    # A long one is read only up to what can be shown, then cut (codex-6).
+    monkeypatch.setattr("agent_bus.worker.RANGE_DIFF_MAX", 10)
+    note = w.range_diff_note(refs, repo.m1)
+    assert note.count("range-diff truncated") == 1 and len(note) < len(prompts_range_diff()) + 200
+
+
+def test_range_diff_is_skipped_when_a_textconv_filter_is_configured(env, no_spawn, repo):
+    bus, claude, tid, f1 = reviewed(env, repo, {"b.txt": "FEATURE\n"})
+    repo.git("config", "diff.evil.textconv", "touch TEXTCONV-RAN; cat")
+    m2 = repo.commit({".gitattributes": "*.txt diff=evil\n", "c.txt": "MAIN\n"}, "main moves on", parent=repo.m1)
+    f2 = repo.commit({"b.txt": "FEATURE-V2\n"}, "change", parent=m2)
+    p = followup(env, claude, bus, tid, repo, m2, f2, f1)["prompt"]
+    assert "rebase-aware" in p and "range-diff" not in p
+    assert not (repo.path / "TEXTCONV-RAN").exists()
+
+
+def prompts_range_diff():
+    from agent_bus import prompts
+    return prompts.RANGE_DIFF
 
 
 def assert_full_diff(env, bus, tid, last, why):
@@ -137,6 +196,11 @@ def test_conflicting_rebase_falls_back_to_the_full_diff(env, no_spawn, repo):
     last = followup(env, claude, bus, tid, repo, m2, f2, f1)
     assert_full_diff(env, bus, tid, last, "replaying the previous head onto the new base conflicts")
     assert f"Previous head (already reviewed): {f1}" in last["prompt"]
+    # The commits still pair up, next to the full diff (codex-4).
+    p = last["prompt"]
+    assert "The change was rebased since your last verdict.\nThe commits, old against new" in p
+    assert re.search(r"-:  -+ > 1:  [0-9a-f]+ change, conflict resolved\n", p)
+    assert p.index("git range-diff of") < p.index("Diff from base to head")
 
 
 def test_missing_old_base_falls_back_to_the_full_diff(env, no_spawn, repo):
@@ -232,3 +296,5 @@ def test_jj_repo_gets_the_rebase_aware_interdiff(env, no_spawn, colocate):
     run_job(bus, tid)
     p = calls(env)[-1]["prompt"]
     assert FOLLOWUP in p and "pure rebase" in p and "MAIN-CHANGE" not in p
+    # git's range-diff only where git reads the repository itself (#135).
+    assert ("git range-diff of" in p) == colocate

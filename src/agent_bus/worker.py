@@ -1212,13 +1212,16 @@ class Worker:
         # The author pushes back on this reviewer's findings without changing the code (#71).
         # (A retry of that pass too: the request marked its round.)
         pushback = followup and refs.get("pushback_round") == t["round"]
-        rebase_note = fallback = fallback_why = ""
+        rebase_note = fallback = fallback_why = range_note = ""
         try:
             full_diff, full_heading = self.review_diff(refs, interdiff=False)
             if pushback:
                 pass  # no interdiff: the head is the one it last reviewed
             elif rebased:
                 inter, why = self.rebase_interdiff(refs, old_base, full_diff)
+                # The commits, old against new: with the interdiff, or with the full diff it falls
+                # back to (#135).
+                range_note = self.range_diff_note(refs, old_base)
                 if inter is None:
                     resume, fallback, fallback_why = False, f" Full diff: the base changed and {why}.", why
                 else:
@@ -1230,6 +1233,7 @@ class Worker:
                     if not inter:
                         inter = "(empty diff: a pure rebase)"
                         rebase_note += prompts.PURE_REBASE
+                    rebase_note += range_note
             elif resume:
                 inter, inter_heading = self.review_diff(refs, interdiff=True)
         except MissingRevision as e:
@@ -1272,7 +1276,10 @@ class Worker:
             why_full = f"the base changed and {fallback_why}"
         else:
             why_full = "your earlier session can't be resumed, so this pass starts a fresh one"
-        fresh = self.review_prompt(t, refs, full_diff, f"{full_heading.rstrip(':')}, because {why_full}:",
+        heading = f"{full_heading.rstrip(':')}, because {why_full}:"
+        if range_note:
+            heading = f"The change was rebased since your last verdict.{range_note}\n\n{heading}"
+        fresh = self.review_prompt(t, refs, full_diff, heading,
                                    notes(everything), earlier, framing=framing, pushback=pushback, snap=snap,
                                    earlier_note=earlier_note, prior=prior, mention=mention)
         replies = "\n\n".join(prompts.render_message(m) for m in notes([m for m in everything
@@ -1443,7 +1450,7 @@ class Worker:
                       prior: dict[str, dict] | None = None, mention: list[str] | None = None) -> str:
         focus = refs.get("focus")
         # A reviewer with an earlier verdict converges on it rather than starting over (#71).
-        converge = ""
+        converge = prompts.FIRST_PASS  # (#135)
         if earlier:
             converge = "\n" + (prompts.CONVERGE + prompts.PUSHBACK_NOTE + earlier_note if pushback else framing)
         converge += budget_note(t)  # every pass, a reviewer's first one too
@@ -1791,6 +1798,69 @@ class Worker:
             return None, "the rebase-aware interdiff is bigger than the full diff"
         return self.cap_diff(diff), ""
 
+    def range_diff_note(self, refs: dict, old_base: str) -> str:
+        """The rebased change's commits, old against new (#135): `git range-diff` of
+        old_base..previous head against base..head, capped at RANGE_DIFF_MAX characters, as a
+        prompt section; "" when there is none.  Only in a repository git reads directly (plain
+        or colocated git; a jj repo that isn't colocated is skipped), and never when a textconv
+        filter or external diff is configured: range-diff's own `git log -p` would run it,
+        --no-textconv or not."""
+        repo = refs["repo"]
+        if not os.path.exists(os.path.join(repo, ".git")) and cfg.vcs(repo) == "jj":
+            return ""
+
+        def git(*argv: str) -> subprocess.CompletedProcess | None:
+            try:
+                return subprocess.run(["git", "--no-replace-objects", *argv], cwd=repo, capture_output=True,
+                                      text=True, errors="replace", timeout=60)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+
+        filters = git("config", "--get-regexp", r"^diff\.(external|.*\.(textconv|command))$")
+        if filters is None or filters.returncode != 1:  # 1: none configured
+            return ""
+        ranges = [f"{old_base}..{refs['prev_head_commit_id']}", f"{refs['base_commit_id']}..{refs['head_commit_id']}"]
+        # Its cost grows with the square of the commit count: a range that long (a base that
+        # isn't the change's own) isn't worth matching up.
+        for r in ranges:
+            count = git("rev-list", "--count", r)
+            if count is None or count.returncode != 0 or not count.stdout.strip().isdigit() \
+                    or int(count.stdout) > RANGE_DIFF_COMMITS:
+                return ""
+        # Read only as much as can be shown (a long one is killed there), UTF-8 whatever
+        # i18n.logOutputEncoding says.
+        argv = ["git", "--no-replace-objects", "-c", "log.showSignature=false", "-c", "i18n.logOutputEncoding=UTF-8",
+                "range-diff", "--no-color", "--no-notes", *ranges]
+        try:
+            proc = subprocess.Popen(argv, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            return ""
+        timer = threading.Timer(60, proc.kill)
+        timer.start()
+        try:
+            raw = proc.stdout.read(4 * RANGE_DIFF_MAX + 1)
+            cut = len(raw) > 4 * RANGE_DIFF_MAX
+            if cut:
+                proc.kill()
+            proc.wait()
+        finally:
+            timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+        if (not cut and proc.returncode != 0) or not raw.strip():
+            return ""
+        # No NUL byte: an argv (agy's prompt) can't hold one.
+        text = raw.decode("utf-8", "replace").replace("\0", "\\0").rstrip()
+        if cut or len(text) > RANGE_DIFF_MAX:
+            text = text[:RANGE_DIFF_MAX] + "\n[... range-diff truncated; the diff below has the content ...]"
+        # A fence longer than any run of backticks in it, so repository text can't close it.
+        fence = "`" * max(3, 1 + max((len(m) for m in re.findall(r"`+", text)), default=0))
+        return prompts.RANGE_DIFF.format(old_base=old_base[:12], prev=refs["prev_head_commit_id"][:12],
+                                         base=refs["base_commit_id"][:12], head=refs["head_commit_id"][:12],
+                                         fence=fence, range_diff=text)
+
     def cap_diff(self, diff: str) -> str:
         # The file list comes from the whole diff, so a truncated one still names every file (#93).
         return Diff(self._cap_diff(diff), diff_overview(diff))
@@ -1899,6 +1969,10 @@ def format_commits(out: str) -> str:
 # Every git diff agent-bus runs uses these prefixes, whatever diff.noprefix or
 # diff.mnemonicPrefix say, as jj's --git output does; diff_overview relies on them.
 DIFF_PREFIXES = ("--src-prefix=a/", "--dst-prefix=b/")
+# How much of a rebased change's `git range-diff` goes in a follow-up prompt (#135).
+RANGE_DIFF_MAX = 4_000
+# ...and the most commits either side may have for one to be computed.
+RANGE_DIFF_COMMITS = 50
 
 
 class Diff(str):
