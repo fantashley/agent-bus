@@ -98,6 +98,8 @@ def format_report(rep: dict) -> str:
                      "uncached input, when a codex turn's input also counted its cached input; as recorded: "
                      + ", ".join(f"{a} {n} turn{'s' if n != 1 else ''}, input {_n(rep['agents'][a]['unsplit_input'])}"
                                  f" cache read {_n(rep['agents'][a]['unsplit_cache_read'])}"
+                                 + (f" cache write {_n(rep['agents'][a]['unsplit_cache_write'])}"
+                                    if rep['agents'][a]['unsplit_cache_write'] else "")
                                  for a, n in unsplit.items()) + ")")
     lines += ["", "by thread (most recent first):"]
     for t in rep["threads"]:

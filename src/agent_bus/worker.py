@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 from . import config as cfg
-from . import autoresume, prompts, provenance, quota, snapshot, unvotable, usages
+from . import autoresume, procinfo, prompts, provenance, quota, snapshot, unvotable, usages
 from .db import HUMAN, SYSTEM, Bus, BusError, format_dissent, review_progress
 from .peers import (ADAPTERS, Adapter, TurnResult, adapter, cli_version, extract_reply, fenced_body,
                     format_usage)
@@ -46,6 +46,7 @@ def spawn(job_id: str) -> int:
         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
         cwd=str(cfg.state_dir()))
     log.close()
+    procinfo.reap_later(proc)
     return proc.pid
 
 
@@ -2062,15 +2063,36 @@ def prior_blocking(mine: dict | None) -> dict[str, dict]:
             if isinstance(f, dict) and f.get("id") and f.get("severity") in BLOCKING}
 
 
+# How much of the earlier blocking findings' text a follow-up prompt quotes in all (#126):
+# each in full while this lasts (a finding's comment is at most 4,000 characters, see
+# normalize_verdict), keeping room for the first EARLIER_MIN_TEXT characters of each of the
+# rest (less, when there are too many for that).
+EARLIER_TEXT_CAP = 12_000
+EARLIER_MIN_TEXT = 300
+
+
 def earlier_findings_note(reviewer: str, mine: dict | None, prior: dict[str, dict]) -> str:
-    """The follow-up prompt's list of earlier blocking findings to settle, by id (#101)."""
+    """The follow-up prompt's list of earlier blocking findings to settle, by id (#101),
+    each with its full text within EARLIER_TEXT_CAP (#126)."""
     if not prior:
         return ""
+    comments = {fid: " ".join(str(f.get("comment") or "").split()) for fid, f in prior.items()}
+    least = min(EARLIER_MIN_TEXT, EARLIER_TEXT_CAP // len(prior))
+    # What each finding is sure of: its first ``least`` characters, or all of a shorter one.
+    later = sum(min(least, len(c)) for c in comments.values())
+    budget = EARLIER_TEXT_CAP
     rows = []
     for fid, f in prior.items():
         loc = f"{f.get('file')}:{f['line']}" if f.get("line") else str(f.get("file"))
-        comment = " ".join(str(f.get("comment") or "").split())
-        rows.append(f"- {fid} [{f.get('severity')}] {loc}: {comment[:300]}{'…' if len(comment) > 300 else ''}")
+        comment = comments[fid]
+        later -= min(least, len(comment))
+        room = budget - later  # never below this one's share: budget >= what is still reserved
+        if len(comment) > room:
+            comment = comment[:room] + "… (cut short)"
+            budget -= room
+        else:
+            budget -= len(comment)
+        rows.append(f"- {fid} [{f.get('severity')}] {loc}: {comment}")
     return prompts.EARLIER_FINDINGS.format(head=mine["data"].get("head_commit_id"), example=next(iter(prior)),
                                            findings=prompts.wrap_peer(reviewer, "\n".join(rows)))
 

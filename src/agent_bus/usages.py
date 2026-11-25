@@ -19,6 +19,11 @@ findings and notes since the reviewer's last pass are searched with the same cap
 names are shown fewest hits first, a very common one collapses to one line, and the changed
 definitions are never cut for space (at worst they shrink to that one line), so generic
 names can't crowd out the specific ones.
+
+Names the added lines only read (#126) are searched too, so a reviewer finds who sets them:
+string keys (``refs.get("opening_focus")``, ``refs["opening_focus"]``) first, then attributes
+read but not called (``t.launched``), at most MAX_READ of them, with the mentioned names'
+low priority.
 """
 
 from __future__ import annotations
@@ -42,11 +47,13 @@ GREP_TIMEOUT_S = 60
 # names taken from the thread's findings and notes.
 MAX_METHODS = 4
 MAX_MENTIONED = 8
+# Names the added lines only read (string keys, then attributes), on top of those.
+MAX_READ = 6
 # A name with more hits than this is too common to list: one line with its busiest files.
 GENERIC_HITS = 100
 # What a term is, and how much room it gets: the changed definitions (and fields) are always
 # shown, at worst as one line; the rest go, highest hit count first, when space runs out.
-KINDS = {"defined": 0, "field": 0, "enclosing": 1, "override": 1, "mentioned": 2}
+KINDS = {"defined": 0, "field": 0, "enclosing": 1, "override": 1, "read": 2, "mentioned": 2}
 
 # A definition on a changed line: Python, JS/TS, Rust, Go (methods too), C-like type keywords.
 _DEF = re.compile(r"\b(?:def|class|function|fn|func|struct|enum|interface|trait|type|macro_rules!)\s+"
@@ -70,6 +77,10 @@ _METHOD = re.compile(r"^(\s+)(?:async\s+)?(?:pub(?:\([^)]*\))?\s+)?(def|fn)\s+([
 _SELF = re.compile(r"\b(def|fn)\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:<[^>]*>)?\(\s*(?:&\s*)?(?:mut\s+)?(?:self|cls)\b")
 # A name in backticks in a finding or note: `needs_you`, `needs_you()`, `TurnResult.launched`.
 _TICKED = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)(?:\(\))?`")
+# A name read on an added line: a string key (x.get("key"), x["key"], getattr(x, "key")), or an
+# attribute that isn't called (x.attr, not x.attr(...)).
+_KEY = re.compile(r"""(?:\.get\(\s*|(?<=[A-Za-z0-9_)\]])\[\s*|getattr\(\s*[^,()]+,\s*)["']([A-Za-z_][A-Za-z0-9_]*)["']""")
+_ATTR = re.compile(r"(?<=[A-Za-z0-9_)\]])\.([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\()")
 # File extensions: `cli.py` names a file, not a symbol.
 _EXT = frozenset({"py", "js", "ts", "tsx", "jsx", "md", "json", "toml", "txt", "yml", "yaml", "sh", "nix", "rs",
                   "go", "lock", "cfg", "ini", "html", "css", "c", "h", "cpp", "java", "rb", "sql", "db"})
@@ -89,10 +100,13 @@ def _ok(name: str) -> bool:
             and not (name.startswith("__") and name.endswith("__")))
 
 
-def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], dict[str, str]]:
+def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], dict[str, str], dict[str, None]]:
     """The names ``diff`` touches: definitions and constants on changed lines, changed class
-    fields (name -> class), the definitions the changed lines sit in, and the changed methods
-    (indented definitions on changed lines, or the method a changed line sits in)."""
+    fields (name -> class), the definitions the changed lines sit in, the changed methods
+    (indented definitions on changed lines, or the method a changed line sits in), and the
+    names added lines read (string keys first, then attributes not called)."""
+    keys: dict[str, None] = {}
+    attrs: dict[str, None] = {}
     defined: dict[str, None] = {}
     fields: dict[str, str] = {}
     enclosing: dict[str, None] = {}
@@ -120,6 +134,9 @@ def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], 
         found = [d.group(1) for d in _DEF.finditer(body)]
         c = _CLASS.match(body)
         meth = _METHOD.match(body)
+        if line[0] == "+" and not body.lstrip().startswith(("#", "//")):
+            keys.update(dict.fromkeys(k.group(1) for k in _KEY.finditer(body)))
+            attrs.update(dict.fromkeys(a.group(1) for a in _ATTR.finditer(body)))
         if line[0] in "+-":
             defined.update(dict.fromkeys(found))
             k = _CONST.match(body)
@@ -145,7 +162,7 @@ def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], 
         if found:
             current = found[-1]
             method = meth.group(2) if meth else ""
-    return defined, fields, enclosing, methods
+    return defined, fields, enclosing, methods, {**keys, **attrs}
 
 
 def symbols(diff: str, limit: int = MAX_SYMBOLS) -> list[str]:
@@ -154,7 +171,7 @@ def symbols(diff: str, limit: int = MAX_SYMBOLS) -> list[str]:
     then the functions or classes the changed lines sit in (their callers see the change):
     the last definition above them in the hunk, or failing that the one git names in the
     hunk header."""
-    return [t.pattern for t in terms(diff, limit=limit) if t.kind != "override"]
+    return [t.pattern for t in terms(diff, limit=limit) if t.kind not in ("override", "read")]
 
 
 def mentioned(texts: list[str], exclude: set[str] | frozenset[str] = frozenset(),
@@ -176,9 +193,10 @@ def mentioned(texts: list[str], exclude: set[str] | frozenset[str] = frozenset()
 
 def terms(diff: str, mention: list[str] | None = None, limit: int = MAX_SYMBOLS) -> list[Term]:
     """What to search for ``diff``: its names (see symbols, at most ``limit``), the other
-    definitions of its changed methods (at most MAX_METHODS), and the names in ``mention``
-    that aren't among them (at most MAX_MENTIONED)."""
-    defined, fields, enclosing, methods = _scan(diff)
+    definitions of its changed methods (at most MAX_METHODS), the names its added lines only
+    read (at most MAX_READ), and the names in ``mention`` that aren't among them (at most
+    MAX_MENTIONED)."""
+    defined, fields, enclosing, methods, reads = _scan(diff)
     out: dict[str, Term] = {}
     for n in defined:
         out.setdefault(n, Term(n, "defined"))
@@ -191,6 +209,8 @@ def terms(diff: str, mention: list[str] | None = None, limit: int = MAX_SYMBOLS)
     meths = [Term(f"{kw} {n}", "override") for n, kw in methods.items()
              if not (n.startswith("__") and n.endswith("__")) and n not in _SKIP and not n.startswith("test")]
     found += meths[:MAX_METHODS]
+    have = {t.pattern for t in found} | set(out)
+    found += [Term(n, "read") for n in reads if n not in have and _ok(n)][:MAX_READ]
     have = {t.pattern for t in found}
     found += [Term(n, "mentioned") for n in (mention or []) if n not in have][:MAX_MENTIONED]
     return found
@@ -327,6 +347,8 @@ def _desc(t: Term) -> str:
                 "or the one it overrides")
     if t.kind == "mentioned":
         return "named in the thread's findings or notes"
+    if t.kind == "read":
+        return "a key or attribute the changed lines read: where it is set"
     return ""
 
 

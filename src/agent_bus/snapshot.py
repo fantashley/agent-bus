@@ -377,7 +377,8 @@ def delta(repo: str, old_head: str, snap: Snapshot, baseline: bool) -> tuple[lis
     ones it lost (#126), for a resumed follow-up whose session was given the old head's whole
     list (``baseline``: see complete()); or None when that can't be told exactly enough, so
     the whole list is shown: no baseline, a sparse copy now, the old list too long to have
-    been listed whole, a symlink or type change, a git error, or over MAX_DELTA files."""
+    been listed whole, a symlink changed or deleted, a type change, a git error, or over
+    MAX_DELTA files."""
     if not baseline or snap.mode != "full" or not snap.path or not _ID.fullmatch(old_head):
         return None
     env = _git_env(repo)
@@ -395,11 +396,14 @@ def delta(repo: str, old_head: str, snap: Snapshot, baseline: bool) -> tuple[lis
             return None
         old_mode, new_mode, status = fields[0].lstrip(b":"), fields[1], fields[4]
         name = os.fsdecode(path)
-        if b"120000" in (old_mode, new_mode) and status != b"A" and status != b"D":
-            return None  # a symlink changed: whether it is in the copy can change too (codex-7)
-        if status == b"A" and name in have:
+        if b"120000" in (old_mode, new_mode):
+            # A symlink changed: whether it is in the copy can change too (codex-7); a deleted
+            # one was in the old copy only if its target was in the tree then (#134); and an
+            # added one can change where other, unchanged symlinks resolve.
+            return None
+        if status == b"A" and name in have:  # not a submodule, which the copy leaves out
             added.append(name)
-        elif status == b"D" and _safe(name):
+        elif status == b"D" and _safe(name) and old_mode != b"160000":  # a submodule never was in it
             removed.append(name)
         elif status not in (b"A", b"D", b"M"):
             return None  # a type change, or anything else: can't tell (antigravity-5)

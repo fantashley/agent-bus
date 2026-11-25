@@ -900,9 +900,32 @@ class Bus:
         msgs, blind = self._visible(t, rows, viewer)
         return {"thread": t, "messages": msgs, "blind": blind}
 
-    def _cursor(self, subscriber: str, thread_id: str) -> int:
+    def _cursor(self, subscriber: str, thread_id: str, store: bool = False) -> int:
+        """The subscriber's cursor on the thread.  A session that has none yet starts where
+        its client's other sessions got to (#126): a client can run several MCP servers at
+        once, or a new one per task (Claude Code's subagents), and without this the first
+        ``wait`` of each replayed the whole thread to a caller that had read it.  Only for a
+        verified client that isn't a daemon serving several windows, as in _reattachable.
+        ``store``: a session's own read (unread, replay) stores the inherited position (even
+        0), so from then on the sessions move on apart, and a replay can't move the cursor
+        back (codex-1).  Hooks and notices only look."""
         row = self._one("SELECT last_id FROM cursors WHERE subscriber=? AND thread_id=?", subscriber, thread_id)
-        return row["last_id"] if row else 0
+        if row:
+            return row["last_id"]
+        me = self._one("SELECT 1 FROM sessions WHERE id=? AND client_pid IS NOT NULL AND client_start IS NOT NULL"
+                       " AND rex_reason IS NULL", subscriber)
+        if me is None:
+            return 0
+        row = self._one(
+            "SELECT MAX(c.last_id) AS last_id FROM sessions me JOIN sessions s"
+            " ON s.client_pid=me.client_pid AND s.client_start=me.client_start AND s.agent_type=me.agent_type"
+            " AND COALESCE(s.harness, s.agent_type)=COALESCE(me.harness, me.agent_type) AND s.id!=me.id"
+            " AND s.rex_reason IS NULL JOIN cursors c ON c.subscriber=s.id AND c.thread_id=? WHERE me.id=?",
+            thread_id, subscriber)
+        last = row["last_id"] or 0
+        if store:
+            self._set_cursor(subscriber, thread_id, last)
+        return last
 
     def _set_cursor(self, subscriber: str, thread_id: str, last_id: int) -> None:
         self.conn.execute(
@@ -949,7 +972,7 @@ class Bus:
             threads = self.candidate_threads(agent_type)
         out: list[dict] = []
         for t in threads:
-            last = self._cursor(subscriber, t["id"])
+            last = self._cursor(subscriber, t["id"], store=True)
             rows = self._all(
                 "SELECT * FROM messages WHERE thread_id=? AND id>? AND sender!=?"
                 " AND (recipient IS NULL OR recipient=?) ORDER BY id LIMIT ?",
@@ -973,6 +996,7 @@ class Bus:
         cursor move all come from the same state (a resumed thread can be blind again)."""
         with self.tx():
             t = self.thread(thread_id)
+            self._cursor(subscriber, thread_id, store=True)  # an inherited position is stored first, so this never moves it back
             after = max(0, after)
             bound = None
             if self._blind(t, agent_type):
