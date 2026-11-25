@@ -76,7 +76,7 @@ def _locked(thread_id: str, wait: float | None = None, cancelled: Callable[[], b
     to remove it with the removal itself, never interleave.  Yields False if someone else
     still holds it after ``wait`` seconds (0: a sweep skips a snapshot being built; a stuck
     old worker's build never blocks a retry's turn for long), or once ``cancelled()`` says
-    the job waiting for it was cancelled (#113)."""
+    the job waiting for it was cancelled, even if it got the lock (#113)."""
     locks = root() / ".locks"
     locks.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(locks / f"{thread_id}.lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -91,6 +91,9 @@ def _locked(thread_id: str, wait: float | None = None, cancelled: Callable[[], b
                     yield False
                     return
                 time.sleep(0.2)
+        if cancelled is not None and cancelled():  # cancelled while it waited, or just as it got it
+            yield False
+            return
         yield True
     finally:
         os.close(fd)

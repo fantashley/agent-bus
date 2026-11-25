@@ -486,6 +486,7 @@ class Worker:
         emit = lambda kind, text: self.event(kind, text, agent)  # noqa: E731
         tag = self.job["id"]
         row = self.begin_usage(ad, model, resume_id)
+        fresh = False  # whether the fresh-session fallback below ran
         # Checked last, just before the hand-off to the CLI: only a turn started in time may
         # post past a discussion's deadline (#74).
         left = self.deadline_left()
@@ -514,16 +515,19 @@ class Worker:
             row = self.begin_usage(ad, model, None)
             left = self.deadline_left()  # again just before the hand-off (#74)
             if left > 0:
-                # Dropped only once the fresh session really runs: a skipped fallback keeps
-                # the stored one for a later resume or debrief (#106).
-                self.set_peer_session(agent, None)
                 res = ad.run(fresh_prompt or prompt, cwd, max(30.0, min(self.config.turn_timeout_s, left)), emit,
                              add_dirs=add_dirs, cancelled=self.cancelled, peer_tag=tag)
                 self.account(ad, model, res, resumed=False, row=row)
+                fresh = True
             else:
                 self.drop_usage(row)
         self.event("turn_end", ("ok" if res.ok else f"failed: {res.error}") + tokens(res), agent)
         self.check()  # a worker that lost its lease records nothing
+        if fresh:
+            # The stored session is dropped only once the fresh one has run, never between
+            # the last deadline check and the launch: a skipped fallback keeps it for a
+            # later resume or debrief (#106).
+            self.set_peer_session(agent, None)
         if res.quota:
             self.record_quota(agent, model, res.quota)
             # Keep the conversation pinned for a retry after the reset, and never pin the

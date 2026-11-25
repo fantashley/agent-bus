@@ -420,6 +420,10 @@ def test_a_cancelled_job_stops_waiting_for_the_lock(env, monkeypatch):
         snap = snapshot.ensure(str(repo), "t-abc", base, head, 10**9, cancelled=lambda: True)
     assert time.monotonic() - start < 5
     assert snap.path is None and "cancelled" in snap.reason
+    # Cancelled just as the lock comes free: it still builds nothing.
+    snap = snapshot.ensure(str(repo), "t-abc", base, head, 10**9, cancelled=lambda: True)
+    assert snap.path is None and "cancelled" in snap.reason
+    assert not (snapshot.root() / "t-abc").exists()
 
 
 def test_a_sparse_snapshot_over_the_file_cap_is_reused(env, monkeypatch):

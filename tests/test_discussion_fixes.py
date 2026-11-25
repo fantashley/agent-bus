@@ -411,3 +411,26 @@ def test_a_fresh_retry_skipped_at_the_deadline_keeps_the_stored_session(env, no_
     assert bus.peer_session(tid, "codex") == stored
     rs = bus.usage_rows(0, thread_id=tid)
     assert len(rs) == 2 and all(r["done"] for r in rs)  # the failed resume's row; the skipped retry's is gone
+
+
+def test_a_fresh_retry_drops_the_stored_session_only_after_it_ran(env, no_spawn, monkeypatch):
+    """Nothing between the retry's last deadline check and its launch writes to the database
+    (a write can wait across the cutoff, #106): the stored session is dropped once the fresh
+    session has run, and replaced by it."""
+    bus = env["bus"]
+    tid, w = turning_worker(bus)
+    stored = bus.peer_session(tid, "codex")
+    monkeypatch.setenv("FAKE_RESUME_FAILS", "codex")
+    before = len(env["log"].read_text().splitlines())
+    set_peer_session = Worker.set_peer_session
+    launched_by_then = []
+
+    def watch(self, agent, external_id):
+        if external_id is None:
+            launched_by_then.append(len(env["log"].read_text().splitlines()) - before)
+        return set_peer_session(self, agent, external_id)
+
+    monkeypatch.setattr(Worker, "set_peer_session", watch)
+    assert w.turn("codex", "Q?", resume=True).ok
+    assert launched_by_then == [2]  # the failed resume and the fresh retry had both run
+    assert bus.peer_session(tid, "codex") not in (None, stored)
