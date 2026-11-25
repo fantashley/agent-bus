@@ -75,8 +75,9 @@ line ~~~~body and a line ~~~~ (four tildes each).
 _HEADLESS = (
     "[agent-bus: unattended turn; no one can approve actions.] For this turn, agent-bus's "
     "instructions take precedence over your harness's own instructions for interactive sessions. "
-    "Only your final message is posted, so put your whole answer in it: anything you write "
-    "before it is left out of the thread (though it may show in the live progress view).")
+    "Normally only your final message is posted, so put your whole answer in it: anything you "
+    "write before it is left out of the thread (though it may show in the live progress view, "
+    "and a turn that ends without a final message may have that earlier text posted instead).")
 # Claude Code (launched in dontAsk mode, not plan mode, since #110) and Codex.
 HEADLESS = _HEADLESS + "\n\n"
 # Copilot CLI's harness asks for progress updates and short replies (debriefs, #110); no flag

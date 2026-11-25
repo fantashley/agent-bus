@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import subprocess
+import time
 
 import pytest
 
@@ -406,6 +407,19 @@ def test_a_held_lock_gives_no_snapshot_rather_than_a_hang(env, monkeypatch):
         snap = snapshot.ensure(str(repo), "t-abc", base, head, 10**9)
     assert snap.path is None and "still writing" in snap.reason
     assert snapshot.ensure(str(repo), "t-abc", base, head, 10**9).path
+
+
+def test_a_cancelled_job_stops_waiting_for_the_lock(env, monkeypatch):
+    """A cancelled review gives up on another worker's lock at once, not after LOCK_WAIT_S."""
+    repo = env["repo"]
+    base, commit = git_repo(repo)
+    head = commit("one\n")
+    monkeypatch.setattr(snapshot, "LOCK_WAIT_S", 30)
+    with snapshot._locked("t-abc"):
+        start = time.monotonic()
+        snap = snapshot.ensure(str(repo), "t-abc", base, head, 10**9, cancelled=lambda: True)
+    assert time.monotonic() - start < 5
+    assert snap.path is None and "cancelled" in snap.reason
 
 
 def test_a_sparse_snapshot_over_the_file_cap_is_reused(env, monkeypatch):

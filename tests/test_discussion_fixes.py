@@ -342,3 +342,72 @@ def test_fresh_session_retry_isnt_started_past_the_deadline(env, no_spawn, monke
     calls = [json.loads(line) for line in env["log"].read_text().splitlines()]
     assert len(calls) == 3  # round 1's two turns, then one failed resume and no fresh retry
     assert bus.thread(tid)["status"] == "needs_human"
+
+
+def turning_worker(bus, agent="codex"):
+    """A discussion's job claimed by a worker that has run ``agent``'s first turn, so the
+    thread has a stored session for it and, for codex, a session total to share from."""
+    tid = Service(bus, HUMAN).start_discussion("Q?", peers=[agent], max_rounds=3)["thread"]["id"]
+    w = Worker(bus, bus.jobs(tid)[-1]["id"])
+    assert bus.claim_job(w.job["id"], w.owner)
+    assert w.turn(agent, "Q?").ok
+    return tid, w
+
+
+def test_a_turn_skipped_at_the_deadline_leaves_no_usage_row(env, no_spawn, monkeypatch):
+    """The deadline passes between a resumed turn's setup and its launch (#106): the row
+    begin_usage started is deleted, not closed, so the session's next resumed turn (after
+    `agent-bus resume`, or a debrief) still gets its own share."""
+    bus = env["bus"]
+    tid, w = turning_worker(bus)
+    begin_usage = Worker.begin_usage
+
+    def slow_begin(self, ad, model, resume_id):
+        overdue(bus, tid)
+        return begin_usage(self, ad, model, resume_id)
+
+    monkeypatch.setattr(Worker, "begin_usage", slow_begin)
+    res = w.turn("codex", "Q?", resume=True)
+    assert not res.ok and "deadline" in res.error
+    assert len(bus.usage_rows(0, thread_id=tid)) == 1  # no gap row
+    monkeypatch.setattr(Worker, "begin_usage", begin_usage)
+    bus.set_thread(tid, deadline=time.time() + 600)
+    assert w.turn("codex", "Q?", resume=True).ok
+    first, last = bus.usage_rows(0, thread_id=tid)
+    assert last["session"] == first["session"] and last["input"] == 20  # its share, not the total (40)
+
+
+def test_a_fresh_retry_skipped_at_the_deadline_keeps_the_stored_session(env, no_spawn, monkeypatch):
+    """A resume fails, and the deadline passes while the fresh retry is set up (#106): the
+    retry never runs, so the stored session stays for a later resume or debrief, even when
+    the failed attempt gave no session id of its own."""
+    from agent_bus.peers import CodexAdapter
+
+    bus = env["bus"]
+    tid, w = turning_worker(bus)
+    stored = bus.peer_session(tid, "codex")
+    assert stored
+    invocation = CodexAdapter.invocation
+
+    def no_id(self, *a, **k):  # a resume that fails before the CLI names its session
+        inv = invocation(self, *a, **k)
+        inv.external_id = None
+        return inv
+
+    monkeypatch.setattr(CodexAdapter, "invocation", no_id)
+    monkeypatch.setenv("FAKE_RESUME_FAILS", "codex")
+    begin_usage = Worker.begin_usage
+
+    def slow_begin(self, ad, model, resume_id):
+        if resume_id is None:
+            overdue(bus, tid)
+        return begin_usage(self, ad, model, resume_id)
+
+    monkeypatch.setattr(Worker, "begin_usage", slow_begin)
+    before = len(env["log"].read_text().splitlines())
+    res = w.turn("codex", "Q?", resume=True)
+    assert not res.ok and res.external_id is None
+    assert len(env["log"].read_text().splitlines()) == before + 1  # the failed resume only
+    assert bus.peer_session(tid, "codex") == stored
+    rs = bus.usage_rows(0, thread_id=tid)
+    assert len(rs) == 2 and all(r["done"] for r in rs)  # the failed resume's row; the skipped retry's is gone

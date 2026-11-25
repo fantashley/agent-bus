@@ -33,7 +33,7 @@ def test_every_turn_says_agent_bus_rules_win(env, agent):
     for resume_id in RESUMES:
         text = prompt_of(agent, invocation(env, agent, resume_id))
         assert text.startswith("[agent-bus: unattended turn") and text.endswith("\n\nPROMPT")
-        assert PRECEDENCE in text and "Only your final message is posted" in text and "live progress view" in text
+        assert PRECEDENCE in text and "Normally only your final message is posted" in text and "live progress view" in text
 
 
 def test_claude_runs_in_dont_ask_mode_with_the_same_isolation(env):

@@ -511,10 +511,12 @@ class Worker:
                 self.event("turn_end", f"failed: {res.error}" + tokens(res), agent)
                 return self.blocked(agent, block)
             self.event("error", f"resume failed ({res.error}); starting a fresh session", agent)
-            self.set_peer_session(agent, None)
             row = self.begin_usage(ad, model, None)
             left = self.deadline_left()  # again just before the hand-off (#74)
             if left > 0:
+                # Dropped only once the fresh session really runs: a skipped fallback keeps
+                # the stored one for a later resume or debrief (#106).
+                self.set_peer_session(agent, None)
                 res = ad.run(fresh_prompt or prompt, cwd, max(30.0, min(self.config.turn_timeout_s, left)), emit,
                              add_dirs=add_dirs, cancelled=self.cancelled, peer_tag=tag)
                 self.account(ad, model, res, resumed=False, row=row)
@@ -568,11 +570,12 @@ class Worker:
         return res
 
     def drop_usage(self, row: int | None) -> None:
-        """A turn marked as started (begin_usage) that never ran its CLI: close the row."""
+        """A turn marked as started (begin_usage) that never ran its CLI: delete the row, so
+        the session's next resumed turn still has its baseline (#106)."""
         if row is None:
             return
         try:
-            self.bus.close_usage(row)
+            self.bus.discard_usage(row)
         except Exception as e:  # noqa: BLE001 - history must never fail a turn
             self.event("error", f"could not record token usage: {e!r}")
 
@@ -1434,7 +1437,7 @@ class Worker:
         the prompt says files on disk may not match the head."""
         try:
             snap = snapshot.ensure(refs["repo"], t["id"], refs["base_commit_id"], refs["head_commit_id"],
-                                   self.config.max_snapshot_bytes)
+                                   self.config.max_snapshot_bytes, cancelled=self.cancelled)
         except Exception as e:  # noqa: BLE001 (never what fails a review)
             snap = snapshot.Snapshot(head=refs["head_commit_id"], reason=f"it could not be made ({e!r})")
         # A non-UTF-8 file name in it would fail the event's insert and a strict prompt encode.
