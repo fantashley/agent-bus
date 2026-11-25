@@ -93,7 +93,9 @@ def test_codex_mcp_listing_sees_every_config_spelling_and_profile(env, monkeypat
     monkeypatch.setattr(subprocess, "run", spy)
     adapter("codex", cfg.Config.load()).invocation("P", None, str(env["repo"]), [])
     listed = json.loads(log.read_text())
-    assert listed[1:-3] == ["--profile", "prof2", "-c", "a=1", "-c", "b=2", "-c", "c=3", "-c", "d=4", "-c", "e=5"]
+    off = [x for f in ("apps", "goals", "image_generation", "tool_suggest", "hooks", "plugins")
+           for x in ("-c", f"features.{f}=false")]
+    assert listed[1:-3] == ["--profile", "prof2", "-c", "a=1", "-c", "b=2", "-c", "c=3", "-c", "d=4", "-c", "e=5", *off]
     assert listed[-3:] == ["mcp", "list", "--json"]
 
 

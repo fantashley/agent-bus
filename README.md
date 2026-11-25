@@ -330,6 +330,10 @@ codex 0.171.0 and 0.172.0, and agy 1.5.13:
   project's config pointed them) or the `js_repl` node path and modules. A checkout whose
   `.codex/config.toml` (in the turn's directory or a parent up to the repository root) sets one
   of those fails the turn. The rest of it (instructions and other settings) still applies.
+  That config can also add a local plugin marketplace and enable a plugin from it, even one
+  your own config disables, and the plugin's bundled MCP servers then start (live probe of
+  0.172.0). They can't be switched off by name, so the `plugins` feature is off for peer turns
+  and their MCP listing. That turns off your own plugins (and their skills) in peer turns too.
 - **Copilot CLI** (1.0.108, live probes 2026-11-23): `-p` with the prompt on stdin and
   `--output-format json`. `--available-tools=view,grep,rg,glob` (plus `web_fetch` when web search
   is on) is the session's whole tool set, so bash, `apply_patch`, `task` sub-agents, skills, `sql`,
@@ -390,7 +394,7 @@ hooks, MCP servers, rules and command-running settings out of a peer turn, or re
 What's left is trusted:
 - **Your own config:** user-level, plugin and managed hooks and settings still apply (Claude
   Code's and Copilot's user hooks run, and so does anything in `~/.gemini/config`), except that
-  Codex peer turns run no hooks or rules at all. Directories above the repository root (say a
+  Codex peer turns run no hooks, rules or plugins at all. Directories above the repository root (say a
   `.agents` in `~/src`) count as yours and aren't checked.
 - **Instructions:** `CLAUDE.md`, `AGENTS.md`, agy's rules and skills, and the non-command keys
   of a trusted project's `.codex/config.toml` still load. They can steer what the peer says, as

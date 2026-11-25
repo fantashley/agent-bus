@@ -68,6 +68,9 @@ class TurnResult:
     # hook, an MCP server it couldn't switch off, a startup event it couldn't check): a fresh
     # session would be refused the same way, so the worker neither retries nor pins it (#100).
     refused: bool = False
+    # False when Adapter.run returned before the CLI started (its setup was refused, or the
+    # subprocess couldn't be created): nothing ran, so no session was started or used (#129).
+    launched: bool = True
 
 
 @dataclass
@@ -251,7 +254,7 @@ class Adapter:
         try:
             inv = self.invocation(prompt, resume_id, cwd, add_dirs or [])
         except PeerSetupError as e:
-            return TurnResult(ok=False, error=str(e), refused=True)
+            return TurnResult(ok=False, error=str(e), refused=True, launched=False)
         st = StreamState(external_id=inv.external_id, resumed=bool(resume_id))
         try:
             self.before_run(st, resume_id)
@@ -267,7 +270,7 @@ class Adapter:
                 inv.argv, cwd=cwd, stdin=subprocess.PIPE if inv.stdin is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, env=env)
         except OSError as e:
-            return TurnResult(ok=False, error=f"could not start {inv.argv[0]}: {e}")
+            return TurnResult(ok=False, error=f"could not start {inv.argv[0]}: {e}", launched=False)
 
         # Supervision starts before any I/O, so a peer that never reads stdin or never
         # writes stdout still hits the timeout and cancellation.
@@ -283,7 +286,8 @@ class Adapter:
                     _killpg(proc)
                     return
 
-        threading.Thread(target=watchdog, daemon=True).start()
+        killer = threading.Thread(target=watchdog, daemon=True)
+        killer.start()
 
         stderr_tail: list[str] = []
 
@@ -334,6 +338,10 @@ class Adapter:
                     break
         rc = proc.wait()
         killer_done.set()
+        # A watchdog already stopping the turn finishes first: the leader can exit on SIGTERM
+        # while a child that ignores it waits for the SIGKILL after the grace period, and a
+        # worker that exits once this returns would take that SIGKILL with it (#120).
+        killer.join()
         if not isinstance(st.external_id, str) or not st.external_id.strip():
             st.external_id = None  # only a non-empty string can be pinned and resumed
         if not isinstance(st.final, str):
@@ -354,12 +362,14 @@ class Adapter:
         except Exception as e:  # noqa: BLE001 - the windows are a hint; never fail a turn on them
             emit("format", f"could not read {self.participant}'s usage limits: {e!r}"[:300])
             limits = None
-        if timed_out:
-            return TurnResult(ok=False, text=text, external_id=st.external_id, error="turn timed out",
-                              timed_out=True, usage=st.usage, partial_usage=partial, limits=limits)
+        # The refusal first: the deadline can pass while _killpg waits on an aborted turn, and a
+        # timeout would let the worker retry it or pin the aborted attempt's session (#120).
         if st.abort:
             return TurnResult(ok=False, text="", external_id=st.external_id, error=st.abort, usage=st.usage,
                               partial_usage=partial, limits=limits, refused=True)
+        if timed_out:
+            return TurnResult(ok=False, text=text, external_id=st.external_id, error="turn timed out",
+                              timed_out=True, usage=st.usage, partial_usage=partial, limits=limits)
         if rc != 0 or st.error:
             err = st.error or f"exit {rc}: {''.join(stderr_tail)[-800:]}"
             # err already ends with the stderr tail unless the stream reported its own error.
@@ -493,14 +503,36 @@ def cli_version(bus, agent: str, command: str, cwd: str | None = None) -> str:
         return version
 
 
+# How long _killpg gives a stopped turn's process group to exit after SIGTERM.
+KILL_GRACE_S = 5.0
+
+
 def _killpg(proc: subprocess.Popen) -> None:
+    """SIGTERM the turn's whole process group, then SIGKILL whatever of it is left after the
+    grace period, even when the leader exited at once: a descendant that ignores SIGTERM
+    would otherwise outlive it (#120).  The group id stays reserved while any member lives,
+    so the SIGKILL can't reach an unrelated group."""
     try:
         os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.wait(5)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
+        return  # the group is already gone
+    end = time.monotonic() + KILL_GRACE_S
+    try:
+        proc.wait(KILL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        pass
+    # The leader is reaped (or still running): poll the rest of the group until it's empty.
+    while time.monotonic() < end:
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return
+        except OSError:
+            break
+        time.sleep(0.05)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
         pass
 
 
@@ -1001,12 +1033,19 @@ _CODEX_KEY = re.compile(r"[A-Za-z0-9_-]+")
 #   the turn's tools and sees the prompt.  No probe of 0.172.0 saw one run in `exec`, even with
 #   --dangerously-bypass-hook-trust, so this is belt and braces too; it also turns off your own
 #   hooks for peer turns (#98).
+# - plugins: a trusted project's .codex/config.toml can add a local marketplace and enable a
+#   plugin from it, even one your own config disables, and that plugin's bundled MCP servers
+#   then load (live probe, codex 0.172.0, 2026-11-25: `codex mcp list --json` listed the
+#   plugin's server and `codex exec` launched it; a plugin that isn't installed didn't load).
+#   `-c mcp_servers.<name>.enabled=false` can't switch a plugin's server off (codex rejects
+#   the half-defined entry: "invalid transport"), so plugins are off for peer turns, yours
+#   included, and the MCP listing runs with them off too (#124).
 # Left on: the collaboration tools (spawn_agent, send_message, ...).  No switch removes them
 # (features.multi_agent and multi_agent_v2 = false don't: the model's catalog entry picks
 # multi-agent v2), and a spawned agent is a thread of the same process with the same config:
 # a probe's sub-agent got `Read-only file system` for `touch`.  They can't act outside the
 # sandbox; they only cost tokens.
-CODEX_FEATURES_OFF = ("apps", "goals", "image_generation", "tool_suggest", "hooks")
+CODEX_FEATURES_OFF = ("apps", "goals", "image_generation", "tool_suggest", "hooks", "plugins")
 # Flags that pick a sandbox or approval mode themselves, so they'd beat our `-c` overrides,
 # and ones that change the repo or codex's own state outside the sandbox: --worktree creates
 # a managed git worktree, and --trust saves trust for the project (MCP commands included).
@@ -1077,7 +1116,8 @@ class CodexAdapter(Adapter):
     # come after the configured args, whose own sandbox flags are dropped (issue #54).
     # 4: --ignore-rules, hooks off, and a checkout whose config moves codex's state is refused
     # (#98).
-    recipe = "4"
+    # 5: plugins off, in the turn and in its MCP listing (#124).
+    recipe = "5"
     known_events = frozenset({"thread.started", "turn.started", "item.started", "item.updated", "item.completed",
                               "turn.completed", "turn.failed", "error"})
     default_command = cfg.AGENT_INFO["codex"]["cli"]
@@ -1093,8 +1133,10 @@ class CodexAdapter(Adapter):
         Raises if they can't be listed: without the list we can't switch them off,
         and running a peer with unknown integrations live is not read-only.
         """
-        # Listed with the same config the turn runs with: every override and profile spelling.
-        argv = [self.command, *_codex_config_args(self.extra_args()), "mcp", "list", "--json"]
+        # Listed with the same config the turn runs with: every override and profile spelling,
+        # then the switched-off features (plugins bring their own MCP servers; #124).
+        off = [arg for feature in CODEX_FEATURES_OFF for arg in ("-c", f"features.{feature}=false")]
+        argv = [self.command, *_codex_config_args(self.extra_args()), *off, "mcp", "list", "--json"]
         try:
             # With the turn's CODEX_HOME too: another home has its own config.toml (#66).
             out = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30,
