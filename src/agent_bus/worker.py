@@ -243,6 +243,8 @@ class Worker:
         if threading.current_thread() is threading.main_thread():
             signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
         try:
+            if self.refuse_repo():
+                return 1  # refused: the job is failed and the requester told
             if self.job["kind"] == "discussion":
                 self.run_discussion()
             elif self.job["kind"] == "review":
@@ -391,6 +393,32 @@ class Worker:
     def set_peer_session(self, agent: str, external_id: str | None) -> None:
         with self.fenced():
             self.bus.set_peer_session(self.thread_id, agent, external_id)
+
+    def refuse_repo(self) -> bool:
+        """Refuse a job whose repo left the allowlist after it was requested (#99).
+
+        The request was checked against the calling server's config, which a long-running
+        server may hold from before the repo was removed; this worker loaded its own.  Checked
+        once, before anything reads the repo (the review diff, snapshot and usage search too),
+        for every job kind.  Like a missing commit (report_missing), a review or discussion is
+        parked as needs_human and the job failed in one transaction, so the same request can be
+        made again once the repo is allow-listed; a debrief leaves the thread as it was."""
+        t = self.thread()
+        if not t["repo"] or self.config.repo_allowed(t["repo"]):
+            return False
+        asker = (self.job["params"].get("asker") or t["initiator"]) if self.debriefing else t["initiator"]
+        what = {"review": "Review", "discussion": "Discussion turn", "debrief": "Debrief"}.get(self.job["kind"], "Job")
+        why = f"{t['repo']} is no longer in the agent-bus repo allowlist ({cfg.config_path()})"
+        retry = (f"Add it back, then {self.retry_hint()}" if self.debriefing else
+                 f"Add it back, then run `agent-bus resume {self.thread_id}`; or `agent-bus cancel {self.thread_id}`")
+        with self.fenced():
+            if self.debriefing or self.bus.transition(self.thread_id, "needs_human"):
+                self.bus.post(self.thread_id, SYSTEM, f"{what} not started: {why}. No peer was run. {retry}.",
+                              kind="status", recipient=None if asker == HUMAN else asker,
+                              data={"debrief": True} if self.debriefing else None)
+            self.bus.finish_job(self.job["id"], "failed", self.owner, f"REPO_NOT_ALLOWED: {why}")
+        self.event("error", f"job refused: {why}")
+        return True
 
     def workdir(self, t: dict) -> tuple[str, list[str]]:
         """Peers run in the allow-listed repo, or a per-thread scratch dir."""
@@ -717,8 +745,12 @@ class Worker:
         mode = self.job["params"].get("mode", "start")
         t = self.thread()
         if mode in ("start", "start_later"):
-            if mode == "start" and self.deadline_left() > 0:  # a job that starts late runs no turn
-                self.round_one(t)
+            # A resume of a thread still blind (its start job refused or failed before round 1
+            # ended, #99) finishes round 1: the peers that still owe a proposal make it before
+            # seeing anyone's.  Those that already proposed keep theirs (and their session).
+            first = mode == "start" or bool(t["blind"])
+            if first and self.deadline_left() > 0:  # a job that starts late runs no turn
+                self.round_one(t, owed_only=mode != "start")
                 if not self.stalemate():
                     self.wait_for_initiator(round_no=1)
             # Round 1 is over, even if the worker stops here (e.g. waiting on an absent
@@ -726,7 +758,7 @@ class Worker:
             self.set_thread(blind=0)
             # An explicit resume gets at least one peer round: the peers it let back in
             # (quota or format drift cleared) may move to the absent initiator's proposal.
-            retry = mode == "start_later"
+            retry = mode == "start_later" and not first
             while not self.done():
                 t = self.thread()
                 if t["round"] >= t["max_rounds"] or self.deadline_left() <= 0:
@@ -802,10 +834,17 @@ class Worker:
         return (bool(d["leading_proposal"]) and d["not_backing_leader"] == [init]
                 and not self.bus.agent_present(init, t["initiator_session"]))
 
-    def round_one(self, t: dict) -> None:
+    def round_one(self, t: dict, owed_only: bool = False) -> None:
+        """``owed_only``: only the peers with no round-1 proposal yet (a resumed round 1)."""
+        peers = self.peers(t)
+        if owed_only:
+            proposed = {m["sender"] for m in self.bus.history(self.thread_id)["messages"]
+                        if m["kind"] == "proposal" and m["round"] == 1}
+            peers = [p for p in peers if p not in proposed]
+            if not peers:
+                return
         self.system(f"Round 1 (blind): collecting initial proposals from {', '.join(t['participants'])}.",
                     quiet=True)
-        peers = self.peers(t)
         first = self.preamble_and_question(t)
 
         def go(agent: str) -> None:
@@ -1659,12 +1698,6 @@ class Worker:
         a peer that can't answer gets a notice, and the thread stays as it was."""
         t = self.thread()
         peers = list(self.job["params"]["peers"])
-        if t["repo"] and not self.config.repo_allowed(t["repo"]):
-            # The request was checked against its server's config, which may predate this one.
-            self.system(f"Debrief not started: {t['repo']} is no longer in the agent-bus repo allowlist.",
-                        recipient=None if self.job["params"].get("asker") in (None, HUMAN)
-                        else self.job["params"]["asker"])
-            return
         self.system(f"Debrief requested from {', '.join(peers)}: each answers in its own resumed session.",
                     quiet=True)
         with ThreadPoolExecutor(max_workers=len(peers) or 1) as pool:

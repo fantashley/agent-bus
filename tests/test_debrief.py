@@ -149,10 +149,15 @@ def test_debrief_refuses_a_repo_no_longer_allowed(env, no_spawn):
     # A server still running with the old config queues it; the worker, with the new one, refuses.
     bus = env["bus"]
     n = len(calls(env))
+    status = bus.thread(tid)["status"]
     svc.debrief(tid)
-    run_job(bus, tid)
+    job = bus.jobs(tid)[-1]
+    assert Worker(bus, job["id"]).run() == 1 and bus.job(job["id"])["status"] == "failed"
     assert len(calls(env)) == n and not [m for m in bus.history(tid)["messages"] if m["kind"] == "debrief"]
-    assert "no longer in the agent-bus repo allowlist" in bus.history(tid)["messages"][-1]["body"]
+    notice = bus.history(tid)["messages"][-1]
+    assert notice["body"].startswith("Debrief not started") and "no longer in the agent-bus repo allowlist" in notice["body"]
+    assert notice["data"]["debrief"] and notice["recipient"] == svc.agent
+    assert bus.thread(tid)["status"] == status  # a debrief never changes the thread
 
 
 def stubborn(env, monkeypatch, peers=("codex", "antigravity")):

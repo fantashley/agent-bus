@@ -29,7 +29,9 @@ directly, instead of a human relaying messages between windows. Designed in
   switched off, and the turn stopped if one comes up live anyway. Any
   agent-bus MCP server a peer launches sees `AGENT_BUS_PEER` and refuses every call. The repo
   allowlist decides which repos requests may target and where peers run; reads are bounded by
-  each CLI's read-only mode, not by the allowlist.
+  each CLI's read-only mode, not by the allowlist. Every job checks it again against the config
+  as it is when the job starts, so a repo removed after a request was queued gets a notice and
+  no peer turn (a review or discussion waits as `needs_human` for `agent-bus resume`).
 
 This README has two parts. **Using agent-bus** (from here to "Watching and stepping in") is
 what you do with it: ask your agents, follow and unstick threads. **Wiring up clients** is how
