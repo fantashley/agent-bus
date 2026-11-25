@@ -429,8 +429,9 @@ def _desc(t: Term) -> str:
 
 def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
            readable: frozenset[str] | set[str] | None = None) -> str:
-    """The hits, grouped by name, fewest hits first, and capped: at most ``per_symbol``
-    lines each (then a count and the files of the rest) and ``limit`` characters in all.
+    """The hits, grouped by name, fewest hits first (names touched only in tests last), and
+    capped: at most ``per_symbol`` lines each (then a count and the files of the rest) and
+    ``limit`` characters in all.
     A name with over GENERIC_HITS hits, or one that doesn't fit in full, is one line: its
     count and busiest files.  The changed definitions are always shown (at worst as that
     line); the others are left out, highest priority last, when even that doesn't fit.
@@ -489,7 +490,9 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
                 kept[n] = block
                 used += len(block) + 1
                 break
-    order = sorted(u.names, key=lambda n: (size[n], index[n]))
+    # Shown fewest hits first, but a name touched only in tests after the rest: kept because
+    # there was room, it shouldn't come before the production names (#142 debrief).
+    order = sorted(u.names, key=lambda n: ((u.terms.get(n) or Term(n)).test, size[n], index[n]))
     out = [kept[n] for n in order if n in kept]
     left = [n for n in order if n not in kept]
     if left:

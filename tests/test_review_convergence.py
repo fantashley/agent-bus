@@ -160,7 +160,7 @@ def test_single_reviewer_pushback_and_budget(env, no_spawn):
     assert bus.jobs(tid)[-1]["params"]["mode"] == "pushback"
     run_job(bus, tid)
     assert "has not changed the code" in calls(env)[-1]["prompt"]
-    assert bus.thread(tid)["status"] == "resolved"
+    assert bus.thread(tid)["status"] == "open"  # still asks for changes (#143)
     # A retry of that request (no newer note) is idempotent; a second pushback is refused.
     assert claude.request_review("codex", str(repo), base, h1, prev_head_commit_id=h1,
                                  focus="it is intended")["job"]["id"] == bus.jobs(tid)[-1]["id"]
@@ -445,7 +445,7 @@ def test_single_reviewer_follow_ups_count_to_the_default_limit(env, no_spawn):
         run_job(bus, tid)
         t = bus.thread(tid)
         assert thread_summary(t)["budget_warning"] == (n >= 3)
-        assert t["status"] == ("needs_human" if n == 6 else "resolved")
+        assert t["status"] == ("needs_human" if n == 6 else "open")  # open: changes requested (#143)
     assert f"Review follow-up requested from codex at head {prev[:12]}." in status_bodies(bus, tid)
     assert "still asks for changes after 6 follow-up requests" in claude.inbox(thread=tid)["messages"][-1]["body"]
     with pytest.raises(BusError) as e:

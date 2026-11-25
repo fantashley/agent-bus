@@ -626,7 +626,9 @@ class Service:
                     job_row, created = self.bus.create_job(t["id"], "review",
                                                            {"mode": "followup", "round": t["round"]},
                                                            f"review:{t['id']}:{t['round']}")
-                elif same and same["status"] in ("queued", "running", "done"):
+                elif same and (same["status"] in ("queued", "running", "done") or self._has_verdict_for_head(t)):
+                    # A failed pass that posted its verdict first (a resume resolves an approval) is
+                    # as good as done (#143).
                     job_row, created = same, False
                 elif same:
                     raise BusError("REVIEW_FAILED", f"the pass for this request on {t['id']} {same['status']} "
@@ -723,8 +725,10 @@ class Service:
             # other evidence on a new thread would leave two reviews of this head.
             self._same_evidence(t, refs.get("evidence"))
             latest = self._revision_pass(t)
-            if latest and latest["status"] in ("queued", "running", "done"):
-                return t, latest, False  # idempotent, including a pass `agent-bus resume` restarted
+            if latest and (latest["status"] in ("queued", "running", "done") or self._has_verdict_for_head(t)):
+                # Idempotent, including a pass `agent-bus resume` restarted, and a failed one that
+                # posted its verdict first (#143).
+                return t, latest, False
         self._quota_check(reviewer, "reviewer", override)
         goal = f"Review {refs['change_id'] or head[:12]} in {os.path.basename(repo_path)}"
         t = self.bus.create_thread("review", goal, [self.agent, reviewer], initiator=self.agent,
@@ -1243,8 +1247,10 @@ class Service:
         with self.bus.tx():
             t = self.bus.thread(thread)  # decided again inside the transaction
             if t["status"] not in ("resolved", "needs_human"):
+                fix = (" (a review that asked for changes stays open until it is approved)"
+                       if t["kind"] == "review" and t["status"] == "open" else "")
                 raise BusError("THREAD_NOT_FINISHED", f"{thread} is {t['status']}; only a resolved or needs_human "
-                               "thread can be debriefed")
+                               f"thread can be debriefed{fix}")
             if self.bus.active_job(thread):
                 raise BusError("THREAD_BUSY", f"{thread} has a job running; wait for it to finish")
             done = self._debriefed(t)
@@ -1388,6 +1394,8 @@ class Service:
         elif (t["refs"] or {}).get("reviewers"):
             # A complete review only needs resolving, which runs no reviewer.
             peers = [] if self.bus.review_standings(t["id"])["complete"] else list(t["refs"]["reviewers"])
+        elif self.bus.review_standings(t["id"])["complete"]:
+            peers = []  # approved: a resume only resolves it (#143)
         else:
             peers = [r for r in [(t["refs"] or {}).get("reviewer")] if r]
         for p in peers:
@@ -1425,6 +1433,10 @@ class Service:
                                         f"{thread}:retry:{key}")
         # After the job lookups, whose reaping may post an older job's notice: this one is last.
         self.bus.post(thread, SYSTEM, note, kind="status")
+        if t["kind"] == "review" and not (t["refs"] or {}).get("reviewers") and not res.get("job") \
+                and not self.bus.active_job(thread) and self.bus.review_standings(thread)["complete"]:
+            # Its reviewer approved, but the worker exited before resolving it (#143).
+            self._finish_complete(t, (t["refs"] or {}).get("head_commit_id") or "")
         res["thread"] = thread_summary(self.bus.thread(thread))
         return res
 

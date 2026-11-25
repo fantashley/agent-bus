@@ -1476,12 +1476,15 @@ class AntigravityAdapter(Adapter):
     # posted (#113).
     # 11: a prompt too long for --print goes in as far as fits and continues in numbered part
     # files, each under read_file's cap (#126).
-    recipe = "11"
-    # agy 1.5.13 in plan mode declares search_web (Google-grounded search, run server side) but
-    # no page fetch.  `search_web(*)` and `read_url(*)` deny rules are ignored, but a custom
+    # 12: no --mode plan: with --disable-slash-commands agy ignores it, and says so on stderr
+    # (live probe, agy 1.5.13, 2026-11-25: the same declared tools, prompt size and refused
+    # write either way, and search_web runs without approval).
+    recipe = "12"
+    # agy 1.5.13 declares search_web (Google-grounded search, run server side) but no page
+    # fetch.  `search_web(*)` and `read_url(*)` deny rules are ignored, but a custom
     # agent's `tools` list removes it (live probes, 2026-11-23): see peer_agent.
-    web_tools = "search only (plan mode has no page fetch)"
-    # The tools a headless turn's agent gets.  Plan mode on its own also declares write_file,
+    web_tools = "search only (agy has no page fetch)"
+    # The tools a headless turn's agent gets.  Without the agent, agy also declares write_file,
     # edit_file, run_command, ask_question, define_subagent, invoke_subagent,
     # manage_subagents, send_message, schedule, run_workflow and swarm (agy 1.5.13, live
     # probes 2026-11-23).  The deny rules stop the writes and commands, and a sub-agent
@@ -1494,7 +1497,7 @@ class AntigravityAdapter(Adapter):
     # inventory apart from manage_task (background tasks of this conversation, none of which
     # can start without run_command) and the MCP tools (agent-bus only, see check_isolation).
     # agy 1.5.13's registry also has list_dir, grep_search and find_by_name (an agent may list
-    # them), but no mode declares them to the model, plan mode or not (live probes 2026-11-24,
+    # them), but no mode declares them to the model (live probes 2026-11-24,
     # issues #93 and #117: listed in the agent's tools, the model still sees only read_file);
     # search would need run_command, which stays denied.  So agent-bus searches for it: a
     # review prompt shows where the names the change touches are used (usages.py).
@@ -1504,8 +1507,8 @@ class AntigravityAdapter(Adapter):
     # Session-only permission rules (Deny wins over any Allow or Ask, in agy's own settings
     # too).  Without them a command is auto-denied as needing approval and the turn ends with
     # no reply; with them it is a tool error the model answers past.  write_file also covers
-    # edit_file, and plan mode allows workspace writes under the system temp directory without
-    # asking (live probes, agy 1.5.13, 2026-11-23).  execute_url is the browser subagent.
+    # edit_file, and agy otherwise allows workspace writes under the system temp directory
+    # without asking (live probes, agy 1.5.13, 2026-11-23).  execute_url is the browser subagent.
     deny_rules = ("command(*)", "write_file(*)", "execute_url(*)")
     known_events = frozenset({"init", "step_update", "result"})
 
@@ -1560,7 +1563,7 @@ class AntigravityAdapter(Adapter):
                 "can't be isolated from. Remove them, or set peers.antigravity.allow_mcp = true to accept that.")
 
     def peer_agent(self) -> tuple[str, str]:
-        """(name, directory) of the custom agent a headless turn runs as: plan mode with only
+        """(name, directory) of the custom agent a headless turn runs as: with only
         ``agent_tools`` (and search_web while web search is on).  agy finds an agent in the
         ``.agents/agents`` of a workspace directory, so the directory goes in with --add-dir.
         It holds nothing but agent-bus's own definitions.  A same-named agent in the reviewed
@@ -1590,10 +1593,11 @@ class AntigravityAdapter(Adapter):
         _agy_workspace_check([cwd, *add_dirs, *configured])
         name, agent_dir = self.peer_agent()
         # --disable-slash-commands: in print mode, no slash command or skill expands from the
-        # prompt (peer text included), and plan mode leaves out its /plan meta-prompt, which
-        # asks for plan and walkthrough artifacts and user approval (live probe, agy 1.5.13,
-        # 2026-11-24, issue #93).
-        argv = [self.command, "--mode", "plan", "--sandbox", "--disable-slash-commands", "--output-format", "stream-json",
+        # prompt (peer text included), and no /plan meta-prompt asks for plan and walkthrough
+        # artifacts and user approval (live probe, agy 1.5.13, 2026-11-24, issue #93).  It
+        # also makes --mode a no-op (agy warns), so there is none: isolation comes from the
+        # agent's tool list, the deny rules and --sandbox (recipe 12).
+        argv = [self.command, "--sandbox", "--disable-slash-commands", "--output-format", "stream-json",
                 "--settings", json.dumps({"permissions": {"deny": list(self.deny_rules)}}),
                 "--agent", name, "--add-dir", agent_dir]
         for d in add_dirs:
@@ -1692,7 +1696,7 @@ class AntigravityAdapter(Adapter):
                     st.denied.append(_safe_name(d["action"]))
 
     def incomplete(self, st):
-        # agy 1.5.13 in plan mode with --sandbox (live probe, 2026-11-23): a terminal command
+        # agy 1.5.13 with --sandbox (live probe, 2026-11-23): a terminal command
         # needs approval, so headless it is auto-denied.  The run_command step ends ERROR,
         # the result is SUCCESS with an empty response and lists denied_actions, and agy
         # exits 0.  Names only in the diagnostic, never arguments.

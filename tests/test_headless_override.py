@@ -94,4 +94,5 @@ def test_agy_counters_agent_bus_tools_and_file_links(env, web):
         assert a[-1] == guide + "PROMPT"
         assert "Do not call agent-bus tools" in guide and "not as file:// links" in guide
         assert "write no plan" in guide  # the plan-mode override stays
-        assert a[a.index("--mode") + 1] == "plan" and "--sandbox" in a and "--disable-slash-commands" in a
+        # --mode is a no-op with --disable-slash-commands (agy warns), so none is passed.
+        assert "--mode" not in a and "--sandbox" in a and "--disable-slash-commands" in a

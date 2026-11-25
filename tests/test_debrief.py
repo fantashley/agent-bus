@@ -56,9 +56,15 @@ def reviewed(env, reviewer):
     svc = Service(bus, author, bus.register_session(author))
     tid = svc.request_review(reviewer, str(repo), base, head1)["thread"]["id"]
     run_job(bus, tid)
+    assert bus.thread(tid)["status"] == "open"  # changes requested: not debriefable yet (#143)
+    with pytest.raises(BusError) as e:
+        svc.debrief(tid)
+    assert e.value.code == "THREAD_NOT_FINISHED" and "stays open until it is approved" in str(e.value)
     svc.send("fixed it", thread=tid)
     assert svc.request_review(reviewer, str(repo), base, head2, prev_head_commit_id=head1)["thread"]["id"] == tid
-    run_job(bus, tid)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("FAKE_APPROVE", reviewer)
+        run_job(bus, tid)
     assert bus.thread(tid)["status"] == "resolved"
     return svc, tid, (base, head1, head2)
 
@@ -83,7 +89,7 @@ def test_debrief_resumes_the_review_session_with_the_same_hardening(env, no_spaw
     assert resume_flag in debrief["argv"] and before[2] in debrief["argv"]
     hardening = {"claude": ["--permission-mode", "dontAsk", "--strict-mcp-config"],
                  "codex": ['sandbox_mode="read-only"', 'approval_policy="never"', "mcp_servers.github.enabled=false"],
-                 "antigravity": ["--mode", "plan", "--sandbox", "--agent"]}[reviewer]
+                 "antigravity": ["--sandbox", "--disable-slash-commands", "--agent"]}[reviewer]
     assert all(h in debrief["argv"] for h in hardening)
     assert "agent-bus debrief of thread" in debrief["prompt"] and "friction" in debrief["prompt"]
     # Posted as peer data to the author; status, verdicts and session untouched.
@@ -133,7 +139,9 @@ def test_followup_keeps_the_debrief_reset(env, no_spawn):
                            text=True).stdout.strip()
     svc.request_review("codex", str(env["repo"]), base, head3, prev_head_commit_id=head2)
     assert bus.thread(tid)["refs"]["debrief_after"] == after
-    run_job(bus, tid)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("FAKE_APPROVE", "codex")  # approved, so finished again (#143)
+        run_job(bus, tid)
     assert svc.debrief(tid)["peers"] == ["codex"]  # the earlier answer no longer counts
 
 

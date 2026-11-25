@@ -1099,14 +1099,17 @@ class Worker:
         verdict = self.review_round(self.job["params"].get("mode", "first"))
         if verdict is None:
             return
+        if verdict["verdict"] == "approve":
+            self.finish_thread("resolved")
+            return
+        # A request for changes leaves the thread open for the author's fix or pushback, as
+        # with several reviewers (#143): resolved means approved.
         t = self.thread()
-        if verdict["verdict"] == "request_changes":
-            what = f"{t['refs']['reviewer']} requested changes at head {t['refs']['head_commit_id'][:12]}."
-            if self.park_over_budget(t, what):
-                return
-            if budget_warning(t):
-                self.system(what + budget_warning(t), recipient=None if t["initiator"] == HUMAN else t["initiator"])
-        self.finish_thread("resolved")
+        what = f"{t['refs']['reviewer']} requested changes at head {t['refs']['head_commit_id'][:12]}."
+        if self.park_over_budget(t, what):
+            return
+        if budget_warning(t):
+            self.system(what + budget_warning(t), recipient=None if t["initiator"] == HUMAN else t["initiator"])
 
     def run_review_rounds(self) -> None:
         """A review with several required reviewers (#47): one reviewer per round, on one

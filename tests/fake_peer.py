@@ -222,7 +222,7 @@ if (behaviour == "silent" or (repair and listed("FAKE_SILENT_REPAIR")) or listed
 if agent == "antigravity" and repair and os.environ.get("FAKE_AGY_DENIED_REPAIR"):
     behaviour = "denied"
 if agent == "antigravity" and behaviour in ("denied", "denied_reply", "denied_blank", "unfinished", "toolerror"):
-    # The headless denial agy 1.5.13 sends in plan mode with --sandbox (live probe,
+    # The headless denial agy 1.5.13 sends with --sandbox (live probe,
     # 2026-11-23): run_command goes ACTIVE then ERROR, the result is SUCCESS with an empty
     # response and lists denied_actions, exit 0.  Variants: denied_reply also answers from
     # context; denied_blank's response is whitespace only; unfinished leaves the tool with

@@ -90,7 +90,7 @@ COPILOT_HEADLESS = _HEADLESS + (
 # Prepended to every headless Antigravity turn, resumed ones included.  agy auto-denies
 # actions that need approval when no one can give it, and the turn then ends with no reply
 # (live probe of agy 1.5.13, 2026-11-23).  The adapter's deny rules turn the terminal and
-# file writes into plain tool errors; search_web needs no approval in plan mode (issue #46).
+# file writes into plain tool errors; search_web needs no approval (issue #46).
 # agy's harness also offers the agent-bus MCP tools (which refuse a peer) and asks for file://
 # links, which mean nothing to the agents reading the thread (debrief, #110).
 _AGY_HEADLESS = _HEADLESS.replace("{", "{{").replace("}", "}}") + """ Your only tools are read_file{web}. \

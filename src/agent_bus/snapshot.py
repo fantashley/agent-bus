@@ -12,8 +12,8 @@ peer can read (an added directory, or Codex's read-only sandbox, which reads eve
 The files come from ``git cat-file --batch``: exactly the commit's blobs, with no checkout
 filters, export-subst or other conversions (``git archive`` applies those, and a filter is an
 external command), and without untracked or ignored files such as node_modules.  A snapshot
-is reused by the thread's later turns on the same head, replaced when the head moves, and
-removed once the thread is no longer open (``sweep``, which every worker also runs when it
+is reused by the pass's later turns on the same head, replaced when the head moves, and
+removed once no job runs on the thread (``sweep``, which every worker also runs when it
 starts, so a crashed worker's snapshots don't stay).  A tree over the size cap gets a sparse
 snapshot: the changed files and the other files in their directories; if even that is over,
 no snapshot, and the prompt says files on disk may not match the head.
@@ -344,15 +344,15 @@ def remove(path: Path) -> None:
 
 
 def stale(bus, thread_id: str) -> bool:
-    """A thread's snapshots are no longer needed: the thread is gone, or it is not open and
-    no job of it is queued or running (a review is resolved after each pass, and a new head
-    makes a new snapshot anyway)."""
+    """A thread's snapshots are no longer needed: the thread is gone, or no job of it is
+    queued or running.  A review waiting for the author's fix stays open (#143), maybe for
+    good; its next pass makes the snapshot again (a new head needs a new one anyway)."""
     from .db import BusError
     try:
-        t = bus.thread(thread_id)
+        bus.thread(thread_id)
     except BusError:
         return True
-    return t["status"] != "open" and bus.active_job(thread_id) is None
+    return bus.active_job(thread_id) is None
 
 
 def sweep(bus, only: str | None = None) -> None:

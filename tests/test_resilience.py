@@ -447,12 +447,12 @@ def test_agy_reply_after_a_denial_is_a_normal_turn(env, monkeypatch):
 def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     from agent_bus.prompts import AGY_HEADLESS
     ad = adapter("antigravity", cfg.Config.load())
-    assert ad.recipe == "11" and "run_command" in AGY_HEADLESS and "search_web" in AGY_HEADLESS
+    assert ad.recipe == "12" and "run_command" in AGY_HEADLESS and "search_web" in AGY_HEADLESS
     assert "do not use search_web" not in AGY_HEADLESS.lower()  # no contradiction with the preamble
     for resume_id in (None, "conv-1"):
         argv = ad.invocation("PROMPT-BODY", resume_id, str(env["repo"]), []).argv
         assert argv[-1] == AGY_HEADLESS + "PROMPT-BODY"
-        assert argv[argv.index("--mode") + 1] == "plan" and "--sandbox" in argv  # unchanged isolation
+        assert "--sandbox" in argv and "--agent" in argv and "--mode" not in argv  # unchanged isolation
     # A long prompt goes in as far as fits (with the guidance) and continues in numbered part
     # files, each under read_file's 46,080-byte cap, so each is read whole in one call (#126).
     scratch = env["tmp"] / "scratch"
@@ -499,7 +499,7 @@ def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     assert not any(AGY_HEADLESS.strip() in c["prompt"] for c in calls(env, "codex"))
     starts = [e["text"] for e in env["bus"]._all(
         "SELECT * FROM events WHERE thread_id=? AND kind='turn_start' AND agent='antigravity'", tid)]
-    assert starts and all("recipe antigravity/11" in s for s in starts)
+    assert starts and all("recipe antigravity/12" in s for s in starts)
 
 
 def test_incomplete_agy_discussion_turn_is_reported_without_a_drift_notice(env, no_spawn, monkeypatch):

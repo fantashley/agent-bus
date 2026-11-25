@@ -50,7 +50,11 @@ def test_test_only_names_render_after_production_ones_and_say_so():
             "unread": [("src/db.py", i, "unread()") for i in range(5)]}
     u = usages.Usages(names=["helper_one", "unread"], hits=hits,
                       terms={"helper_one": T("helper_one", test=True), "unread": T("unread", "enclosing")})
-    assert "helper_one (only in tests; 1 hit in 1 file)" in usages.render(u)
+    text = usages.render(u)
+    assert "helper_one (only in tests; 1 hit in 1 file)" in text
+    # Kept with room to spare, it still comes after the production name, though it has fewer
+    # hits (#142 debrief).
+    assert text.index("unread (5 hits") < text.index("helper_one (")
     # With room for one, the production name keeps it, though it has more hits.
     tight = usages.render(u, limit=len(usages.render(usages.Usages(names=["unread"], hits=hits))))
     assert "unread (5 hits" in tight and "not shown: helper_one" in tight
