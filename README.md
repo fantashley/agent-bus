@@ -1143,6 +1143,8 @@ release-please can occasionally carry a stale copy of a file
 
 ## Development
 
+Coding agents working on an issue: follow [docs/contributing-agents.md](docs/contributing-agents.md).
+
 ```sh
 nix develop -c pytest      # tests use fake peer CLIs that speak each client's stream format
 nix develop -c pytest -n auto   # the same in parallel (pytest-xdist, in the dev shell)
