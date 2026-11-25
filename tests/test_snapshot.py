@@ -229,6 +229,89 @@ def test_follow_up_names_the_new_heads_snapshot(env, no_spawn, monkeypatch):
     second = calls(env)[-1]
     assert "--conversation" in second["argv"]  # a resumed follow-up
     assert f"are exactly head {h2}" in second["prompt"] and str(snapshot.root() / tid / h2) in second["argv"]
+    first = calls(env)[0]["prompt"]
+    assert "Files in the copy (1)" in first and "\na.txt\n" in first
+    # The resumed session has the earlier list: only what was added or removed (#126).
+    assert "Files in the copy (" not in second["prompt"]
+    assert "with no files added or removed (1 file)" in second["prompt"]
+    sh(repo, "git", "rm", "-q", "a.txt")
+    (repo / "b.txt").write_text("b\n")
+    sh(repo, "git", "add", "b.txt")
+    sh(repo, "git", "commit", "-qm", "three")
+    h3 = sh(repo, "git", "rev-parse", "HEAD")
+    claude.request_review("antigravity", str(repo), base, h3, prev_head_commit_id=h2)
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    third = calls(env)[-1]["prompt"]
+    assert "--conversation" in calls(env)[-1]["argv"] and "Files in the copy (" not in third
+    assert f"Added since head {h2[:12]}:\nb.txt\nRemoved since head {h2[:12]}:\na.txt" in third
+
+
+def test_delta_needs_a_baseline_the_session_was_given(env, no_spawn):
+    """codex-2: a first pass on a sparse copy, then a resumed pushback once the copy is full
+    (it lists nothing): the next follow-up lists the whole copy, not a delta."""
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    (repo / "big").mkdir()
+    (repo / "big" / "blob.txt").write_text("b" * 5_000)
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "big")
+    base = sh(repo, "git", "rev-parse", "HEAD")
+    h1 = commit("one\n")
+    path = env["tmp"] / "config" / "agent-bus" / "config.json"
+    conf = json.loads(path.read_text())
+    path.write_text(json.dumps({**conf, "max_snapshot_bytes": 1_000}))
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("antigravity", str(repo), base, h1)["thread"]["id"]
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()  # asks for changes, on a sparse copy
+    assert "big/blob.txt" not in calls(env)[-1]["prompt"]
+    path.write_text(json.dumps({**conf, "max_snapshot_bytes": 10**9}))
+    claude.send("Not a bug, see the spec.", thread=tid)
+    claude.request_review("antigravity", str(repo), base, h1, prev_head_commit_id=h1)
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()  # a resumed pushback on a full copy: no list
+    assert "has not changed the code" in calls(env)[-1]["prompt"]
+    h2 = commit("two\n")
+    claude.request_review("antigravity", str(repo), base, h2, prev_head_commit_id=h1)
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    p = calls(env)[-1]["prompt"]
+    assert "--conversation" in calls(env)[-1]["argv"]
+    assert "Files in the copy (" in p and "\nbig/blob.txt" in p and "no files added or removed" not in p
+    assert [e["text"] for e in bus.events(tid, agent="antigravity") if e["kind"] == "listing"] == ["none", h2]
+
+
+def test_snapshot_delta_falls_back_to_the_whole_list(env, monkeypatch):
+    repo = env["repo"]
+    base, commit = git_repo(repo)
+    h1, h2 = commit("one\n"), commit("two\n")
+    snap = snapshot.ensure(str(repo), "t-delta", base, h2, 10**9)
+    assert snapshot.complete(snap)
+    assert snapshot.delta(str(repo), h1, snap, True) == ([], [])
+    assert snapshot.delta(str(repo), h1, snap, False) is None  # no baseline in the session (codex-2)
+    assert snapshot.delta(str(repo), "0" * 40, snap, True) is None  # git can't diff it
+    monkeypatch.setattr(snapshot, "MAX_LISTING", 3)
+    assert snapshot.delta(str(repo), h1, snap, True) is None  # the old list was cut, not shown whole
+    monkeypatch.undo()
+    # A type change (a file that became a symlink): in or out of the copy can't be told.
+    (repo / "a.txt").unlink()
+    os.symlink("/etc/hostname", repo / "a.txt")
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "link")
+    h3 = sh(repo, "git", "rev-parse", "HEAD")
+    snap3 = snapshot.ensure(str(repo), "t-delta", base, h3, 10**9)
+    assert snap3.mode == "full" and snapshot.delta(str(repo), h2, snap3, True) is None
+    # A symlink whose target changes (in the tree, then out of it) is an M record (codex-7).
+    os.symlink("b.txt", repo / "lnk")
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "lnk")
+    h4 = sh(repo, "git", "rev-parse", "HEAD")
+    (repo / "lnk").unlink()
+    os.symlink("/etc/hostname", repo / "lnk")
+    sh(repo, "git", "add", "-A")
+    sh(repo, "git", "commit", "-qm", "lnk2")
+    h5 = sh(repo, "git", "rev-parse", "HEAD")
+    snap5 = snapshot.ensure(str(repo), "t-delta", base, h5, 10**9)
+    assert snapshot.delta(str(repo), h4, snap5, True) is None
+    snap.mode = "sparse"
+    assert snapshot.delta(str(repo), h1, snap, True) is None
 
 
 # ------------------------------------------------------------------ garbage collection

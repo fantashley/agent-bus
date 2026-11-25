@@ -43,7 +43,6 @@ SAFE_WORDS = frozenset({"app-server", "exec", "run", "server", "serve", "start",
                         "new", "mcp", "chat", "agent", "login", "--"})
 # Only these read as paths: a token with a "/" in it (base64, a URL) is not one.
 PATH_PREFIXES = ("/", "./", "../", "~/")
-_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,39}")
 _BASENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,23}")  # a script's name, not a long token
 _EXE = re.compile(r"[A-Za-z0-9._+-]{1,40}")
 _LONG_FLAG = re.compile(r"--[A-Za-z0-9][A-Za-z0-9_-]{0,30}")

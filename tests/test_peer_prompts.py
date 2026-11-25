@@ -283,9 +283,21 @@ def test_tail_shows_repair_events(env, no_spawn, monkeypatch, capsys):
     claude = Service(bus, "claude", bus.register_session("claude"))
     tid = claude.request_review("codex", str(repo), base, commit("one\n"))["thread"]["id"]
     run_job(bus, tid)
+    # A verdict streams as a text event too: --events shows it, --events-only must not.
+    bus.add_event(tid, "text", "VERDICT-TEXT: the turn timed out earlier", agent="codex")
+    bus.add_event(tid, "thinking", "THINKING-TEXT", agent="codex")
     capsys.readouterr()
     assert cli.main(["tail", tid, "--events", "--once", "--no-status", "--no-color"]) == 0
-    assert "codex repair: asking again for the verdict: no JSON object in the reply" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "codex repair: asking again for the verdict: no JSON object in the reply" in out
+    assert "review" in out.lower() and tid in out and "VERDICT-TEXT" in out  # the header and messages too
+    # --events-only (#122): the event lines alone, no header, messages or review text.
+    assert cli.main(["tail", tid, "--events-only", "--once", "--no-status", "--no-color"]) == 0
+    only = capsys.readouterr().out.splitlines()
+    assert only and all(line.startswith("  · ") for line in only)
+    assert any("codex repair: asking again for the verdict" in line for line in only)
+    assert any(" turn_start: " in line for line in only)
+    assert not any("VERDICT-TEXT" in line or "THINKING-TEXT" in line or " text: " in line for line in only)
 
 
 @pytest.mark.parametrize("reviewers", [None, ["codex", "antigravity"]])

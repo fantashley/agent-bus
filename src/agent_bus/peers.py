@@ -1395,6 +1395,70 @@ def _agy_workspace_check(dirs: list[str]) -> None:
             '"enabled": false on each hook and "disabled": true on each MCP server.')
 
 
+# agy's read_file returns at most 46,080 bytes per call (live, agy 1.5.13, #126): a part file
+# kept under it is read whole in one call, so the model needn't guess slices.
+AGY_READ_CAP = 45_000
+
+
+def _cut(text: str, limit: int) -> tuple[str, str]:
+    """``text`` split into a head of at most ``limit`` UTF-8 bytes and the rest: at the last
+    line break that fits, or mid-line (on a character boundary) for one very long line."""
+    size = lambda k: len(text[:k].encode("utf-8", "surrogateescape"))  # noqa: E731
+    if size(len(text)) <= limit:
+        return text, ""
+    lo, hi = 0, min(len(text), max(limit, 0))  # a character is at least one byte
+    while lo < hi:  # the most characters that fit
+        mid = (lo + hi + 1) // 2
+        lo, hi = (mid, hi) if size(mid) <= limit else (lo, mid - 1)
+    head = text[:max(lo, 1)]
+    nl = head.rfind("\n")
+    if nl > 0:
+        head = head[:nl + 1]
+    return head, text[len(head):]
+
+
+def _agy_spill(guide: str, body: str, directory: str) -> str:
+    """The --print value for a prompt too long for one argv entry (#126): the guide and as
+    much of the prompt as fits, as part 1, and the rest in part files under ``directory``,
+    each under AGY_READ_CAP and named in order, so the reviewer reads each one whole.  The
+    sizes count the real notices and paths (codex-6); the number of parts is settled by
+    trying again when a guess was wrong (its digits change the paths' length)."""
+    def size(text: str) -> int:
+        return len(text.encode("utf-8", "surrogateescape"))
+
+    tag = new_uuid()
+    n = 2
+    for _ in range(8):
+        paths = [os.path.join(directory, f"prompt-{tag}-part{i}-of-{n}.md") for i in range(2, n + 1)]
+        # Only part 2 is named here, so this stays small however many parts there are
+        # (codex-8): each part ends by naming the next.
+        intro = (guide + f"This prompt is too long for one message, so it is in {n} parts: part 1 is "
+                 f"below, and parts 2 to {n} are files, each small enough to read whole in one "
+                 f"read_file call (no StartLine or EndLine needed), and each ending with the path of "
+                 f"the next. Read every part, in order, before you answer, and follow them as one "
+                 f"prompt. Part 2: {paths[0]}\n\n[part 1 of {n}]\n")
+        outro = f"\n[end of part 1 of {n}: continue with part 2, {paths[0]}]"
+        first, rest = _cut(body, MAX_ARG - size(intro) - size(outro))
+        parts: list[tuple[str, str, str]] = []
+        i = 2
+        while rest:
+            head = f"[agent-bus prompt, part {i} of {n}]\n"
+            # A path of the same length stands in for one past the guess: the count is redone.
+            nxt = paths[i - 1] if i - 1 < len(paths) else paths[-1]
+            more = f"\n[end of part {i} of {n}: continue with part {i + 1}, {nxt}]\n"
+            last = f"\n[end of part {i} of {n}: the whole prompt has been read]\n"
+            text, rest = _cut(rest, AGY_READ_CAP - size(head) - max(size(more), size(last)))
+            parts.append((head, text, last if not rest else more))
+            i += 1
+        if len(parts) + 1 == n:
+            break
+        n = len(parts) + 1
+    for path, (head, text, end) in zip(paths, parts):
+        with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(head + text + end)
+    return intro + first + outro
+
+
 class AntigravityAdapter(Adapter):
     agent = "antigravity"
     # 2: headless tool guidance in every prompt; denied actions reported as an incomplete turn.
@@ -1410,7 +1474,9 @@ class AntigravityAdapter(Adapter):
     # 9: a workspace with its own hooks, MCP servers or plugins is refused (#98).
     # 10: the shared headless rules say the final message is normally, not always, the one
     # posted (#113).
-    recipe = "10"
+    # 11: a prompt too long for --print goes in as far as fits and continues in numbered part
+    # files, each under read_file's cap (#126).
+    recipe = "11"
     # agy 1.5.13 in plan mode declares search_web (Google-grounded search, run server side) but
     # no page fetch.  `search_web(*)` and `read_url(*)` deny rules are ignored, but a custom
     # agent's `tools` list removes it (live probes, 2026-11-23): see peer_agent.
@@ -1543,13 +1609,10 @@ class AntigravityAdapter(Adapter):
         guide = AGY_HEADLESS if self.web_search else AGY_HEADLESS_NO_WEB
         prompt = guide + prompt
         # agy takes the prompt as the value of --print; there is no stdin mode
-        # for plain text, so very long prompts go through a file.
+        # for plain text, so a very long prompt goes in as far as fits and continues in
+        # numbered part files (#126), each small enough for one read_file call.
         if len(prompt.encode()) > MAX_ARG:
-            path = os.path.join(add_dirs[0] if add_dirs else cwd, f"prompt-{new_uuid()}.md")
-            with open(path, "w") as f:
-                f.write(prompt)
-            prompt = (guide + f"Your full instructions are in the file {path}. "
-                      "Read it with read_file and follow it exactly.")
+            prompt = _agy_spill(guide, prompt[len(guide):], add_dirs[0] if add_dirs else cwd)
         argv += ["--print", prompt]
         return Invocation(argv=argv, external_id=resume_id)
 

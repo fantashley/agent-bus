@@ -65,6 +65,25 @@ def test_short_argv_redacts_what_could_hold_a_credential(argv, want):
     assert provenance.short_argv(argv) == want
 
 
+# The README's "What the redaction keeps" rules, one case each (#132).
+@pytest.mark.parametrize("argv,want", [
+    (["tool", "--mode", "exec"], "tool --mode exec"),  # 1: an allowlisted word, even after a flag
+    (["tool", "-o", "--", "x"], "tool -o -- *"),  # 1: "--" too
+    (["tool", "-o", "value"], "tool -o *"),  # 2: a flag's value
+    (["tool", "-o", "-v"], "tool -o -v"),  # 2: unless it starts with "-"
+    (["tool", "--a", "--b", "--c=x"], "tool --a --b --c=*"),  # 3: long flags, even after a flag
+    (["tool", "--" + "x" * 32], "tool -*"),  # 3/4: too long for a long flag
+    (["tool", "-v", "-abc"], "tool -v -*"),  # 4
+    (["tool", "~/" + "a" * 24], "tool .../" + "a" * 24),  # 5: a component of 24 characters
+    (["tool", "~/" + "a" * 25], "tool .../*"),  # 5: over 24
+    (["tool", "/opt/a b"], "tool *"),  # 5: whitespace: not a path
+    (["tool", "plain"], "tool *"),  # 6
+    (["x" * 41], "*"),  # an executable name over 40 characters
+])
+def test_short_argv_keeps_exactly_what_the_readme_says(argv, want):
+    assert provenance.short_argv(argv) == want
+
+
 def test_ancestry_marks_harnesses_from_the_full_argv_and_cuts_long_chains():
     argvs = {10: ["bash"], 11: ["node", "/opt/lib/node_modules/@openai/codex/bin/codex.js"], 12: None}
     chain, cut = REAL_ANCESTRY(1, ancestors_of=lambda pid: [10, 11, 12], argv_of=argvs.get)

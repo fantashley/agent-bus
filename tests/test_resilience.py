@@ -7,6 +7,7 @@ import time
 import pytest
 
 from agent_bus import config as cfg
+from agent_bus import peers
 from agent_bus.db import HUMAN, SYSTEM
 from agent_bus.peers import PeerSetupError, adapter, cli_identity, cli_version
 from agent_bus.service import Service
@@ -446,20 +447,46 @@ def test_agy_reply_after_a_denial_is_a_normal_turn(env, monkeypatch):
 def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     from agent_bus.prompts import AGY_HEADLESS
     ad = adapter("antigravity", cfg.Config.load())
-    assert ad.recipe == "10" and "run_command" in AGY_HEADLESS and "search_web" in AGY_HEADLESS
+    assert ad.recipe == "11" and "run_command" in AGY_HEADLESS and "search_web" in AGY_HEADLESS
     assert "do not use search_web" not in AGY_HEADLESS.lower()  # no contradiction with the preamble
     for resume_id in (None, "conv-1"):
         argv = ad.invocation("PROMPT-BODY", resume_id, str(env["repo"]), []).argv
         assert argv[-1] == AGY_HEADLESS + "PROMPT-BODY"
         assert argv[argv.index("--mode") + 1] == "plan" and "--sandbox" in argv  # unchanged isolation
-    # Long prompts still go through a file, and both the file and the pointer carry the guidance.
+    # A long prompt goes in as far as fits (with the guidance) and continues in numbered part
+    # files, each under read_file's 46,080-byte cap, so each is read whole in one call (#126).
     scratch = env["tmp"] / "scratch"
     scratch.mkdir()
-    big = "x" * 200_000
+    lines = [f"line {i:06d} " + "é" * 20 + "\n" for i in range(9_000)]  # multibyte, ~400 KB
+    big = "".join(lines) + "y" * 60_000  # and one line longer than a part
     argv = ad.invocation(big, "conv-1", str(env["repo"]), [str(scratch)]).argv
-    assert argv[-1].startswith(AGY_HEADLESS) and "read_file" in argv[-1] and big not in argv[-1]
-    (written,) = scratch.glob("prompt-*.md")
-    assert written.read_text() == AGY_HEADLESS + big
+    inline = argv[-1]
+    assert inline.startswith(AGY_HEADLESS) and len(inline.encode()) <= peers.MAX_ARG
+    written = sorted(scratch.glob("prompt-*-part*-of-*.md"), key=lambda p: int(p.name.split("-part")[1].split("-")[0]))
+    n = len(written) + 1
+    assert n > 2 and f"in {n} parts" in inline and str(written[0]) in inline
+    assert all(len(p.read_bytes()) <= peers.AGY_READ_CAP < 46_080 for p in written)
+    # The parts, stripped of their markers, are the prompt exactly, in order.
+    first = inline.split(f"[part 1 of {n}]\n", 1)[1].rsplit(f"\n[end of part 1 of {n}", 1)[0]
+    rest = []
+    for i, p in enumerate(written, start=2):
+        text = p.read_text()
+        assert text.startswith(f"[agent-bus prompt, part {i} of {n}]\n")
+        assert (str(written[i - 1]) if i < n else "the whole prompt has been read") in text.splitlines()[-1]
+        rest.append(text.split("\n", 1)[1].rsplit("\n[end of part", 1)[0])
+    assert first + "".join(rest) == big
+    # The limits hold with a long scratch path too: the sizes count the real paths (codex-6).
+    deep = scratch
+    for k in range(12):
+        deep = deep / (f"d{k}" + "p" * 240)
+    deep.mkdir(parents=True)
+    inline = ad.invocation(big, "conv-1", str(env["repo"]), [str(deep)]).argv[-1]
+    deep_parts = list(deep.glob("prompt-*-part*-of-*.md"))
+    assert len(inline.encode()) <= peers.MAX_ARG and deep_parts
+    assert all(len(p.read_bytes()) <= peers.AGY_READ_CAP for p in deep_parts)
+    assert f"in {len(deep_parts) + 1} parts" in inline
+    # A prompt that fits is passed whole, with no part files.
+    assert ad.invocation("x" * 50_000, None, str(env["repo"]), [str(scratch)]).argv[-1] == AGY_HEADLESS + "x" * 50_000
 
     # Through the worker: first and resumed turns get agy's guidance and are recorded as recipe 10;
     # other peers get the shared HEADLESS note instead, never agy's.
@@ -472,7 +499,7 @@ def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     assert not any(AGY_HEADLESS.strip() in c["prompt"] for c in calls(env, "codex"))
     starts = [e["text"] for e in env["bus"]._all(
         "SELECT * FROM events WHERE thread_id=? AND kind='turn_start' AND agent='antigravity'", tid)]
-    assert starts and all("recipe antigravity/10" in s for s in starts)
+    assert starts and all("recipe antigravity/11" in s for s in starts)
 
 
 def test_incomplete_agy_discussion_turn_is_reported_without_a_drift_notice(env, no_spawn, monkeypatch):
