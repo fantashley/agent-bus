@@ -486,6 +486,7 @@ class Worker:
         emit = lambda kind, text: self.event(kind, text, agent)  # noqa: E731
         tag = self.job["id"]
         row = self.begin_usage(ad, model, resume_id)
+        fresh = False  # whether the fresh-session fallback below ran
         # Checked last, just before the hand-off to the CLI: only a turn started in time may
         # post past a discussion's deadline (#74).
         left = self.deadline_left()
@@ -511,17 +512,22 @@ class Worker:
                 self.event("turn_end", f"failed: {res.error}" + tokens(res), agent)
                 return self.blocked(agent, block)
             self.event("error", f"resume failed ({res.error}); starting a fresh session", agent)
-            self.set_peer_session(agent, None)
             row = self.begin_usage(ad, model, None)
             left = self.deadline_left()  # again just before the hand-off (#74)
             if left > 0:
                 res = ad.run(fresh_prompt or prompt, cwd, max(30.0, min(self.config.turn_timeout_s, left)), emit,
                              add_dirs=add_dirs, cancelled=self.cancelled, peer_tag=tag)
                 self.account(ad, model, res, resumed=False, row=row)
+                fresh = True
             else:
                 self.drop_usage(row)
         self.event("turn_end", ("ok" if res.ok else f"failed: {res.error}") + tokens(res), agent)
         self.check()  # a worker that lost its lease records nothing
+        if fresh:
+            # The stored session is dropped only once the fresh one has run, never between
+            # the last deadline check and the launch: a skipped fallback keeps it for a
+            # later resume or debrief (#106).
+            self.set_peer_session(agent, None)
         if res.quota:
             self.record_quota(agent, model, res.quota)
             # Keep the conversation pinned for a retry after the reset, and never pin the
@@ -568,11 +574,12 @@ class Worker:
         return res
 
     def drop_usage(self, row: int | None) -> None:
-        """A turn marked as started (begin_usage) that never ran its CLI: close the row."""
+        """A turn marked as started (begin_usage) that never ran its CLI: delete the row, so
+        the session's next resumed turn still has its baseline (#106)."""
         if row is None:
             return
         try:
-            self.bus.close_usage(row)
+            self.bus.discard_usage(row)
         except Exception as e:  # noqa: BLE001 - history must never fail a turn
             self.event("error", f"could not record token usage: {e!r}")
 
@@ -1434,7 +1441,7 @@ class Worker:
         the prompt says files on disk may not match the head."""
         try:
             snap = snapshot.ensure(refs["repo"], t["id"], refs["base_commit_id"], refs["head_commit_id"],
-                                   self.config.max_snapshot_bytes)
+                                   self.config.max_snapshot_bytes, cancelled=self.cancelled)
         except Exception as e:  # noqa: BLE001 (never what fails a review)
             snap = snapshot.Snapshot(head=refs["head_commit_id"], reason=f"it could not be made ({e!r})")
         # A non-UTF-8 file name in it would fail the event's insert and a strict prompt encode.

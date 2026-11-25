@@ -1366,7 +1366,9 @@ class AntigravityAdapter(Adapter):
     # 8: the guidance says a review shows where the change's names are used, and to read long
     # files by line range (#117).
     # 9: a workspace with its own hooks, MCP servers or plugins is refused (#98).
-    recipe = "9"
+    # 10: the shared headless rules say the final message is normally, not always, the one
+    # posted (#113).
+    recipe = "10"
     # agy 1.5.13 in plan mode declares search_web (Google-grounded search, run server side) but
     # no page fetch.  `search_web(*)` and `read_url(*)` deny rules are ignored, but a custom
     # agent's `tools` list removes it (live probes, 2026-11-23): see peer_agent.

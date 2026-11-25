@@ -1300,6 +1300,12 @@ class Bus:
         time becomes the time it ended, as for a recorded turn."""
         self.conn.execute("UPDATE turn_usage SET done=1, created_at=? WHERE id=?", (_now(), row))
 
+    def discard_usage(self, row: int) -> None:
+        """A started turn that never ran its CLI (#106): it spent nothing and reported nothing,
+        so its row goes.  Closed instead, it would stand between the session's turns that did
+        run, and the next resumed turn's share could not be worked out (see _session_share)."""
+        self.conn.execute("DELETE FROM turn_usage WHERE id=? AND done=0", (row,))
+
     def record_usage(self, thread_id: str, agent: str, usage: dict | None, *, ok: bool,
                      job_id: str | None = None, model: str | None = None, session: str | None = None,
                      session_total: dict | None = None, resumed: bool = False, row: int | None = None,

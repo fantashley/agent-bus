@@ -34,6 +34,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Callable
 
 from . import config as cfg
 
@@ -70,11 +71,12 @@ def root() -> Path:
 
 
 @contextmanager
-def _locked(thread_id: str, wait: float | None = None):
+def _locked(thread_id: str, wait: float | None = None, cancelled: Callable[[], bool] | None = None):
     """Holds the thread's snapshot lock: making or reusing a snapshot, and a sweep's decision
     to remove it with the removal itself, never interleave.  Yields False if someone else
     still holds it after ``wait`` seconds (0: a sweep skips a snapshot being built; a stuck
-    old worker's build never blocks a retry's turn for long)."""
+    old worker's build never blocks a retry's turn for long), or once ``cancelled()`` says
+    the job waiting for it was cancelled, even if it got the lock (#113)."""
     locks = root() / ".locks"
     locks.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(locks / f"{thread_id}.lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -85,10 +87,13 @@ def _locked(thread_id: str, wait: float | None = None):
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= deadline or (cancelled is not None and cancelled()):
                     yield False
                     return
                 time.sleep(0.2)
+        if cancelled is not None and cancelled():  # cancelled while it waited, or just as it got it
+            yield False
+            return
         yield True
     finally:
         os.close(fd)
@@ -166,9 +171,11 @@ def _inside(path: str, target: str) -> bool:
     return not (norm == ".." or norm.startswith("../") or norm.startswith("/"))
 
 
-def ensure(repo: str, thread_id: str, base: str, head: str, max_bytes: int) -> Snapshot:
+def ensure(repo: str, thread_id: str, base: str, head: str, max_bytes: int,
+           cancelled: Callable[[], bool] | None = None) -> Snapshot:
     """The snapshot of ``head`` for ``thread_id``, made now or reused.  Never raises for a
-    repository problem: a Snapshot without a path says why there is none."""
+    repository problem: a Snapshot without a path says why there is none.  ``cancelled``
+    stops a wait for another worker's lock early."""
     snap = Snapshot(head=head)
     if not (_ID.fullmatch(head) and _ID.fullmatch(thread_id) and _ID.fullmatch(base)):
         snap.reason = "the base, head or thread id can't name a directory"
@@ -176,9 +183,10 @@ def ensure(repo: str, thread_id: str, base: str, head: str, max_bytes: int) -> S
     if max_bytes <= 0:
         snap.mode, snap.reason = "over_cap", "snapshots are turned off (max_snapshot_bytes is 0)"
         return snap
-    with _locked(thread_id) as mine:
+    with _locked(thread_id, cancelled=cancelled) as mine:
         if not mine:
-            snap.reason = "another worker is still writing it"
+            snap.reason = ("the review was cancelled" if cancelled is not None and cancelled()
+                           else "another worker is still writing it")
             return snap
         return _ensure(repo, thread_id, base, head, max_bytes, snap)
 

@@ -171,7 +171,7 @@ def test_agy_switched_off_or_empty_customizations_are_fine(env):
     write(env["repo"] / ".agents" / "rules" / "style.md", "# rules are only text")
     write(env["repo"] / ".agents" / "skills" / "s" / "SKILL.md", "---\nname: s\n---\n")
     a = invocation(env, "antigravity").argv
-    assert "--print" in a and adapter("antigravity", cfg.Config.load()).recipe == "9"
+    assert "--print" in a and adapter("antigravity", cfg.Config.load()).recipe == "10"
 
 
 @pytest.mark.parametrize("content", ["{not json", "[1]"])
