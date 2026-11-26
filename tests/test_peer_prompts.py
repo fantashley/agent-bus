@@ -7,10 +7,10 @@ import subprocess
 import pytest
 
 from agent_bus import prompts
-from agent_bus.db import HUMAN
+from agent_bus.db import HUMAN, SYSTEM
 from agent_bus.peers import extract_json
 from agent_bus.service import Service
-from agent_bus.worker import Worker, diff_overview, normalize_verdict, repair_reason, verdict_problem
+from agent_bus.worker import Worker, diff_overview, is_refusal, normalize_verdict, repair_reason, verdict_problem
 
 from test_review_rounds import BOTH, calls, git_repo, run_job
 
@@ -97,6 +97,33 @@ def test_repair_turns_log_why(env, no_spawn, monkeypatch):
     run_job(bus, tid)
     assert ("repair", "asking again for the move: no JSON object in the reply") in [
         (e["kind"], e["text"]) for e in bus.events(tid)]
+
+
+def test_a_bare_refusal_is_named_as_one(env, no_spawn, monkeypatch):
+    # A model-side refusal with no JSON (#154) is told apart from malformed output, in the repair
+    # event and the system notice, without quoting the peer's text in the notice.
+    bus, repo = env["bus"], env["repo"]
+    refusal = "I cannot assist with that request."
+    monkeypatch.setenv("FAKE_REPLY_CODEX", refusal)
+    monkeypatch.setenv("FAKE_REPAIR_CODEX", refusal)
+    assert is_refusal(refusal) and is_refusal("I'm sorry, but I can't help with that.")
+    assert not is_refusal("The review: I cannot assist further. {\"verdict\": 1}") and not is_refusal("")
+    assert repair_reason(None, None, refusal) == "the reply was a refusal, with no JSON object"
+    base, commit = git_repo(repo)
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(repo), base, commit("one\n"))["thread"]["id"]
+    run_job(bus, tid)
+    assert ("repair", "asking again for the verdict: the reply was a refusal, with no JSON object") in [
+        (e["kind"], e["text"]) for e in bus.events(tid)]
+    notices = [m["body"] for m in bus.history(tid)["messages"] if m["sender"] == SYSTEM]
+    assert any("codex did not return a usable verdict: its reply was a refusal, with no JSON verdict" in b
+               for b in notices)
+    tid = Service(bus, HUMAN).start_discussion("Q?", peers=["codex", "antigravity"])["thread"]["id"]
+    run_job(bus, tid)
+    assert ("repair", "asking again for the move: the reply was a refusal, with no JSON object") in [
+        (e["kind"], e["text"]) for e in bus.events(tid)]
+    assert any(m["body"].startswith("codex's reply was a refusal and had no valid proposal")
+               for m in bus.history(tid)["messages"] if m["sender"] == SYSTEM)
 
 
 def test_review_prompt_leads_with_files_commits_and_testing(env, no_spawn, monkeypatch):

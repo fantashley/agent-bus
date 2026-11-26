@@ -99,10 +99,10 @@ def finished_line(f: dict) -> str:
     left = []
     if f.get("open_findings"):
         left.append(f"blocking findings left open: {', '.join(f['open_findings'])}")
-    if f.get("earlier_open_findings"):
-        left.append("unsettled from an earlier revision: " + ", ".join(
-            f"{fid} (head {str(at.get('head_commit_id'))[:12]} on base {str(at.get('base_commit_id'))[:12]})"
-            for fid, at in f["earlier_open_findings"].items()))
+    # A count (#154); a record from before it listed each id with its head.
+    earlier = f.get("earlier_unsettled") or len(f.get("earlier_open_findings") or {})
+    if earlier:
+        left.append(f"{earlier} blocking finding{'s' if earlier != 1 else ''} unsettled from an earlier revision")
     if f.get("pending"):
         left.append(f"not reviewed at that head: {', '.join(f['pending'])}")
     return (f"finished by {f.get('by')} at head {str(f.get('head_commit_id'))[:12]} without every approval"
@@ -1421,9 +1421,10 @@ class Service:
         open) and its notice."""
         thread, refs = t["id"], t["refs"] or {}
         # Each reviewer's blocking findings from its latest verdict, unless it has approved the
-        # current head since: confirmed at this head, or left unsettled at an earlier one (a
-        # reviewer that hadn't reached the new head yet).
-        left, earlier = [], {}
+        # current head since: the ids confirmed at this head, and a count of those left
+        # unsettled at an earlier one (a reviewer that hadn't reached the new head yet), which
+        # on a long review-only review can be many (#154).
+        left, earlier = [], 0
         for r, state in st["reviewers"].items():
             verdict = self.bus.last_verdict(thread, r)
             if state["state"] == "approved" or verdict is None or verdict["data"].get("verdict") != "request_changes":
@@ -1433,11 +1434,9 @@ class Service:
             if state["state"] == "changes_requested":
                 left += ids
             else:
-                at = {"head_commit_id": verdict["data"].get("head_commit_id"),
-                      "base_commit_id": verdict["data"].get("base_commit_id")}
-                earlier.update({fid: at for fid in ids})
+                earlier += len(ids)
         finished = {"by": self.agent, "reason": reason, "head_commit_id": refs.get("head_commit_id"),
-                    "open_findings": left, "earlier_open_findings": earlier, "approved": st["approved"],
+                    "open_findings": left, "earlier_unsettled": earlier, "approved": st["approved"],
                     "changes_requested": st["changes_requested"], "pending": st["pending"],
                     "at": round(time.time())}
         note = provenance.peer_note(self.bus.human_provenance) if self.agent == HUMAN else ""

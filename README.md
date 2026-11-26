@@ -175,7 +175,7 @@ pull request review on top of it.
 pass is running (`THREAD_BUSY` otherwise). The thread becomes `resolved` with a `finished` record:
 who, the reason (fenced as peer data when an agent wrote it; a human reason whose provenance is
 flagged carries `reason_provenance`), the head, the blocking finding ids left open at that head,
-any a reviewer left unsettled at an earlier head (`earlier_open_findings`, with that head), and
+a count of those a reviewer left unsettled at an earlier head (`earlier_unsettled`), and
 any required reviewer that hadn't reviewed the head. `threads`, `history`, `tail` and `wait`'s
 `next_action` (`done: finished by … without every approval; blocking findings left open:
 codex-2`) all show it. A finished review is terminal: it takes no more follow-ups (one naming
@@ -467,7 +467,8 @@ codex 0.171.0 and 0.172.0, and agy 1.5.13:
   methods, and names in backticks in the thread's findings and notes since its last pass),
   fewest hits first, with a very common name collapsed to one line. A prompt too long for one
   argument goes in as far as fits and continues in numbered part files, each small enough for
-  one `read_file` call (agy reads at most 46,080 bytes per call). Turns also
+  one `read_file` call (agy reads at most 800 lines or 46,080 bytes per call; a part stays under
+  750 lines and 44,000 bytes). Turns also
   pass `--disable-slash-commands`, so nothing in the prompt expands as a slash command or skill,
   and there is no `/plan` meta-prompt (plan and walkthrough artifacts and asking for approval).
   That flag makes `--mode` a no-op, so turns pass none: the agent's tool list, the deny rules

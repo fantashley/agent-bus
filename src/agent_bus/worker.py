@@ -974,6 +974,7 @@ class Worker:
         action = extract_reply(res.text, move_field)
         if not self.valid_action(action, blind) and self.deadline_left() > 0:  # no repair turn past it (#74)
             self.event("repair", "asking again for the move: " + (
+                "the reply was a refusal, with no JSON object" if action is None and is_refusal(res.text) else
                 "no JSON object in the reply" if action is None else
                 f"the JSON object is not a valid {'proposal' if blind else 'proposal or vote'}"), agent)
             # The repair turn resumes the same session; a fresh fallback gets only the
@@ -989,7 +990,8 @@ class Worker:
         if not self.valid_action(action, blind):
             self.safe_post(agent, res.text.strip()[:20000] or "(empty reply)", kind="message",
                            session_id=f"job:{self.job['id']}")
-            self.safe_post(SYSTEM, f"{agent}'s reply had no valid {'proposal' if blind else 'proposal or vote'}, "
+            refused = " was a refusal and" if is_refusal(res.text) else ""
+            self.safe_post(SYSTEM, f"{agent}'s reply{refused} had no valid {'proposal' if blind else 'proposal or vote'}, "
                         "so it was posted as a plain message.", kind="status")
             return
         prose = strip_trailing_json(fenced_body(res.text)[1])
@@ -1356,7 +1358,7 @@ class Worker:
         problem = (verdict_problem(verdict) or settlement_problem(verdict, prior)) if verdict else None
         if (verdict is None or problem) and res.ok:
             # Why a repair turn runs, for `agent-bus tail` (#93).
-            self.event("repair", f"asking again for the verdict: {repair_reason(raw, problem)}", reviewer)
+            self.event("repair", f"asking again for the verdict: {repair_reason(raw, problem, res.text)}", reviewer)
             ask = (f"Your verdict is inconsistent: {problem}. Reply again with only the corrected JSON "
                    "verdict object described above (and its body block, if you use one)." if problem else
                    "Reply again with only the JSON verdict object described above (and its body block, if "
@@ -1390,6 +1392,8 @@ class Worker:
         if verdict is None or problem:
             if self.finish_thread("needs_human"):
                 why = (f"gave an inconsistent verdict ({problem})" if problem else
+                       "did not return a usable verdict: its reply was a refusal, with no JSON verdict"
+                       if not res.error and is_refusal(gave.text) else
                        f"did not return a usable verdict: {clause(res.error or 'no valid JSON verdict')}")
                 self.safe_post(SYSTEM, f"{reviewer} {why}. Run `agent-bus resume` to retry.",
                                kind="status", recipient=t["initiator"])
@@ -2120,13 +2124,26 @@ def shown_path(path: str) -> str:
     return "".join(esc(c) for c in path)
 
 
-def repair_reason(raw: object, problem: str | None) -> str:
-    """Why a reviewer's reply needs a repair turn (#93): no JSON, the wrong shape, or a
-    severity rule broken."""
+# A bare model-side refusal ("I cannot assist with that request"), told apart from malformed
+# output in the repair event and notices so a recurring one is easy to spot (#154).  Its text
+# is the peer's, so it is never quoted in a system notice.
+_REFUSAL = re.compile(r"\bI(?:['’]m| am)?\s+(?:sorry,?\s+(?:but\s+)?I\s+)?(?:cannot|can['’]?t|can not|won['’]t|"
+                      r"will not|(?:am\s+|['’]m\s+)?(?:unable|not able) to|must decline to)\s+(?:assist|help|comply)", re.I)
+
+
+def is_refusal(text: str | None) -> bool:
+    """Whether ``text`` is a bare refusal: short, with no JSON object, saying it can't help."""
+    t = " ".join((text or "").split())
+    return bool(t) and len(t) <= 400 and "{" not in t and bool(_REFUSAL.search(t))
+
+
+def repair_reason(raw: object, problem: str | None, text: str | None = None) -> str:
+    """Why a reviewer's reply needs a repair turn (#93): a refusal or no JSON, the wrong shape,
+    or a severity rule broken."""
     if problem:
         return f"inconsistent verdict ({problem})"
     if raw is None:
-        return "no JSON object in the reply"
+        return "the reply was a refusal, with no JSON object" if is_refusal(text) else "no JSON object in the reply"
     if not isinstance(raw, dict) or raw.get("verdict") not in ("approve", "request_changes"):
         return 'the JSON object has no "verdict" of "approve" or "request_changes"'
     return 'the JSON object\'s "findings" is not a list'

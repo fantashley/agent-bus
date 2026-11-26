@@ -34,6 +34,8 @@ def test_every_turn_says_agent_bus_rules_win(env, agent):
         text = prompt_of(agent, invocation(env, agent, resume_id))
         assert text.startswith("[agent-bus: unattended turn") and text.endswith("\n\nPROMPT")
         assert PRECEDENCE in text and "Normally only your final message is posted" in text and "live progress view" in text
+        # Up front, so a peer doesn't spend a tool call reading SKILL.md (#154).
+        assert "The agent-bus skills are for the agents that call agent-bus, not for you" in text[:400]
 
 
 def test_claude_runs_in_dont_ask_mode_with_the_same_isolation(env):
