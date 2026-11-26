@@ -228,7 +228,7 @@ def test_follow_up_names_the_new_heads_snapshot(env, no_spawn, monkeypatch):
     Worker(bus, bus.jobs(tid)[-1]["id"]).run()
     second = calls(env)[-1]
     assert "--conversation" in second["argv"]  # a resumed follow-up
-    assert f"are exactly head {h2}" in second["prompt"] and str(snapshot.root() / tid / h2) in second["argv"]
+    assert f"exactly head {h2}" in second["prompt"] and str(snapshot.root() / tid / h2) in second["argv"]
     first = calls(env)[0]["prompt"]
     assert "Files in the copy (1)" in first and "\na.txt\n" in first
     # The resumed session has the earlier list: only what was added or removed (#126).

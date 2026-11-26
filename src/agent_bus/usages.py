@@ -30,6 +30,9 @@ Ranking (#135): names the change touches only in test files (``tests/``, ``test_
 ones it touches elsewhere, and get room after every other name, so a change's test helpers can't
 crowd out its production names; and a definition keyword inside a string literal on its
 line (a fake diff in a test, ``"+def key_0(): pass"``) defines nothing.
+
+Debrief follow-ups (#156): a name's hits outside test files are listed first, and a name with
+no room for its full list gets a sample of SAMPLE hits before it falls back to one line.
 """
 
 from __future__ import annotations
@@ -45,6 +48,8 @@ from . import snapshot
 # how much git grep output is read at most (a name used everywhere can't flood the worker).
 MAX_SYMBOLS = 16
 PER_SYMBOL = 8
+# Hits shown for a name that has no room for PER_SYMBOL of them (#156).
+SAMPLE = 3
 MAX_LINE = 140
 MAX_CHARS = 6_000
 MAX_OUTPUT = 2_000_000
@@ -430,8 +435,9 @@ def _desc(t: Term) -> str:
 def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
            readable: frozenset[str] | set[str] | None = None) -> str:
     """The hits, grouped by name, fewest hits first (names touched only in tests last), and
-    capped: at most ``per_symbol`` lines each (then a count and the files of the rest) and
-    ``limit`` characters in all.
+    capped: at most ``per_symbol`` lines each, hits outside test files first (then a count
+    and the files of the rest), and ``limit`` characters in all; a name with no room for that
+    gets SAMPLE of its hits.
     A name with over GENERIC_HITS hits, or one that doesn't fit in full, is one line: its
     count and busiest files.  The changed definitions are always shown (at worst as that
     line); the others are left out, highest priority last, when even that doesn't fit.
@@ -443,13 +449,14 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
 
     lower = u.cut or (set(u.names) if u.truncated else set())
     full: dict[str, str] = {}
+    sample: dict[str, str] = {}
     short: dict[str, str] = {}
     for n in u.names:
         t = u.terms.get(n) or Term(n)
         desc = ", ".join(d for d in (_desc(t), "only in tests" if t.test else "") if d)
         hits = u.hits.get(n) or []
         if not hits:
-            full[n] = short[n] = (f"{n}{f' ({desc})' if desc else ''}: "
+            full[n] = sample[n] = short[n] = (f"{n}{f' ({desc})' if desc else ''}: "
                                   + ("none found before the search output was cut" if n in lower
                                      else "no uses at head"))
             continue
@@ -459,21 +466,28 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
         count = (f"{'at least ' if n in lower else ''}{_plural(len(hits), 'hit')} in "
                  f"{_plural(len(files), 'file')}")
         head = f"{n} ({desc}; {count})" if desc else f"{n} ({count})"
-        lines = [head + ":"]
-        for p, ln, text in hits[:per_symbol]:
-            out_of_copy = " (not in the copy)" if readable is not None and p not in readable else ""
-            lines.append(f"  {_defuse(p)}:{ln}{out_of_copy}: {_clean(text)}")
-        if len(hits) > per_symbol:
-            rest = list(dict.fromkeys(p for p, _, _ in hits[per_symbol:]))
-            shown = ", ".join(mark(p) for p in rest[:6]) + (f" and {len(rest) - 6} more" if len(rest) > 6 else "")
-            lines.append(f"  [... {len(hits) - per_symbol} more in {shown}]")
-        full[n] = "\n".join(lines)
+        # Hits outside test files first (#156): they are what a reviewer checks a change against.
+        hits = sorted(hits, key=lambda h: is_test(h[0]))
+
+        def listing(k: int) -> str:  # the heading and the first ``k`` hits, then where the rest are
+            lines = [head + ":"]
+            for p, ln, text in hits[:k]:
+                out_of_copy = " (not in the copy)" if readable is not None and p not in readable else ""
+                lines.append(f"  {_defuse(p)}:{ln}{out_of_copy}: {_clean(text)}")
+            if len(hits) > k:
+                rest = list(dict.fromkeys(p for p, _, _ in hits[k:]))
+                shown = ", ".join(mark(p) for p in rest[:6]) + (f" and {len(rest) - 6} more" if len(rest) > 6 else "")
+                lines.append(f"  [... {len(hits) - k} more in {shown}]")
+            return "\n".join(lines)
+        full[n] = listing(per_symbol)
+        # Failing room for that, a sample of the hits rather than none (#156).
+        sample[n] = listing(SAMPLE) if len(hits) > SAMPLE else full[n]
         busiest = sorted(files, key=lambda p: -files[p])[:6]
         why = "too common to list" if len(hits) > GENERIC_HITS else "not listed, for space"
         short[n] = (f"{head}: {why}; most in " + ", ".join(f"{mark(p)} ({files[p]})" for p in busiest)
                     + (f" and {len(files) - 6} more files" if len(files) > 6 else ""))
         if len(hits) > GENERIC_HITS:
-            full[n] = short[n]
+            full[n] = sample[n] = short[n]
     index = {n: i for i, n in enumerate(u.names)}
     prio = {n: priority(u.terms.get(n) or Term(n)) for n in u.names}
     size = {n: len(u.hits.get(n) or []) for n in u.names}
@@ -485,7 +499,7 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
     for n in sorted(u.names, key=lambda n: (prio[n], size[n], index[n])):
         if prio[n] == 0:
             reserve -= len(short[n]) + 1
-        for block in dict.fromkeys((full[n], short[n])):
+        for block in dict.fromkeys((full[n], sample[n], short[n])):
             if used + len(block) + 1 + reserve <= limit or (prio[n] == 0 and block is short[n]):
                 kept[n] = block
                 used += len(block) + 1

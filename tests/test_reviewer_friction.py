@@ -50,8 +50,8 @@ def test_an_approving_reviewer_gets_the_approved_framing_not_converge(env, no_sp
     assert f"on a change you approved at {h1}" in codex2["prompt"]
     assert "other reviewers asked for changes" in codex2["prompt"]
     assert "fixed, withdrawn, or still blocking" not in codex2["prompt"]
-    assert "with your earlier review in mind" in codex2["prompt"] and "say which are" not in codex2["prompt"]
-    assert "fixed, withdrawn, or still blocking" in agy2["prompt"]
+    assert "The same rules apply as before" in codex2["prompt"] and "say which are" not in codex2["prompt"]
+    assert "settle the findings listed at the top" in agy2["prompt"]
     assert "you approved at" not in agy2["prompt"]
 
 
@@ -96,18 +96,17 @@ def test_findings_get_stable_ids_and_follow_ups_settle_them(env, no_spawn, monke
     run_job(bus, tid)
     p = calls(env)[-1]["prompt"]
     assert "- codex-1 [high] a.txt:1: typo" in p and "- codex-2 [medium] b.txt:1: typo" in p
-    assert '"earlier": [{"id": "codex-1", "status": "fixed"' in p
-    # A complete follow-up verdict example (#126): valid JSON, with "earlier" and a finding
-    # listed again by its "id", using this reviewer's own ids, and one that approves.
+    # The resumed confirmation pass leads with them (#159), before the interdiff.
+    assert p.index("Your open blocking findings") < p.index("- codex-1 [high]") < p.index("```diff")
+    # One complete follow-up verdict example (#126, #159): valid JSON, with "earlier" and a
+    # finding listed again by its "id", using this reviewer's own ids.
     examples = [json.loads(line) for line in p.splitlines() if line.startswith('{"verdict"')]
-    still = next(e for e in examples if e.get("earlier") and e["verdict"] == "request_changes")
-    assert [e["id"] for e in still["earlier"]] == ["codex-1", "codex-2"]
+    (still,) = [e for e in examples if e.get("earlier")]
+    assert still["verdict"] == "request_changes" and [e["id"] for e in still["earlier"]] == ["codex-1", "codex-2"]
     assert still["findings"][0]["id"] == "codex-1" and "id" not in still["findings"][1]
-    done = next(e for e in examples if e.get("earlier") and e["verdict"] == "approve")
     prior = {"codex-1": {"severity": "high"}, "codex-2": {"severity": "medium"}}
-    for e in (still, done):
-        v = settle_earlier(normalize_verdict(e), prior)
-        assert verdict_problem(v) is None and settlement_problem(v, prior) is None
+    v = settle_earlier(normalize_verdict(still), prior)
+    assert verdict_problem(v) is None and settlement_problem(v, prior) is None
     v2 = bus.last_verdict(tid, "codex")
     assert [(f["id"], f["file"]) for f in v2["data"]["findings"]] == [("codex-3", "c.txt"), ("codex-2", "b.txt")]
     assert [e["id"] for e in v2["data"]["earlier"]] == ["codex-1", "codex-2"]  # not other-9

@@ -114,6 +114,24 @@ def test_generic_names_cannot_crowd_out_the_specific_ones():
     assert "not shown: " in tight and "thread" in tight.split("not shown: ")[1]
 
 
+def test_a_name_short_of_room_shows_a_sample_of_its_hits_outside_tests_first():
+    """#156: a new key read in 21 places was "not listed, for space" on pass 1, and the hits
+    shown first were test lines."""
+    T = usages.Term
+    hits = {"follow_ups": [(f"tests/test_{i}.py", i, f"assert refs['follow_ups'] == {i}") for i in range(18)]
+            + [("src/worker.py", 900, "refs['follow_ups'] = used"), ("src/service.py", 40, "p['follow_ups']"),
+               ("src/cli.py", 7, "row['follow_ups']")],
+            "settle": [("src/worker.py", 10, "def settle(v):")]}
+    u = usages.Usages(names=list(hits), hits=hits, terms={"follow_ups": T("follow_ups", "read"), "settle": T("settle")})
+    full = usages.render(u)
+    assert full.index("src/worker.py:900") < full.index("tests/test_0.py")  # outside tests first
+    tight = usages.render(u, limit=420)
+    assert "not listed, for space" not in tight and "not shown" not in tight
+    sample = tight[tight.index("follow_ups ("):]
+    assert sample.count("\n  ") == usages.SAMPLE + 1  # three hits and where the other 18 are
+    assert "  src/worker.py:900: refs['follow_ups'] = used" in sample and "[... 18 more in tests/test_0.py" in sample
+
+
 def test_overflow_files_are_marked_when_not_in_the_copy():
     hits = [("src/a.py", i, "alpha") for i in range(9)] + [("docs/b.md", 1, "alpha"), ("src/c.py", 2, "alpha")]
     text = usages.render(usages.Usages(names=["alpha"], hits={"alpha": hits}), readable={"src/a.py", "src/c.py"})

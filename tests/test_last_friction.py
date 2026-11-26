@@ -145,5 +145,5 @@ def test_first_pass_asks_for_every_blocking_finding_at_once(env, no_spawn, monke
     claude.request_review(None, str(repo), base, h2, prev_head_commit_id=h1, reviewers=BOTH)
     run_job(bus, tid)
     by = {c["agent"]: c["prompt"] for c in calls(env)[1:]}
-    assert nudge not in by["codex"] and "fixed, withdrawn, or still blocking" in by["codex"]  # it converges
+    assert nudge not in by["codex"] and "settle the findings listed at the top" in by["codex"]  # it converges
     assert nudge in by["antigravity"]  # its own first pass
