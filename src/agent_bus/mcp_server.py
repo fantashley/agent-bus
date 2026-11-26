@@ -18,7 +18,8 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from . import config as cfg
-from . import autoresume, procinfo, quota, service
+from . import autoresume, quota, service
+from .mcp_shim import SESSION_ENV, register, resolve  # noqa: F401  (resolve: re-exported)
 from .db import Bus, BusError
 from .peers import cli_version
 
@@ -56,22 +57,6 @@ ACTING_TOOLS = frozenset({"send", "reply", "request_review", "start_discussion",
                           "finish_review"})
 
 
-def resolve(harness: str, participant: str | None, config: cfg.Config) -> str:
-    """The participant an interactive session of ``harness`` speaks as: ``participant``
-    when pinned (it must run on that harness), else the harness's default participant."""
-    if harness not in cfg.HARNESSES:
-        raise SystemExit(f"--agent must be one of {', '.join(cfg.HARNESSES)}")
-    if participant is None:
-        return harness
-    try:
-        found = config.participant(participant)
-    except ValueError as e:
-        raise SystemExit(f"--participant: {e}") from None
-    if found.harness != harness:
-        raise SystemExit(f"--participant {participant} runs on the {found.harness} harness, not {harness}")
-    return participant
-
-
 def build(agent: str, role: str | None = None, bus: Bus | None = None, participant: str | None = None,
           config: cfg.Config | None = None) -> MCPServer:
     config = config or cfg.Config.load()
@@ -82,16 +67,19 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
     # Set by the worker on headless peers: they contribute only through their reply,
     # never through tools (no posting, no new jobs, no peeking at blind proposals).
     peer_job = os.environ.get("AGENT_BUS_PEER")
+    # Set by the restart shim (#139): serve its session rather than registering one.  Popped
+    # so the workers and viewers this server starts don't inherit it.
+    shim_session = os.environ.pop(SESSION_ENV, None)
     session_id = None
     if not peer_job:
-        # Under Codex's shared app-server daemon, REX_* are the daemon's, not this window's (#6).
-        rex_reason = (procinfo.CODEX_SHARED_DAEMON
-                      if harness == "codex" and procinfo.shared_codex_daemon(os.getpid()) is not None else None)
-        # The client that started this server, so its hooks can find this session (and only it).
-        client = os.getppid()
-        session_id = bus.register_session(agent, cwd=cwd, repo=cfg.repo_root(cwd), role=role, rex_reason=rex_reason,
-                                          client_pid=client, client_start=procinfo.start_time(client),
-                                          harness=harness)
+        if shim_session:
+            # Never a session of its own: the shim's hooks and cursors live on that one.
+            if not bus.session(shim_session):
+                raise SystemExit(f"agent-bus mcp: the restart shim's session {shim_session} isn't in the bus")
+            session_id = shim_session
+            bus.touch_session(session_id)
+        else:
+            session_id = register(bus, harness, agent, role)
     svc = service.Service(bus, agent=agent, session_id=session_id, config=config)
     mcp = MCPServer(name="agent-bus", instructions=INSTRUCTIONS)
 
@@ -120,7 +108,7 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
     def flag_stale(res: dict[str, Any]) -> dict[str, Any]:
         """``res`` plus ``stale_build`` when this server is an older build than PATH's (#92), so
         an agent sees it during normal use, not only from whoami, and can tell the human."""
-        stale = None if peer_job else cfg.stale_build()
+        stale = None if peer_job else cfg.stale_build(auto_restart=session_id is not None and session_id == shim_session)
         return {**res, "stale_build": stale} if stale else res
 
     @mcp.tool()

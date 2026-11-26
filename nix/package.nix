@@ -19,6 +19,13 @@ python3Packages.buildPythonApplication {
   # when withJujutsu (plain-git users can build without it).
   makeWrapperArgs = [ "--suffix" "PATH" ":" (lib.makeBinPath ([ git ] ++ lib.optional withJujutsu jujutsu)) ];
 
+  # The PATH the caller gave, before the wrapper's own additions: the MCP restart shim starts
+  # each later build's server with it, so that build's wrapper adds its own (#139).
+  postFixup = ''
+    sed -i '1a export AGENT_BUS_CALLER_PATH="$PATH"' $out/bin/agent-bus
+    grep -q AGENT_BUS_CALLER_PATH $out/bin/agent-bus
+  '';
+
   # The agent-bus skill (the how-to agents read), installed with the build it describes so
   # the Home Manager module can ship it to each client (see nix/plugins.nix).
   postInstall = ''

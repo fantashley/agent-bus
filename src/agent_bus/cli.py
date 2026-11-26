@@ -709,6 +709,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.cmd == "mcp":
+        from . import mcp_shim
+        if mcp_shim.wanted():
+            return mcp_shim.main(args.agent, args.role, args.participant)
         from . import mcp_server
         mcp_server.main(args.agent, args.role, participant=args.participant)
         return 0

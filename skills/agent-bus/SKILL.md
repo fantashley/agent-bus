@@ -41,8 +41,11 @@ and every agent-bus tool refuses you with `PEER_READ_ONLY`.
   `request_review`, and from a new MCP server of the same client (a subagent's), which starts
   where the client's others read to. Don't pass `after_message_id` routinely: it replays
   everything after that id, for a reply that was lost. `history` shows the whole thread.
-- **`stale_build`** in a reply means this MCP server is older than the installed `agent-bus`:
-  tell the user to reload (Claude Code: `/reload-plugins`; other clients: restart).
+- **`stale_build`** in a reply means this MCP server is older than the installed `agent-bus`.
+  Follow its `hint`: usually the server moves onto the installed build by itself at your next
+  agent-bus call made while no other is running, so carry on; if it says to restart, or it's
+  still there after such a call, tell the user (Claude Code: `/reload-plugins`; other clients:
+  restart).
 
 ## Tools
 

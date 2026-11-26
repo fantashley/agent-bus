@@ -1079,38 +1079,69 @@ A client without skills can be pointed at that file from its global instructions
 
 ### Upgrading
 
-After `home-manager switch` (or `nixos-rebuild switch`), restart the MCP server in each open
-session:
+After `home-manager switch` (or `nixos-rebuild switch`), open sessions move onto the new build
+by themselves: no `/reload-plugins` or client restart (#139). `agent-bus mcp` is a small shim that
+holds the client's connection and runs the real MCP server as a child. When the client calls an
+agent-bus tool while no other agent-bus call of that session is running, and the `agent-bus` on
+PATH has become another build, the shim starts that build, replays the session's MCP handshake to
+it, and hands it the call; the old server is stopped only once the new one is up. Every call goes
+to exactly one server, none is dropped or repeated, and a call made while another runs (say, during
+a `wait`) goes to the old build, with the next idle one moving. Each server serves the same bus
+session, which the shim registers once, so read cursors, the threads you started and hooks' link
+to the session carry over, and the review workers start from the new build from then on. If the
+tool list changed, the client is sent `notifications/tools/list_changed`; the server's MCP
+instructions can't be refreshed that way, so a change to them waits for the next session. If the
+new build fails to start, the session stays on the old one (the reason is in the client's MCP log)
+and that build isn't tried again until the installed one changes (one that was only slow, over 4 s,
+is tried again after 5 minutes). Nor does a session move onto a build from before the shim, which
+would register a session of its own. A cancelled tool call other than `wait` keeps the session on its
+server until that call's reply comes (the server may still be running it, and sends none for a
+cancelled call), so after such a cancellation the session may need a manual restart. The same applies under Claude Code, Codex, Antigravity and
+Copilot CLI, for clients that open the connection with MCP's `initialize` handshake (a client on
+the newer handshake-free protocol stays on its build until restarted). The installed build is the
+`agent-bus` the client's MCP entry names in `AGENT_BUS_INSTALLED` (the Home Manager plugins set it
+to the profile's), else the one on PATH. Hooks need nothing: each one runs the profile's
+`agent-bus` afresh.
+
+The shim itself stays on the build it started with. It only forwards JSON-RPC lines, so that
+matters only for a change to the shim itself, which, like a session started before the shim
+existed (0.3.0 and earlier), needs one last manual restart:
 - **Claude Code:** run `/reload-plugins` (or start a new session). It restarts a plugin's MCP
   server only when the server's entry in `.mcp.json` has changed, so the plugin's entry carries
   `AGENT_BUS_BUILD` (the build's store path) and every build looks different. The old server is
   stopped, not left running. A subagent started before the reload keeps its own server on the
-  old build until it finishes. Hooks need nothing: each one runs the profile's `agent-bus`
-  afresh. When the reload would invalidate the session's prompt cache, it warns and skips:
-  run `/reload-plugins --force` to apply it anyway. A session without an interactive terminal
-  (`-p`, the Agent SDK, the desktop app) doesn't restart plugin MCP servers on a reload: the new
-  build applies at its next session.
+  old build until it finishes. When the reload would invalidate the session's prompt cache, it
+  warns and skips: run `/reload-plugins --force` to apply it anyway. A session without an
+  interactive terminal (`-p`, the Agent SDK, the desktop app) doesn't restart plugin MCP servers
+  on a reload: the new build applies at its next session.
 - **Codex and Antigravity:** restart the client.
+
+To turn the automatic move off, set `auto_restart_mcp` to `false` in `config.json` (Home Manager:
+`local.agentBus.settings.auto_restart_mcp = false`): `agent-bus mcp` then runs the server
+in-process, as before, and an upgrade needs the manual restart above. The setting is read when a
+server starts and again before each move. Headless peers' servers never use the shim.
 
 If you pasted the old "Agent Bus" section (`docs/AGENTS-section.md`) into your global agent
 instructions (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` and the like),
 delete it once you're on a build with the `agent-bus` skill: the MCP instructions and the skill
 replace it, and a stale copy would contradict them as the tools change.
 
-Until then the running server, and the review workers it starts, stay on the old build. When it
-differs from the `agent-bus` on PATH, `whoami`, `inbox`, `wait`, `request_review`,
-`start_discussion` and `advance_discussion` replies carry a `stale_build` with both paths, and
-agents are asked to tell you. To check by hand, compare the store paths of the running servers
-with the installed one:
+Until a session moves (or restarts), its server, and the review workers it starts, stay on the
+old build. When it differs from the `agent-bus` on PATH, `whoami`, `inbox`, `wait`,
+`request_review`, `start_discussion` and `advance_discussion` replies carry a `stale_build` with
+both paths, and agents are asked to tell you if it doesn't clear by itself. To check by hand,
+compare the store paths of the running servers with the installed one:
 
 ```sh
-pgrep -af 'agent-bus.* mcp'            # Linux: one line per server, with its /nix/store/...-agent-bus-*/bin path
+pgrep -af 'agent-bus.* mcp'            # Linux: one line per process, with its /nix/store/...-agent-bus-*/bin path
 pgrep -lf 'agent-bus.* mcp'            # macOS: the same (its -a means something else and prints no command lines)
 readlink -f "$(command -v agent-bus)"  # the installed build
 ```
 
-A server on another store path belongs to a session that hasn't reloaded yet. Closing a session
-stops its server.
+Each session has two processes: the shim (the build the session started with) and its child, the
+server, which should be on the installed build after the session's next agent-bus call. A server on
+another store path belongs to a session that hasn't made a call since the upgrade, or one with
+`auto_restart_mcp` off or from before the shim. Closing a session stops both.
 
 Claude Code records a marketplace's path when it first adds it and doesn't follow later changes
 to `settings.json`, which is why the plugin lives at a fixed path whose link each rebuild moves.
