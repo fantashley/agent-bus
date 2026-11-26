@@ -209,6 +209,7 @@ DEFAULTS = {
     "usage_warn_at": 0.8,
     "auto_resume_after_quota": True,
     "auto_resume_max": 3,
+    "auto_restart_mcp": True,
     "max_messages": 60,
     "max_diff_bytes": 200_000,
     "max_snapshot_bytes": 256 * 1024 * 1024,
@@ -256,6 +257,8 @@ class Config:
     # Resume a thread parked by a usage limit once it resets, at most this many times (#26).
     auto_resume_after_quota: bool = True
     auto_resume_max: int = 3
+    # Move a client's MCP server onto the installed build at its next idle tool call (#139).
+    auto_restart_mcp: bool = True
     max_messages: int = 60
     max_diff_bytes: int = 200_000
     # The most a review's read-only snapshot of its pinned head may hold (#111); over it, a
@@ -285,6 +288,8 @@ class Config:
             raise ValueError("usage_warn_at must be a fraction above 0 and at most 1, e.g. 0.8")
         if not isinstance(conf.auto_resume_after_quota, bool):
             raise ValueError("auto_resume_after_quota must be true or false")
+        if not isinstance(conf.auto_restart_mcp, bool):
+            raise ValueError("auto_restart_mcp must be true or false")
         if isinstance(conf.auto_resume_max, bool) or not isinstance(conf.auto_resume_max, int) \
                 or conf.auto_resume_max < 0:
             raise ValueError("auto_resume_max must be a whole number, 0 or more")
@@ -636,12 +641,56 @@ def _launched_from() -> str | None:
     return os.path.realpath(argv0) if os.access(argv0, os.X_OK) else None
 
 
+def _wrapped() -> bool:
+    """Whether this process runs Nix's wrapProgram'd script (bin/.agent-bus-wrapped).  The
+    wrapped script may set sys.argv[0] to the wrapper's own path, so the interpreter's
+    original argv is checked too (#139)."""
+    names = (sys.argv[:1] if sys.argv else []) + list(getattr(sys, "orig_argv", [])[:3])
+    return any(os.path.basename(n) == ".agent-bus-wrapped" for n in names)
+
+
+def own_wrapped_bin() -> str | None:
+    """This build's bin directory when it was started through a Nix wrapper, which put it
+    first on this process's PATH (and on its children's): an upgrade can't be seen past it."""
+    return os.path.dirname(_LAUNCHED_FROM) if _LAUNCHED_FROM and _wrapped() else None
+
+
+def wrapper_path_dirs() -> set[str]:
+    """The directories this build's Nix wrapper added to PATH (its own bin, its Python
+    dependencies' and git's/jj's), read from the wrapper script; just its own bin if that
+    can't be read, and nothing when not started through one.  A newer build's wrapper adds
+    its own, so a child of another build must not inherit these (#139)."""
+    own = own_wrapped_bin()
+    if not own:
+        return set()
+    dirs = {own}
+    try:
+        with open(os.path.join(own, "agent-bus"), errors="replace") as f:
+            text = f.read(1 << 20)
+    except OSError:
+        return dirs
+    for line in text.splitlines():
+        if "PATH" in line:
+            for value in re.findall(r"'(/nix/store/[^']+)'", line):  # makeBinPath joins several with ':'
+                dirs.update(os.path.realpath(d) for d in value.split(os.pathsep) if d)
+    return dirs
+
+
+def installed() -> str | None:
+    """The installed `agent-bus` now, resolved: ``AGENT_BUS_INSTALLED`` when the client's MCP
+    entry names a stable path for it (the Home Manager profile's bin/agent-bus, which the
+    client's PATH may lack), else the one on PATH."""
+    stable = os.environ.get("AGENT_BUS_INSTALLED")
+    if stable and os.path.isfile(stable) and os.access(stable, os.X_OK):
+        return os.path.realpath(stable)
+    return _on_path()
+
+
 def _on_path() -> str | None:
     """The `agent-bus` a new shell would run, resolved.  When started through a Nix wrapper,
     skips this build's own bin directory: the wrapper put it first on this process's PATH,
     which would hide an upgrade (#89).  Any other launch takes PATH as it is."""
-    wrapped = bool(sys.argv) and os.path.basename(sys.argv[0]) == ".agent-bus-wrapped"
-    own = os.path.dirname(_LAUNCHED_FROM) if _LAUNCHED_FROM and wrapped else None
+    own = own_wrapped_bin()
     for d in os.environ.get("PATH", "").split(os.pathsep):
         if not d or (own and os.path.realpath(d) == own):
             continue
@@ -670,20 +719,27 @@ def self_command() -> list[str]:
     return [sys.executable, "-m", "agent_bus"]
 
 
-def stale_build() -> dict | None:
+def stale_build(auto_restart: bool = False) -> dict | None:
     """When this process runs a different agent-bus install than the `agent-bus` on PATH.
 
     After an upgrade, a long-lived MCP server keeps running the build it started with (and
-    spawns its workers from that build) until its client restarts it.  Compares the path this
-    process started from, resolved at startup, with PATH's `agent-bus` resolved now; None when
-    they match or either can't be told (not started as an installed `agent-bus` script, or
-    none on PATH).
+    spawns its workers from that build) until its client restarts it, or, under the restart
+    shim (``auto_restart``, #139), until its next tool call made while no other is running.
+    Compares the path this process started from, resolved at startup, with PATH's
+    `agent-bus` resolved now; None when they match or either can't be told (not started as
+    an installed `agent-bus` script, or none on PATH).
     """
-    on_path = _on_path() if _LAUNCHED_FROM else None
+    on_path = installed() if _LAUNCHED_FROM else None
     if not on_path or _LAUNCHED_FROM == on_path:
         return None
-    return {"running": _LAUNCHED_FROM, "on_path": on_path,
-            "hint": "This agent-bus MCP server is a different build from the agent-bus on PATH "
-                    "(likely started before an upgrade), and the review workers it starts use it "
-                    "too. Tell the user to restart it: /reload-plugins in Claude Code, or restart "
-                    "the client."}
+    if auto_restart:
+        hint = ("This agent-bus MCP server is a different build from the agent-bus on PATH (likely "
+                "started before an upgrade). It moves onto the installed build by itself at a tool call "
+                "made while no other agent-bus call is running. If it stays stale, the new build failed "
+                "to start (see the client's MCP log): tell the user.")
+    else:
+        hint = ("This agent-bus MCP server is a different build from the agent-bus on PATH "
+                "(likely started before an upgrade), and the review workers it starts use it "
+                "too. Tell the user to restart it: /reload-plugins in Claude Code, or restart "
+                "the client.")
+    return {"running": _LAUNCHED_FROM, "on_path": on_path, "hint": hint}

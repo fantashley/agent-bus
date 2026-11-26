@@ -30,9 +30,13 @@ let
     fi
   '';
 
+  # AGENT_BUS_INSTALLED names the profile's agent-bus, whose link each rebuild moves: the
+  # MCP server's restart shim compares its build with that one, even when the client's PATH
+  # lacks the profile (#139).
   mcpEntry = agent: {
     command = bin;
     args = [ "mcp" "--agent" agent ];
+    env.AGENT_BUS_INSTALLED = profileBin;
   };
 
   # Fixed-hint hooks (v1.5): a constant "you have agent-bus mail" line at prompt submit,
@@ -92,7 +96,7 @@ in
     cp ${json.generate "mcp.json" {
       mcpServers.agent-bus = mcpEntry "claude" // {
         command = profileBin;
-        env.AGENT_BUS_BUILD = "${package}";
+        env = { AGENT_BUS_INSTALLED = profileBin; AGENT_BUS_BUILD = "${package}"; };
       };
     }} \
       $out/plugins/agent-bus/.mcp.json

@@ -57,12 +57,15 @@
             check $c/.claude-plugin/marketplace.json
             check $c/plugins/agent-bus/.claude-plugin/plugin.json
             check $c/plugins/agent-bus/.mcp.json
+            grep -q '"AGENT_BUS_INSTALLED": *"/profile/bin/agent-bus"' $c/plugins/agent-bus/.mcp.json
+            grep -q '"AGENT_BUS_BUILD"' $c/plugins/agent-bus/.mcp.json
             check $c/plugins/agent-bus/hooks/hooks.json
             skill $c/plugins/agent-bus/skills/agent-bus
             prskill $c/plugins/agent-bus/skills/agent-bus-pr-review
             a=${built.antigravityPlugin}
             check $a/plugin.json
             check $a/mcp_config.json
+            grep -q '"AGENT_BUS_INSTALLED": *"/profile/bin/agent-bus"' $a/mcp_config.json
             check $a/hooks.json
             skill $a/skills/agent-bus
             prskill $a/skills/agent-bus-pr-review
