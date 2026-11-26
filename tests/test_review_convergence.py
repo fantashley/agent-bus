@@ -127,6 +127,8 @@ def test_follow_up_budget_warns_then_waits_for_the_human(env, no_spawn):
     run_job(bus, tid)  # codex, past the budget, still asks for changes: the human decides
     codex2 = calls(env)[-1]
     assert codex2["agent"] == "codex" and "This review has run long" in codex2["prompt"]
+    # Only nice-to-haves wait: a real bug keeps its severity (#164).
+    assert "a real bug is medium or high) still blocks" in codex2["prompt"]
     assert "settle the findings listed at the top" in codex2["prompt"]
     t = bus.thread(tid)
     assert t["status"] == "needs_human" and thread_summary(t)["waiting_for_human"]

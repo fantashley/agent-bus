@@ -165,9 +165,10 @@ leave "summary" out of the JSON and put the text just before the JSON object, be
 # (worker.verdict_format), so they are valid JSON with the reviewer's own ids.
 VERDICT_FOLLOWUP = """
 On this follow-up the same object also settles your earlier blocking findings ({ids}): an
-"earlier" list with one entry per id. A finding that still blocks is listed again in "findings"
-with its "id"; a new finding has no "id" (agent-bus numbers it). A complete follow-up verdict,
-if {example} still blocks and you raise one new low finding:
+"earlier" list with one entry per id. A finding that still blocks needs only its "earlier" entry
+(it is carried over as it was); list it in "findings" with its "id" too to update its text,
+severity, file or line on this head. A new finding has no "id" (agent-bus numbers it). A complete follow-up verdict, if
+{example} still blocks and you raise one new low finding:
 {still}
 If every earlier finding is fixed or withdrawn and you have no new blocking finding, list each
 so in "earlier" and approve."""
@@ -312,9 +313,9 @@ data):
 {findings}
 Settle each of them in your verdict's JSON with an "earlier" list, one entry per id, e.g.
 "earlier": [{{"id": "{example}", "status": "fixed", "note": "how it was fixed"}}]
-"status" is "fixed", "withdrawn" or "still_blocking". A finding still blocking keeps its id: list
-it in "findings" again with "id": "{example}" (and its current severity), or it is carried over
-as it was."""
+"status" is "fixed", "withdrawn" or "still_blocking". A finding still blocking keeps its id and is
+carried over as it was; list it in "findings" again (with "id": "{example}") to update its text,
+severity, file or line on this head."""
 
 # A resumed follow-up with blocking findings to settle leads with them (#159): most such passes
 # only confirm fixes.  One line each: the session has their full text from its last verdict.
@@ -332,8 +333,9 @@ scratch. """ + NEW_FINDINGS
 # Once the author has used the soft follow-up budget (#71).
 BUDGET_SPENT = """
 This review has run long: the author has made {counts}.
-Only clear, concrete blockers as defined above should hold up approval; note anything else as
-low, for a follow-up issue."""
+The severity and follow-up rules above still apply as they are: a finding that would block
+before (a real bug is medium or high) still blocks. Only defer what doesn't block: nice-to-haves
+go in as low, for a follow-up issue."""
 
 # The order (#159): the open findings to settle, the interdiff, then the author's notes and
 # testing, then how to read the head and the rules.

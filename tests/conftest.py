@@ -16,6 +16,17 @@ FAKE = Path(__file__).resolve().parent / "fake_peer.py"
 
 
 @pytest.fixture(autouse=True)
+def no_real_state(tmp_path_factory, monkeypatch):
+    """Never the real state and config dirs, even in a test without ``env``: a worker's
+    sweep there removed a running review's snapshot (#164)."""
+    home = tmp_path_factory.mktemp("xdg")
+    monkeypatch.setenv("XDG_STATE_HOME", str(home / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
+    monkeypatch.delenv("AGENT_BUS_DB", raising=False)
+    monkeypatch.delenv("AGENT_BUS_CONFIG", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def not_in_agent_shell(monkeypatch):
     """Tests run the human's CLI commands, often from inside an agent's shell: hide the
     harness markers the CLI's guard looks for (#84).  Guard tests put them back."""

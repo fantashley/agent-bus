@@ -142,7 +142,10 @@ prev_head_commit_id?, focus?, evidence?, testing?, thread?, model?, effort?, pee
 - **`testing`**: a short note on how you tested this head (commands and results). Reviewers
   can't run tests, so they see it as your unchecked claim.
 - **Several required reviewers:** `reviewers=["codex", "antigravity"]` instead of `reviewer`.
-  They review one at a time on one thread; an approval hands the head to the next. The change is
+  They review one at a time on one thread; an approval hands the head to the next. The list's
+  order sets only who goes first: a follow-up starts with the reviewer after the one that asked
+  for changes (review-only: after the last reviewer that ran), going round the list (with two,
+  the other one sees the fix first), and a pushback goes to the one that asked. The change is
   ready once every one of them has approved the **same** base..head: any new head (or base) makes
   earlier approvals stale. The result's `review` object lists `approved`, `changes_requested`
   and `pending`.
@@ -185,8 +188,9 @@ blocking), and the verdict shows how.
 **Follow-up budget.** Each new head, new base or pushback is a follow-up. The soft budget
 (`review_followup_budget`, default 3) counts only those where a reviewer's re-review raised a
 new blocking finding; follow-ups that only confirm fixes are free. Once it's spent (or one
-follow-up before the hard limit), reviewers are told the review has run long: defer
-non-blocking work to a follow-up issue. A review still asking for changes after twice the
+follow-up before the hard limit), reviewers are told the review has run long: severity rules
+don't change (a real bug still blocks), but nice-to-haves go in as low; defer non-blocking work
+to a follow-up issue. A review still asking for changes after twice the
 budget in follow-ups of any kind goes to `needs_human` (`REVIEW_LIMIT_REACHED`): stop and tell
 the user.
 A review-only review (below) keeps the warning but never parks: it has no follow-up limit.

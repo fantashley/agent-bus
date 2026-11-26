@@ -287,9 +287,9 @@ def test_snapshot_delta_falls_back_to_the_whole_list(env, monkeypatch):
     assert snapshot.delta(str(repo), h1, snap, True) == ([], [])
     assert snapshot.delta(str(repo), h1, snap, False) is None  # no baseline in the session (codex-2)
     assert snapshot.delta(str(repo), "0" * 40, snap, True) is None  # git can't diff it
-    monkeypatch.setattr(snapshot, "MAX_LISTING", 3)
-    assert snapshot.delta(str(repo), h1, snap, True) is None  # the old list was cut, not shown whole
-    monkeypatch.undo()
+    with monkeypatch.context() as m:  # not monkeypatch.undo(): that would undo env's state dir too (#164)
+        m.setattr(snapshot, "MAX_LISTING", 3)
+        assert snapshot.delta(str(repo), h1, snap, True) is None  # the old list was cut, not shown whole
     # A type change (a file that became a symlink): in or out of the copy can't be told.
     (repo / "a.txt").unlink()
     os.symlink("/etc/hostname", repo / "a.txt")
@@ -537,3 +537,70 @@ def test_a_sparse_snapshot_over_the_file_cap_is_reused(env, monkeypatch):
     assert snapshot.ensure(str(repo), "t-abc", base, head, 10**9).mode == "sparse"
     monkeypatch.setattr(snapshot, "_write", lambda *a: pytest.fail("rebuilt a reusable sparse snapshot"))
     assert snapshot.ensure(str(repo), "t-abc", base, head, 10**9).mode == "sparse"
+
+
+class _NoThreads:
+    """A bus that knows none of this bus's threads, like a worker or a test run on another
+    database whose sweep reaches this one's snapshots (#164)."""
+
+    def thread(self, tid):
+        from agent_bus.db import BusError
+        raise BusError("NO_SUCH_THREAD", tid)
+
+    def active_job(self, tid):
+        return None
+
+
+def test_a_snapshot_is_never_swept_while_a_turn_reads_it(env, no_spawn, monkeypatch):
+    """#164: a sweep that took the thread for finished removed the snapshot a running pass
+    was reading.  While a job's turns use it, it stays; once the job ends it goes."""
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    head = commit("one\n")
+    tid = Service(bus, HUMAN).request_review("codex", str(repo), base, head)["thread"]["id"]
+    path = snapshot.root() / tid / head
+    during = []
+    real = Worker.turn
+
+    def turn(self, *a, **kw):
+        snapshot.sweep(_NoThreads())  # another worker's sweep, mid-pass
+        during.append(path.is_dir())
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Worker, "turn", turn)
+    monkeypatch.setenv("FAKE_APPROVE", "codex")
+    Worker(bus, bus.jobs(tid)[-1]["id"]).run()
+    assert during == [True]
+    assert bus.thread(tid)["status"] == "resolved" and not (snapshot.root() / tid).exists()
+
+
+def test_a_hold_waits_for_a_removal_only_so_long(env, monkeypatch):
+    """codex-1 (#164): a hold waits for a sweep's removal with a bound, and stops on cancel;
+    with snapshots off a review takes no hold at all."""
+    import fcntl
+    fd = snapshot._use_lock("t-abc")
+    fcntl.flock(fd, fcntl.LOCK_EX)  # a sweep removing it, stuck
+    try:
+        t0 = time.monotonic()
+        assert snapshot.hold("t-abc", wait=0.3) is None and time.monotonic() - t0 < 5
+        assert snapshot.hold("t-abc", wait=60, cancelled=lambda: True) is None
+    finally:
+        os.close(fd)
+    held = snapshot.hold("t-abc", wait=0)
+    assert held is not None
+    snapshot.release(held)
+    calls_ = []
+    monkeypatch.setattr(snapshot, "hold", lambda *a, **kw: calls_.append(a))
+    w = Worker.__new__(Worker)
+    w._snap_hold, w.config = None, cfg.Config(max_snapshot_bytes=0)
+    w.event = lambda *a, **kw: None
+    w.cancelled = lambda: False
+    snap = w.pin_snapshot({"id": "t-abc"}, {"repo": str(env["repo"]), "base_commit_id": "a" * 40,
+                                            "head_commit_id": "b" * 40})
+    assert calls_ == [] and snap.path is None and snap.mode == "over_cap"
+    # A hold not taken: no snapshot, rather than one a sweep may remove under the turn.
+    monkeypatch.setattr(snapshot, "hold", lambda *a, **kw: None)
+    w.config = cfg.Config(max_snapshot_bytes=10**9)
+    snap = w.pin_snapshot({"id": "t-abc"}, {"repo": str(env["repo"]), "base_commit_id": "a" * 40,
+                                            "head_commit_id": "b" * 40})
+    assert snap.path is None and "still removing it" in snap.reason

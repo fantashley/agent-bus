@@ -103,10 +103,18 @@ def test_findings_get_stable_ids_and_follow_ups_settle_them(env, no_spawn, monke
     examples = [json.loads(line) for line in p.splitlines() if line.startswith('{"verdict"')]
     (still,) = [e for e in examples if e.get("earlier")]
     assert still["verdict"] == "request_changes" and [e["id"] for e in still["earlier"]] == ["codex-1", "codex-2"]
-    assert still["findings"][0]["id"] == "codex-1" and "id" not in still["findings"][1]
-    prior = {"codex-1": {"severity": "high"}, "codex-2": {"severity": "medium"}}
+    # A still-blocking finding is only in "earlier" (#164): carried, not repeated in "findings".
+    assert [f.get("id") for f in still["findings"]] == [None] and still["findings"][0]["severity"] == "low"
+    prior = {"codex-1": {"severity": "high", "file": "a.txt", "comment": "typo"}, "codex-2": {"severity": "medium"}}
     v = settle_earlier(normalize_verdict(still), prior)
     assert verdict_problem(v) is None and settlement_problem(v, prior) is None
+    assert [(f["id"], f["severity"], f.get("carried")) for f in v["findings"]] == [
+        (None, "low", None), ("codex-1", "high", True)]
+    # The old shape, listed in both, still reads: once, at the severity it gives.
+    both = {**still, "findings": [{"id": "codex-1", "file": "a.txt", "severity": "medium", "comment": "still"}]}
+    v = settle_earlier(normalize_verdict(both), prior)
+    assert verdict_problem(v) is None and settlement_problem(v, prior) is None
+    assert [(f["id"], f["severity"], f.get("carried")) for f in v["findings"]] == [("codex-1", "medium", None)]
     v2 = bus.last_verdict(tid, "codex")
     assert [(f["id"], f["file"]) for f in v2["data"]["findings"]] == [("codex-3", "c.txt"), ("codex-2", "b.txt")]
     assert [e["id"] for e in v2["data"]["earlier"]] == ["codex-1", "codex-2"]  # not other-9

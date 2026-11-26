@@ -206,7 +206,12 @@ same things in parallel:
   next reviewer without a valid approval; a request for changes stops and waits for you.
 - Fix the findings, `send` a note on the thread saying how, then call `request_review` again
   with the same reviewers, the new head and `prev_head_commit_id` = the thread's current head.
-  The next round goes to the reviewer after the one that asked for changes (round robin). A
+  The list's order only sets who goes first. A follow-up's first pass goes to the reviewer after
+  the one whose verdict ended the last round (the one that asked for changes), going round the
+  list; an approval then hands the head on the same way. So with two reviewers, the one that
+  didn't ask for changes sees the fix first, then the one that did. A pushback (the same head
+  again) goes to the reviewer that asked for changes. (A review-only review starts the next head
+  after the last reviewer that ran, which may have approved.) A
   reviewer new to the change gets the full diff plus the earlier verdicts (each naming the head
   it was given on) and your notes; one that reviewed before resumes its own conversation with
   the interdiff since the head it last saw and everything posted since.
@@ -222,7 +227,8 @@ same things in parallel:
   an added directory (`--add-dir`); Codex reads it in its read-only sandbox. Antigravity, which
   can't list directories or search, also gets the snapshot's file list (capped). A pass's
   later turns on the same head reuse the snapshot; it is removed once no job is running on the
-  thread (the next pass makes it again), and each worker sweeps stale ones when it starts.
+  thread (the next pass makes it again), and each worker sweeps stale ones when it starts. A
+  running job holds its snapshot (a lock), so no sweep removes it while a turn reads it.
   Over `max_snapshot_bytes` (256 MiB, or
   50,000 files) the snapshot holds only the changed files and the other files in their
   directories, and the prompt says so; over that too, or with `max_snapshot_bytes` set to 0,
@@ -276,7 +282,8 @@ handoffs, retries and repeats are free). The soft budget, `review_followup_budge
 (default 3), counts only the follow-ups that drew a new blocking finding from a reviewer's
 re-review (#140): one whose passes only confirm fixes, or find an earlier finding still blocking,
 is free, and so is a reviewer's first look at a later head. Once the budget is spent, or one
-follow-up before the hard limit below, reviewers are told the review has run long and your
+follow-up before the hard limit below, reviewers are told the review has run long (the severity
+and follow-up rules don't change, so a real bug still blocks; only nice-to-haves are deferred) and your
 changes-requested notices suggest deferring non-blocking findings to a follow-up issue. A review
 that still asks for changes after twice the budget in follow-ups of any kind goes to `needs_human` and refuses follow-ups
 with `REVIEW_LIMIT_REACHED` (review-only reviews excepted, above) until the human runs
