@@ -166,8 +166,11 @@ def test_reply_records_provenance_with_its_message(env, capsys):
     assert cli.main(["history", tid]) == 0
     out = capsys.readouterr().out
     assert "from: zsh[4120] < terminal[4100]" in out and "tty: /dev/pts/0" in out and "!!" not in out
-    j = history_json(capsys, tid)["messages"][-1]["provenance"]
+    msg = history_json(capsys, tid)["messages"][-1]
+    j = msg["provenance"]
     assert j["recorded"] and not j["flagged"] and j["record"]["tty"] == "/dev/pts/0"
+    # #161: the exact time too, not only "at" (local time, to the second).
+    assert msg["created_at"] == m["created_at"] and isinstance(msg["created_at"], float)
 
 
 def test_ask_records_its_opening_question(env, capsys, no_spawn):
@@ -263,6 +266,7 @@ def test_cancel_and_resume_are_recorded_as_actions(env, capsys, no_spawn):
     j = history_json(capsys, tid)
     assert [a["command"] for a in j["human_actions"]] == ["resume", "cancel"]
     assert not j["human_actions"][0]["provenance"]["flagged"]
+    assert [a["created_at"] for a in j["human_actions"]] == [a["created_at"] for a in acts]
 
 
 def test_service_calls_without_the_cli_record_no_action(env):

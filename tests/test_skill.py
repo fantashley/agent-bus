@@ -5,6 +5,9 @@ import asyncio
 import re
 from pathlib import Path
 
+import pytest
+import yaml
+
 from agent_bus import mcp_server, unvotable
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,9 +22,13 @@ def skill_text() -> str:
 
 
 def frontmatter(text: str) -> dict[str, str]:
+    """The frontmatter as a real YAML parser reads it (#161): a hand-rolled split passed
+    invalid YAML."""
     assert text.startswith("---\n"), "SKILL.md must start with YAML frontmatter"
     block = text[4:text.index("\n---\n", 4)]
-    return dict(line.split(": ", 1) for line in block.splitlines())
+    meta = yaml.safe_load(block)
+    assert isinstance(meta, dict) and all(isinstance(v, str) for v in meta.values()), meta
+    return meta
 
 
 def test_frontmatter_names_the_skill_and_says_when_to_load_it():
@@ -35,10 +42,16 @@ def test_frontmatter_names_the_skill_and_says_when_to_load_it():
     # Codex shows descriptions with its higher-priority instructions, so the description itself
     # keeps headless peers out (#156).
     assert "Not for a headless agent-bus peer" in desc
-    # An unquoted YAML value: ": " or " #" in it would make the frontmatter invalid YAML.
-    for line in skill_text().split("\n---\n", 1)[0].splitlines()[1:]:
-        value = line.split(": ", 1)[1]
-        assert ": " not in value and " #" not in value and not value.startswith(("'", '"')), line
+    # Some clients read the frontmatter line by line, not as YAML: one plain "key: value"
+    # line per key, its value exactly what YAML parses.
+    lines = skill_text().split("\n---\n", 1)[0].splitlines()[1:]
+    assert dict(line.split(": ", 1) for line in lines) == meta
+
+
+def test_frontmatter_check_rejects_invalid_yaml():
+    for bad in ("---\nname: x\ndescription: a: b\n---\n", "---\nname: [x\n---\n"):
+        with pytest.raises(yaml.YAMLError):
+            frontmatter(bad)
 
 
 def test_skill_mentions_every_mcp_tool(env):

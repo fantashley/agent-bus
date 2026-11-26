@@ -17,6 +17,11 @@ removed once no job runs on the thread (``sweep``, which every worker also runs 
 starts, so a crashed worker's snapshots don't stay).  A worker holds its thread's snapshot
 (``hold``) from its first turn on it until its job ends, and a sweep never removes a held one,
 whatever it makes of the thread (#164): the hold is a lock, so it goes with a crashed worker.
+A new head's build, or a rebuild of the same head, never removes a copy another worker's turn
+still reads either: each worker also holds the head it reads (``<head>.hold``, taken under the
+thread's lock), and a held copy stays until the next build or sweep after its job ends (#166).
+(A worker from a build before #164/#166 doesn't know these locks: during an upgrade it can
+still remove a copy in use, once.)
 A tree over the size cap gets a sparse snapshot: the changed files and the other files in
 their directories; if even that is over, no snapshot, and the prompt says files on disk may
 not match the head.
@@ -64,6 +69,8 @@ class Snapshot:
     tree_files: int = 0  # files in the head's whole tree
     skipped: int = 0  # symlinks out of the tree and submodules, left out
     reason: str = ""
+    # This caller's shared lock on the head's copy (#166), to ``release`` when its job ends.
+    hold: int | None = field(default=None, repr=False, compare=False)
 
 
 def root() -> Path:
@@ -178,7 +185,9 @@ def ensure(repo: str, thread_id: str, base: str, head: str, max_bytes: int,
            cancelled: Callable[[], bool] | None = None) -> Snapshot:
     """The snapshot of ``head`` for ``thread_id``, made now or reused.  Never raises for a
     repository problem: a Snapshot without a path says why there is none.  ``cancelled``
-    stops a wait for another worker's lock early."""
+    stops a wait for another worker's lock early.  One with a path comes with ``hold``, the
+    caller's shared lock on that head's copy (#166): the caller owns it and ``release``s it
+    when its job ends; until then no other build removes or rebuilds the copy."""
     snap = Snapshot(head=head)
     if not (_ID.fullmatch(head) and _ID.fullmatch(thread_id) and _ID.fullmatch(base)):
         snap.reason = "the base, head or thread id can't name a directory"
@@ -194,9 +203,26 @@ def ensure(repo: str, thread_id: str, base: str, head: str, max_bytes: int,
         return _ensure(repo, thread_id, base, head, max_bytes, snap)
 
 
+def _head_hold(tdir: Path, head: str, op: int) -> int | None:
+    """``head``'s hold lock in ``tdir``, taken with ``op`` (LOCK_SH or LOCK_EX), or None if
+    another worker's turn holds it.  Only ever taken, and the file only removed, under the
+    thread's lock, so a removed hold file is never one somebody is about to lock."""
+    try:
+        fd = os.open(tdir / f"{head}.hold", os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, op | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def _ensure(repo: str, thread_id: str, base: str, head: str, max_bytes: int, snap: Snapshot) -> Snapshot:
     tdir = root() / thread_id
     final, meta = tdir / head, tdir / f"{head}.json"
+    tdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     if final.is_dir() and meta.is_file():
         try:
             data = json.loads(meta.read_text())
@@ -206,14 +232,49 @@ def _ensure(repo: str, thread_id: str, base: str, head: str, max_bytes: int, sna
             if (data["base"] == base and data["bytes"] <= max_bytes
                     and (data["mode"] == "full" or data["tree_bytes"] > max_bytes
                          or data["tree_files"] > MAX_FILES)):
-                return Snapshot(head=head, path=str(final), mode=data["mode"], files=data["files"],
-                                changed=data["changed"], tree_files=data["tree_files"], skipped=data["skipped"])
+                reused = Snapshot(head=head, path=str(final), mode=data["mode"], files=data["files"],
+                                  changed=data["changed"], tree_files=data["tree_files"], skipped=data["skipped"])
+                # Shared: only a rebuild takes it exclusively, under the lock this caller holds.
+                reused.hold = _head_hold(tdir, head, fcntl.LOCK_SH)
+                if reused.hold is not None:
+                    return reused
         except (OSError, ValueError, KeyError, TypeError):
             pass  # rebuilt below
-    tdir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # One head per thread: an earlier head's snapshot, or a crashed build's leftovers, go.
+    # A rebuild of this head replaces it in place: not while another worker's turn reads it.
+    mine = _head_hold(tdir, head, fcntl.LOCK_EX)
+    if mine is None:
+        snap.reason = "another worker's turn is still reading an earlier snapshot of this head"
+        return snap
+    try:
+        built = _build(repo, tdir, base, head, max_bytes, snap)
+        if built.path:
+            fcntl.flock(mine, fcntl.LOCK_SH)  # nobody else can take it: we hold the thread's lock
+            built.hold, mine = mine, None
+        return built
+    finally:
+        if mine is not None:
+            os.close(mine)
+
+
+def _build(repo: str, tdir: Path, base: str, head: str, max_bytes: int, snap: Snapshot) -> Snapshot:
+    final, meta = tdir / head, tdir / f"{head}.json"
+    remove(final)
+    meta.unlink(missing_ok=True)
+    # One head per thread: an earlier head's copy goes, unless a turn of another worker (one
+    # that lost its lease, say) still reads it (#166); a crashed build's leftovers go too.
+    for name in {p.name.split(".")[0] for p in tdir.iterdir() if not p.name.startswith(".")} - {head}:
+        fd = _head_hold(tdir, name, fcntl.LOCK_EX)
+        if fd is None:
+            continue
+        try:
+            remove(tdir / name)
+            (tdir / f"{name}.json").unlink(missing_ok=True)
+            (tdir / f"{name}.hold").unlink(missing_ok=True)
+        finally:
+            os.close(fd)
     for p in tdir.iterdir():
-        remove(p)
+        if p.name.startswith(".tmp-"):
+            remove(p)
     env = _git_env(repo)
     entries = _tree(repo, env, head) if env is not None else None
     if entries is None:
@@ -376,18 +437,21 @@ def hold(thread_id: str, wait: float | None = None, cancelled: Callable[[], bool
     except OSError:
         return None
     deadline = time.monotonic() + (LOCK_WAIT_S if wait is None else wait)
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            return fd
-        except BlockingIOError:
-            if time.monotonic() >= deadline or (cancelled is not None and cancelled()):
-                os.close(fd)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                fd, held = None, fd
+                return held
+            except BlockingIOError:
+                if time.monotonic() >= deadline or (cancelled is not None and cancelled()):
+                    return None
+                time.sleep(0.2)
+            except OSError:
                 return None
-            time.sleep(0.2)
-        except OSError:
+    finally:
+        if fd is not None:  # not taken, or cancelled() raised: never left open
             os.close(fd)
-            return None
 
 
 def release(fd: int | None) -> None:

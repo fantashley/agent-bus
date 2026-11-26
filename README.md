@@ -228,7 +228,8 @@ same things in parallel:
   can't list directories or search, also gets the snapshot's file list (capped). A pass's
   later turns on the same head reuse the snapshot; it is removed once no job is running on the
   thread (the next pass makes it again), and each worker sweeps stale ones when it starts. A
-  running job holds its snapshot (a lock), so no sweep removes it while a turn reads it.
+  running job holds its snapshot (a lock), so no sweep removes it while a turn reads it, and no
+  other worker's build of a newer head (or a rebuild of the same one) replaces it meanwhile.
   Over `max_snapshot_bytes` (256 MiB, or
   50,000 files) the snapshot holds only the changed files and the other files in their
   directories, and the prompt says so; over that too, or with `max_snapshot_bytes` set to 0,
@@ -820,7 +821,8 @@ cut at 120 characters). Each argument is judged on its own, in this order:
 - the record is unreadable, or one message has several.
 
 `history --json` has each human message's `provenance` (`recorded`, `flagged`, `flags`,
-`details`, `record`) and a `human_actions` list. `agents` shows the latest `--clear-quota` of
+`details`, `record`) and a `human_actions` list. Its messages and human actions carry `at`
+(local time) and `created_at` (Unix seconds). `agents` shows the latest `--clear-quota` of
 each agent this past week, flagged the same way. Agents never get the record itself. On a
 flagged human message they get one short note in their prompt, or a `provenance` field from the
 MCP tools: the flag codes, with no pids or paths, saying it may not be from you. A discussion you

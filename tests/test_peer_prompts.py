@@ -137,6 +137,9 @@ def test_a_bare_refusal_is_named_as_one(env, no_spawn, monkeypatch):
     ("Unfortunately, I can't help with that request.", True),
     ("I'm sorry. I can't help with that.", True),
     ("I can't help you with the benchmark. The restore path still clears the queue.", False),  # a finding
+    # #161 (codex-4): "I can" starts a finding here, not a closer offering help.
+    ("I can't help you with the benchmark. I can confirm that the restore path still clears the queue.", False),
+    ("I can't help with that. I can help with something else.", True),
 ])
 def test_only_a_standalone_refusal_counts(text, refusal):
     # #156 (codex-2): a substring match counted prose and quotes as refusals.

@@ -23,6 +23,15 @@ def sh(repo, *argv):
     return subprocess.run(argv, cwd=repo, check=True, capture_output=True, text=True, env=genv).stdout.strip()
 
 
+def ensure(*a, **kw):
+    """snapshot.ensure, with the head's hold (#166) let go at once, as a job that ended:
+    these tests build heads one after another, as the workers of consecutive jobs do."""
+    snap = snapshot.ensure(*a, **kw)
+    snapshot.release(snap.hold)
+    snap.hold = None
+    return snap
+
+
 def calls(env):
     return [json.loads(line) for line in env["log"].read_text().splitlines()] if env["log"].exists() else []
 
@@ -56,7 +65,7 @@ def layout(repo):
 def test_snapshot_is_exactly_the_head_and_read_only(env):
     repo = env["repo"]
     base, head = layout(repo)
-    snap = snapshot.ensure(str(repo), "t-abc", base, head, 10**9)
+    snap = ensure(str(repo), "t-abc", base, head, 10**9)
     root = snapshot.root() / "t-abc" / head
     assert snap.mode == "full" and snap.path == str(root)
     assert (root / "src" / "app.py").read_text() == "print('head')\n"
@@ -81,15 +90,15 @@ def test_snapshot_is_reused_then_replaced_for_a_new_head(env, monkeypatch):
     repo = env["repo"]
     base, commit = git_repo(repo)
     h1 = commit("one\n")
-    first = snapshot.ensure(str(repo), "t-abc", base, h1, 10**9)
+    first = ensure(str(repo), "t-abc", base, h1, 10**9)
     with monkeypatch.context() as m:
         m.setattr(snapshot, "_write", lambda *a: pytest.fail("rebuilt a reused snapshot"))
-        again = snapshot.ensure(str(repo), "t-abc", base, h1, 10**9)
+        again = ensure(str(repo), "t-abc", base, h1, 10**9)
     assert again.path == first.path and again.files == first.files and again.mode == "full"
     h2 = commit("two\n")
-    second = snapshot.ensure(str(repo), "t-abc", base, h2, 10**9)
+    second = ensure(str(repo), "t-abc", base, h2, 10**9)
     assert (snapshot.root() / "t-abc" / h2 / "a.txt").read_text() == "two\n"
-    assert sorted(p.name for p in (snapshot.root() / "t-abc").iterdir()) == sorted([h2, f"{h2}.json"])
+    assert sorted(p.name for p in (snapshot.root() / "t-abc").iterdir()) == sorted([h2, f"{h2}.json", f"{h2}.hold"])
     assert not os.path.exists(first.path) and second.path != first.path
 
 
@@ -101,7 +110,7 @@ def test_snapshot_rebuilds_after_a_crash(env):
     (tdir / ".tmp-leftover" / "sub").mkdir(parents=True)
     (tdir / ".tmp-leftover").chmod(0o555)
     (tdir / head).mkdir()  # a snapshot directory without its record: not trusted
-    snap = snapshot.ensure(str(repo), "t-abc", base, head, 10**9)
+    snap = ensure(str(repo), "t-abc", base, head, 10**9)
     assert snap.mode == "full" and (tdir / head / "a.txt").read_text() == "one\n"
     assert not (tdir / ".tmp-leftover").exists()
 
@@ -121,14 +130,14 @@ def test_over_the_cap_a_sparse_snapshot_then_none(env):
     sh(repo, "git", "add", "-A")
     sh(repo, "git", "commit", "-qm", "change")
     head = sh(repo, "git", "rev-parse", "HEAD")
-    snap = snapshot.ensure(str(repo), "t-abc", mid, head, 1000)
+    snap = ensure(str(repo), "t-abc", mid, head, 1000)
     assert snap.mode == "sparse" and snap.files == ["src/a.py", "src/b.py"] and snap.tree_files == 4
     assert not (snapshot.root() / "t-abc" / head / "big").exists()
     note = prompts.SNAPSHOT_SPARSE.format(n=2, total=4)
     assert "2 of the head's 4 files" in note
-    snap = snapshot.ensure(str(repo), "t-def", mid, head, 5)
+    snap = ensure(str(repo), "t-def", mid, head, 5)
     assert snap.path is None and snap.mode == "over_cap" and "size cap" in snap.reason
-    snap = snapshot.ensure(str(repo), "t-ghi", mid, head, 0)
+    snap = ensure(str(repo), "t-ghi", mid, head, 0)
     assert snap.path is None and "turned off" in snap.reason
     assert not (snapshot.root() / "t-ghi").exists()
 
@@ -137,13 +146,13 @@ def test_bad_ids_and_unreadable_repos_give_no_snapshot(env, tmp_path):
     repo = env["repo"]
     base, commit = git_repo(repo)
     head = commit("one\n")
-    assert snapshot.ensure(str(repo), "../x", base, head, 10**9).path is None
-    assert snapshot.ensure(str(repo), "t-abc", base, "../" + head, 10**9).path is None
-    snap = snapshot.ensure(str(repo), "t-abc", base, "f" * 40, 10**9)
+    assert ensure(str(repo), "../x", base, head, 10**9).path is None
+    assert ensure(str(repo), "t-abc", base, "../" + head, 10**9).path is None
+    snap = ensure(str(repo), "t-abc", base, "f" * 40, 10**9)
     assert snap.path is None and snap.mode == "failed" and "could not read" in snap.reason
     plain = tmp_path / "plain"
     plain.mkdir()
-    assert snapshot.ensure(str(plain), "t-abc", base, head, 10**9).path is None
+    assert ensure(str(plain), "t-abc", base, head, 10**9).path is None
 
 
 def test_listing_is_capped_and_keeps_the_changed_directories(env):
@@ -282,7 +291,7 @@ def test_snapshot_delta_falls_back_to_the_whole_list(env, monkeypatch):
     repo = env["repo"]
     base, commit = git_repo(repo)
     h1, h2 = commit("one\n"), commit("two\n")
-    snap = snapshot.ensure(str(repo), "t-delta", base, h2, 10**9)
+    snap = ensure(str(repo), "t-delta", base, h2, 10**9)
     assert snapshot.complete(snap)
     assert snapshot.delta(str(repo), h1, snap, True) == ([], [])
     assert snapshot.delta(str(repo), h1, snap, False) is None  # no baseline in the session (codex-2)
@@ -296,7 +305,7 @@ def test_snapshot_delta_falls_back_to_the_whole_list(env, monkeypatch):
     sh(repo, "git", "add", "-A")
     sh(repo, "git", "commit", "-qm", "link")
     h3 = sh(repo, "git", "rev-parse", "HEAD")
-    snap3 = snapshot.ensure(str(repo), "t-delta", base, h3, 10**9)
+    snap3 = ensure(str(repo), "t-delta", base, h3, 10**9)
     assert snap3.mode == "full" and snapshot.delta(str(repo), h2, snap3, True) is None
     # A symlink whose target changes (in the tree, then out of it) is an M record (codex-7).
     os.symlink("b.txt", repo / "lnk")
@@ -308,7 +317,7 @@ def test_snapshot_delta_falls_back_to_the_whole_list(env, monkeypatch):
     sh(repo, "git", "add", "-A")
     sh(repo, "git", "commit", "-qm", "lnk2")
     h5 = sh(repo, "git", "rev-parse", "HEAD")
-    snap5 = snapshot.ensure(str(repo), "t-delta", base, h5, 10**9)
+    snap5 = ensure(str(repo), "t-delta", base, h5, 10**9)
     assert snapshot.delta(str(repo), h4, snap5, True) is None
     # A symlink added or deleted: the whole list is shown (#134). A deleted one may or may not
     # have been in the old copy; an added one can change where unchanged ones resolve (codex-2).
@@ -316,13 +325,13 @@ def test_snapshot_delta_falls_back_to_the_whole_list(env, monkeypatch):
     sh(repo, "git", "add", "-A")
     sh(repo, "git", "commit", "-qm", "out")
     h6 = sh(repo, "git", "rev-parse", "HEAD")
-    snap6 = snapshot.ensure(str(repo), "t-delta", base, h6, 10**9)
+    snap6 = ensure(str(repo), "t-delta", base, h6, 10**9)
     assert "out" not in snap6.files and snapshot.delta(str(repo), h5, snap6, True) is None
     (repo / "out").unlink()
     sh(repo, "git", "add", "-A")
     sh(repo, "git", "commit", "-qm", "rm out")
     h7 = sh(repo, "git", "rev-parse", "HEAD")
-    snap7 = snapshot.ensure(str(repo), "t-delta", base, h7, 10**9)
+    snap7 = ensure(str(repo), "t-delta", base, h7, 10**9)
     assert snapshot.delta(str(repo), h6, snap7, True) is None
     snap.mode = "sparse"
     assert snapshot.delta(str(repo), h1, snap, True) is None
@@ -338,7 +347,7 @@ def test_sweep_removes_finished_threads_and_strays(env, no_spawn):
     open_tid = Service(bus, HUMAN).request_review("codex", str(repo), base, head)["thread"]["id"]
     done_tid = Service(bus, HUMAN).start_discussion("Q?", peers=["codex"])["thread"]["id"]
     for tid in (open_tid, done_tid, "t-gone00"):
-        assert snapshot.ensure(str(repo), tid, base, head, 10**9).path
+        assert ensure(str(repo), tid, base, head, 10**9).path
     bus.cancel_thread(done_tid)
     snapshot.sweep(bus)
     left = {p.name for p in snapshot.root().iterdir() if not p.name.startswith(".")}
@@ -352,7 +361,7 @@ def test_a_worker_sweeps_stale_snapshots_when_it_starts(env, no_spawn):
     bus, repo = env["bus"], env["repo"]
     base, commit = git_repo(repo)
     head = commit("one\n")
-    assert snapshot.ensure(str(repo), "t-crash0", base, head, 10**9).path  # a crashed worker's
+    assert ensure(str(repo), "t-crash0", base, head, 10**9).path  # a crashed worker's
     tid = Service(bus, HUMAN).start_discussion("Q?", peers=["codex"])["thread"]["id"]
     Worker(bus, bus.jobs(tid)[-1]["id"]).run()
     assert not (snapshot.root() / "t-crash0").exists()
@@ -399,7 +408,7 @@ def test_a_symlink_chain_that_resolves_outside_is_left_out(env):
     sh(repo, "git", "commit", "-qm", "links")
     head = sh(repo, "git", "rev-parse", "HEAD")
     assert snapshot._inside("a/b/esc", "up/..")  # the text check alone lets it through
-    snap = snapshot.ensure(str(repo), "t-abc", base, head, 10**9)
+    snap = ensure(str(repo), "t-abc", base, head, 10**9)
     top = snapshot.root() / "t-abc" / head
     assert os.readlink(top / "a" / "b" / "up") == "../.." and not os.path.lexists(top / "a" / "b" / "esc")
     assert "a/b/esc" not in snap.files and snap.skipped == 1
@@ -414,7 +423,7 @@ def test_replacement_objects_are_ignored(env):
     other = sh(repo, "git", "hash-object", "-w", "other.txt")
     sh(repo, "git", "replace", blob, other)
     assert sh(repo, "git", "show", f"{head}:a.txt") == "replaced"  # git itself honours it
-    snapshot.ensure(str(repo), "t-abc", base, head, 10**9)
+    ensure(str(repo), "t-abc", base, head, 10**9)
     assert (snapshot.root() / "t-abc" / head / "a.txt").read_text() == "pinned\n"
 
 
@@ -423,15 +432,15 @@ def test_reuse_needs_the_same_base_and_a_cap_it_still_fits(env, monkeypatch):
     base, commit = git_repo(repo)
     mid = commit("one\n")
     head = commit("two\n")
-    snapshot.ensure(str(repo), "t-abc", base, head, 10**9)
+    ensure(str(repo), "t-abc", base, head, 10**9)
     built = []
     real = snapshot._write
     monkeypatch.setattr(snapshot, "_write", lambda *a: built.append(1) or real(*a))
-    snapshot.ensure(str(repo), "t-abc", base, head, 10**9)
+    ensure(str(repo), "t-abc", base, head, 10**9)
     assert built == []
-    snap = snapshot.ensure(str(repo), "t-abc", mid, head, 10**9)  # rebased onto another base
+    snap = ensure(str(repo), "t-abc", mid, head, 10**9)  # rebased onto another base
     assert built == [1] and snap.path
-    snap = snapshot.ensure(str(repo), "t-abc", mid, head, 2)  # the cap lowered under it
+    snap = ensure(str(repo), "t-abc", mid, head, 2)  # the cap lowered under it
     assert built == [1] and snap.path is None and snap.mode == "over_cap"
 
 
@@ -453,7 +462,7 @@ def test_sweep_decides_and_removes_under_the_threads_lock(env, monkeypatch):
     repo = env["repo"]
     base, commit = git_repo(repo)
     head = commit("one\n")
-    snapshot.ensure(str(repo), "t-gone00", base, head, 10**9)
+    ensure(str(repo), "t-gone00", base, head, 10**9)
     held = []
     real = snapshot._locked
 
@@ -471,7 +480,7 @@ def test_sweep_skips_a_snapshot_being_built(env):
     repo = env["repo"]
     base, commit = git_repo(repo)
     head = commit("one\n")
-    snapshot.ensure(str(repo), "t-gone00", base, head, 10**9)
+    ensure(str(repo), "t-gone00", base, head, 10**9)
     with snapshot._locked("t-gone00") as mine:  # another worker building it
         assert mine
         snapshot.sweep(env["bus"])  # returns at once rather than waiting
@@ -490,9 +499,9 @@ def test_a_raised_cap_upgrades_a_sparse_snapshot(env):
     sh(repo, "git", "add", "-A")
     sh(repo, "git", "commit", "-qm", "big")
     head = sh(repo, "git", "rev-parse", "HEAD")
-    assert snapshot.ensure(str(repo), "t-abc", base, head, 5005).mode == "sparse"
-    assert snapshot.ensure(str(repo), "t-abc", base, head, 5005).mode == "sparse"  # reused
-    assert snapshot.ensure(str(repo), "t-abc", base, head, 10**9).mode == "full"
+    assert ensure(str(repo), "t-abc", base, head, 5005).mode == "sparse"
+    assert ensure(str(repo), "t-abc", base, head, 5005).mode == "sparse"  # reused
+    assert ensure(str(repo), "t-abc", base, head, 10**9).mode == "full"
 
 
 def test_a_held_lock_gives_no_snapshot_rather_than_a_hang(env, monkeypatch):
@@ -501,9 +510,9 @@ def test_a_held_lock_gives_no_snapshot_rather_than_a_hang(env, monkeypatch):
     head = commit("one\n")
     monkeypatch.setattr(snapshot, "LOCK_WAIT_S", 0.3)
     with snapshot._locked("t-abc"):
-        snap = snapshot.ensure(str(repo), "t-abc", base, head, 10**9)
+        snap = ensure(str(repo), "t-abc", base, head, 10**9)
     assert snap.path is None and "still writing" in snap.reason
-    assert snapshot.ensure(str(repo), "t-abc", base, head, 10**9).path
+    assert ensure(str(repo), "t-abc", base, head, 10**9).path
 
 
 def test_a_cancelled_job_stops_waiting_for_the_lock(env, monkeypatch):
@@ -514,11 +523,11 @@ def test_a_cancelled_job_stops_waiting_for_the_lock(env, monkeypatch):
     monkeypatch.setattr(snapshot, "LOCK_WAIT_S", 30)
     with snapshot._locked("t-abc"):
         start = time.monotonic()
-        snap = snapshot.ensure(str(repo), "t-abc", base, head, 10**9, cancelled=lambda: True)
+        snap = ensure(str(repo), "t-abc", base, head, 10**9, cancelled=lambda: True)
     assert time.monotonic() - start < 5
     assert snap.path is None and "cancelled" in snap.reason
     # Cancelled just as the lock comes free: it still builds nothing.
-    snap = snapshot.ensure(str(repo), "t-abc", base, head, 10**9, cancelled=lambda: True)
+    snap = ensure(str(repo), "t-abc", base, head, 10**9, cancelled=lambda: True)
     assert snap.path is None and "cancelled" in snap.reason
     assert not (snapshot.root() / "t-abc").exists()
 
@@ -534,9 +543,9 @@ def test_a_sparse_snapshot_over_the_file_cap_is_reused(env, monkeypatch):
     sh(repo, "git", "commit", "-qm", "two dirs")
     head = sh(repo, "git", "rev-parse", "HEAD")
     monkeypatch.setattr(snapshot, "MAX_FILES", 2)  # 3 files: over the file cap, not the bytes
-    assert snapshot.ensure(str(repo), "t-abc", base, head, 10**9).mode == "sparse"
+    assert ensure(str(repo), "t-abc", base, head, 10**9).mode == "sparse"
     monkeypatch.setattr(snapshot, "_write", lambda *a: pytest.fail("rebuilt a reusable sparse snapshot"))
-    assert snapshot.ensure(str(repo), "t-abc", base, head, 10**9).mode == "sparse"
+    assert ensure(str(repo), "t-abc", base, head, 10**9).mode == "sparse"
 
 
 class _NoThreads:
@@ -583,7 +592,9 @@ def test_a_hold_waits_for_a_removal_only_so_long(env, monkeypatch):
     try:
         t0 = time.monotonic()
         assert snapshot.hold("t-abc", wait=0.3) is None and time.monotonic() - t0 < 5
+        t0 = time.monotonic()  # codex-7 (#166): a cancelled hold gives up at once, not at the wait
         assert snapshot.hold("t-abc", wait=60, cancelled=lambda: True) is None
+        assert time.monotonic() - t0 < 5
     finally:
         os.close(fd)
     held = snapshot.hold("t-abc", wait=0)
@@ -604,3 +615,85 @@ def test_a_hold_waits_for_a_removal_only_so_long(env, monkeypatch):
     snap = w.pin_snapshot({"id": "t-abc"}, {"repo": str(env["repo"]), "base_commit_id": "a" * 40,
                                             "head_commit_id": "b" * 40})
     assert snap.path is None and "still removing it" in snap.reason
+
+
+def test_a_hold_closes_its_lock_if_cancelled_raises(env, monkeypatch):
+    """antigravity-2 (#166): a cancelled() that raises leaves no descriptor open."""
+    import fcntl
+    fd = snapshot._use_lock("t-abc")
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    opened = []
+    real = snapshot._use_lock
+    monkeypatch.setattr(snapshot, "_use_lock", lambda tid: opened.append(real(tid)) or opened[-1])
+
+    def boom():
+        raise RuntimeError("the bus is gone")
+
+    try:
+        with pytest.raises(RuntimeError):
+            snapshot.hold("t-abc", wait=60, cancelled=boom)
+    finally:
+        os.close(fd)
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+def test_a_new_head_never_removes_a_copy_another_workers_turn_reads(env):
+    """codex-4 (#166): a worker that lost its lease may still have a turn reading head one
+    when the next worker builds head two: head one stays while it is held, and goes with
+    the next build after its hold ends."""
+    repo = env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    old = snapshot.ensure(str(repo), "t-abc", base, h1, 10**9)  # the lingering worker's
+    assert old.hold is not None
+    h2 = commit("two\n")
+    new = ensure(str(repo), "t-abc", base, h2, 10**9)
+    assert new.path and (snapshot.root() / "t-abc" / h1 / "a.txt").read_text() == "one\n"
+    snapshot.release(old.hold)  # its job ended
+    h3 = commit("three\n")
+    ensure(str(repo), "t-abc", base, h3, 10**9)
+    assert sorted(p.name for p in (snapshot.root() / "t-abc").iterdir()) == sorted(
+        [h3, f"{h3}.json", f"{h3}.hold"])
+
+
+def test_a_held_head_is_not_rebuilt_in_place(env):
+    """codex-4 (#166): a rebuild of the same head (another base) replaces it in place, so
+    not while another worker's turn reads it: no snapshot then, rather than one that goes."""
+    repo = env["repo"]
+    base, commit = git_repo(repo)
+    mid = commit("one\n")
+    head = commit("two\n")
+    old = snapshot.ensure(str(repo), "t-abc", base, head, 10**9)
+    snap = ensure(str(repo), "t-abc", mid, head, 10**9)
+    assert snap.path is None and "still reading" in snap.reason
+    assert (snapshot.root() / "t-abc" / head / "a.txt").read_text() == "two\n"
+    shared = ensure(str(repo), "t-abc", base, head, 10**9)  # the same base: shared, reused
+    assert shared.path == old.path
+    snapshot.release(old.hold)
+    snap = ensure(str(repo), "t-abc", mid, head, 10**9)
+    assert snap.path == old.path
+    assert json.loads((snapshot.root() / "t-abc" / f"{head}.json").read_text())["base"] == mid  # rebuilt
+
+
+def test_a_worker_holds_each_head_it_reads_until_its_job_ends(env, monkeypatch):
+    """#166: pin_snapshot keeps one hold per head for the job, so another worker's build of
+    a new head leaves this one's copy alone."""
+    repo = env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    w = Worker.__new__(Worker)
+    w._snap_hold, w._head_holds, w.config = None, {}, cfg.Config(max_snapshot_bytes=10**9)
+    w.event = lambda *a, **kw: None
+    w.cancelled = lambda: False
+    refs = {"repo": str(repo), "base_commit_id": base, "head_commit_id": h1}
+    first = w.pin_snapshot({"id": "t-abc"}, refs)
+    again = w.pin_snapshot({"id": "t-abc"}, refs)
+    assert first.path == again.path and list(w._head_holds) == [h1]
+    assert first.hold is None and again.hold is None  # the worker keeps them, not the Snapshot
+    h2 = commit("two\n")
+    ensure(str(repo), "t-abc", base, h2, 10**9)  # another worker, on the next head
+    assert os.path.isdir(first.path)
+    for fd in w._head_holds.values():
+        snapshot.release(fd)
+    snapshot.release(w._snap_hold)

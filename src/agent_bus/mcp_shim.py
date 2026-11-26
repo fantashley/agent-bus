@@ -236,7 +236,23 @@ def _listen_ack(m: dict) -> Any:
 
 class Mismatch(RuntimeError):
     """A candidate that can't serve the client's current streams or envelope: tried again
-    once those change, not only when the installed build does."""
+    once those change, not only when the installed build does.  ``probed`` is what it was
+    probed against (Shim._streams, #168)."""
+
+    def __init__(self, message: str, probed: str):
+        super().__init__(message)
+        self.probed = probed
+
+
+class ListenRefused(RuntimeError):
+    """A candidate ended a re-opened listen stream at once (an error or a final result)."""
+
+
+def _fingerprint(meta: dict | None, listens) -> str:
+    """The client's envelope and listen streams (each one's request and what the server
+    honored): what a Mismatch depends on (#168)."""
+    streams = sorted([key, v["request"], v["honored"]] for key, v in listens)
+    return json.dumps([meta, streams], sort_keys=True, default=str)
 
 
 class Child:
@@ -308,7 +324,7 @@ class Child:
             if _key(reply["id"]) == _key(sub):
                 if "ack" in reply:
                     return reply["ack"]
-                raise RuntimeError(f"{LISTEN} ended at once: {reply.get('error') or reply.get('result')}")
+                raise ListenRefused(f"{LISTEN} ended at once: {reply.get('error') or reply.get('result')}")
 
     def stop(self) -> None:
         """End it the way a client does (close stdin), then harder if it doesn't exit."""
@@ -361,9 +377,10 @@ class Shim:
         self.last_skip: str | None = None        # why the last move didn't happen, as logged
         # A build that wouldn't start, and when to try it again (never, unless it timed
         # out): retried sooner only once the installed build changes.
-        # A Mismatch also names the listen streams it was tried with (a change retries it).
+        # A Mismatch also keeps the envelope and listen streams it was probed against (a
+        # change retries it).
         self.failed: tuple[str, float] | None = None
-        self.failed_with: frozenset[str] | None = None
+        self.failed_with: str | None = None
         self.closing = False
         self.child = self._spawn(exe)
 
@@ -500,6 +517,9 @@ class Shim:
         """Hand the candidate the client's handshake (or, on 2026-07-28, ask it what it
         supports and re-open the client's listen streams on it) and check it can take over:
         same protocol, a tool list, and the shim's session taken up (not one of its own)."""
+        with self.lock:  # what it is probed against (#168): a Mismatch is kept against it
+            meta = self.meta or {}
+            probed = _fingerprint(self.meta, self.listens.items())
         if self.init is not None:
             result = cand.request(INIT_ID, "initialize", self.init.get("params"), deadline)
             if self.protocol and result.get("protocolVersion") != self.protocol:
@@ -507,23 +527,29 @@ class Shim:
             cand.write(self.initialized)
             params: dict = {}
         else:
-            meta = self.meta or {}
             params = {"_meta": meta}
             result = cand.request(DISCOVER_ID, "server/discover", params, deadline)
             versions = result.get("supportedVersions")
             if not isinstance(versions, list) or meta.get(PROTOCOL_META) not in versions:
-                raise Mismatch(f"it speaks MCP {versions}, the client {meta.get(PROTOCOL_META)}")
+                raise Mismatch(f"it speaks MCP {versions}, the client {meta.get(PROTOCOL_META)}", probed)
         tools = cand.request(LIST_ID, "tools/list", params, deadline).get("tools")
         if not isinstance(tools, list):
             raise RuntimeError("tools/list returned no tools")
+        # The streams as they are now: one the serving child ended meanwhile isn't replayed.
         with self.lock:
             listens = list(self.listens.items())
+            probed = _fingerprint(self.meta, listens)
         self.replayed = {key: listen["request"]["id"] for key, listen in listens}
         for key, listen in listens:
-            honored = cand.listen(listen["request"], deadline)
+            try:
+                honored = cand.listen(listen["request"], deadline)
+            except ListenRefused as e:
+                # Maybe a stream the serving child ended during the replay: tried again once
+                # the streams change, like any stream it can't serve.
+                raise Mismatch(f"{e} (listen stream {key})", probed) from e
             if not _covers(honored, listen["honored"] or {}):
                 raise Mismatch(f"it honors {honored} on listen stream {key}, the current build "
-                                   f"{listen['honored']}")
+                               f"{listen['honored']}", probed)
         # A build that serves SESSION_ENV touches the session at startup; the old child is
         # idle, so a later last_seen is the candidate's.  One from before the shim registers
         # a session of its own instead.
@@ -643,16 +669,27 @@ class Shim:
                     self._to_client(json.dumps({"jsonrpc": "2.0", "method": "notifications/tools/list_changed",
                                                 "params": {"_meta": {SUBSCRIPTION_META: listen["request"]["id"]}}}).encode())
 
+    def _streams(self) -> str:
+        """The client's envelope and listen streams now (see _fingerprint).  Called with
+        self.lock held."""
+        return _fingerprint(self.meta, self.listens.items())
+
     def _forget_failure(self, target: str) -> None:
         """Forget a failed build once the install changed (a later fix of it is tried), or,
-        for one that couldn't serve the client's streams, once those changed."""
-        if self.failed and (self.failed[0] != target or
-                            (self.failed_with is not None and self.failed_with != frozenset(self.listens))):
+        for one that couldn't serve the client's streams, once those changed since its probe:
+        a stream ended, a new or re-filtered one, or another envelope (#168)."""
+        if not self.failed:
+            return
+        changed = self.failed[0] != target
+        if not changed and self.failed_with is not None:
+            with self.lock:
+                changed = self._streams() != self.failed_with
+        if changed:
             self.failed = self.failed_with = None
 
     def _fail(self, target: str, until: float, error: BaseException | None = None) -> None:
         self.failed = (target, until)
-        self.failed_with = frozenset(self.listens) if isinstance(error, Mismatch) else None
+        self.failed_with = error.probed if isinstance(error, Mismatch) else None
 
     def _drop_candidate(self, cand: Child) -> None:
         with self.lock:

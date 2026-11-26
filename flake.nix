@@ -82,7 +82,7 @@
 
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
-          packages = [ (pkgs.python3.withPackages (ps: [ ps.mcp ps.pytest ps.pytest-xdist ])) pkgs.jujutsu ];
+          packages = [ (pkgs.python3.withPackages (ps: [ ps.mcp ps.pytest ps.pytest-xdist ps.pyyaml ])) pkgs.jujutsu ];
           shellHook = ''export PYTHONPATH="$PWD/src''${PYTHONPATH:+:$PYTHONPATH}"'';
         };
       });

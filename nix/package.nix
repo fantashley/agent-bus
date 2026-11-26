@@ -33,7 +33,9 @@ python3Packages.buildPythonApplication {
     cp -r skills $out/share/agent-bus/skills
   '';
 
-  nativeCheckInputs = [ python3Packages.pytestCheckHook git ] ++ lib.optional withJujutsu jujutsu;
+  # PyYAML: the skill tests parse SKILL.md's frontmatter as real YAML (#161); not a runtime dependency.
+  nativeCheckInputs = [ python3Packages.pytestCheckHook python3Packages.pyyaml git ]
+    ++ lib.optional withJujutsu jujutsu;
   # The review tests make throwaway git (and jj) repos, which want a user and a writable home.
   preCheck = ''
     export HOME=$(mktemp -d)

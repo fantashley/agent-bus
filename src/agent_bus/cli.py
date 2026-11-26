@@ -420,9 +420,10 @@ def needs_you(bus: Bus, ts: list[dict]) -> dict[str, str]:
 
 
 def _with_provenance(m: dict) -> dict:
-    """A message for `history --json`: as agents see it, plus a human message's full
-    provenance (#108), which agents never get."""
+    """A message for `history --json`: as agents see it, with its exact time, plus a human
+    message's full provenance (#108), which agents never get."""
     out = present(m)
+    out["created_at"] = m["created_at"]  # epoch seconds: "at" is local time, to the second (#161)
     if m["sender"] == HUMAN and "provenance" in m:
         out["provenance"] = provenance.summary(m["provenance"], m.get("provenance_records", 1))
     return out
@@ -980,6 +981,7 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
                               "human_actions": [{"id": a["id"], "command": a["command"], "detail": a["detail"],
                                                  "at": time.strftime("%Y-%m-%dT%H:%M:%S",
                                                                      time.localtime(a["created_at"])),
+                                                 "created_at": a["created_at"],
                                                  "provenance": provenance.summary(a["provenance"])}
                                                 for a in bus.human_actions(args.thread)]}, indent=2))
         else:
