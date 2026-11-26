@@ -14,9 +14,12 @@ filters, export-subst or other conversions (``git archive`` applies those, and a
 external command), and without untracked or ignored files such as node_modules.  A snapshot
 is reused by the pass's later turns on the same head, replaced when the head moves, and
 removed once no job runs on the thread (``sweep``, which every worker also runs when it
-starts, so a crashed worker's snapshots don't stay).  A tree over the size cap gets a sparse
-snapshot: the changed files and the other files in their directories; if even that is over,
-no snapshot, and the prompt says files on disk may not match the head.
+starts, so a crashed worker's snapshots don't stay).  A worker holds its thread's snapshot
+(``hold``) from its first turn on it until its job ends, and a sweep never removes a held one,
+whatever it makes of the thread (#164): the hold is a lock, so it goes with a crashed worker.
+A tree over the size cap gets a sparse snapshot: the changed files and the other files in
+their directories; if even that is over, no snapshot, and the prompt says files on disk may
+not match the head.
 """
 
 from __future__ import annotations
@@ -355,8 +358,49 @@ def stale(bus, thread_id: str) -> bool:
     return bus.active_job(thread_id) is None
 
 
+def _use_lock(thread_id: str) -> int:
+    locks = root() / ".locks"
+    locks.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return os.open(locks / f"{thread_id}.use", os.O_RDWR | os.O_CREAT, 0o600)
+
+
+def hold(thread_id: str, wait: float | None = None, cancelled: Callable[[], bool] | None = None) -> int | None:
+    """Mark ``thread_id``'s snapshot in use until ``release`` (or until this process exits):
+    no sweep removes it meanwhile (#164).  Shared, so it only waits for a sweep that is
+    removing it right now, and like ``_locked`` for at most ``wait`` seconds (LOCK_WAIT_S)
+    or until ``cancelled()``.  Returns the lock's descriptor, or None if it wasn't taken."""
+    if not _ID.fullmatch(thread_id):
+        return None
+    try:
+        fd = _use_lock(thread_id)
+    except OSError:
+        return None
+    deadline = time.monotonic() + (LOCK_WAIT_S if wait is None else wait)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline or (cancelled is not None and cancelled()):
+                os.close(fd)
+                return None
+            time.sleep(0.2)
+        except OSError:
+            os.close(fd)
+            return None
+
+
+def release(fd: int | None) -> None:
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def sweep(bus, only: str | None = None) -> None:
-    """Remove the snapshots of every thread that no longer needs them (or of ``only``)."""
+    """Remove the snapshots of every thread that no longer needs them (or of ``only``),
+    except one a worker holds."""
     top = root()
     if not top.is_dir():
         return
@@ -364,8 +408,22 @@ def sweep(bus, only: str | None = None) -> None:
         if p.name.startswith(".") or (only is not None and p.name != only):
             continue
         with _locked(p.name, wait=0) as mine:  # the decision and the removal, together
-            if mine and stale(bus, p.name):  # a held lock: being built for a live job
-                remove(p)
+            if not mine:  # a held lock: being built for a live job
+                continue
+            try:
+                fd = _use_lock(p.name)
+            except OSError:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                continue  # a running job's turns read it
+            try:
+                if stale(bus, p.name):
+                    remove(p)
+            finally:
+                os.close(fd)
 
 
 # The most files a resumed follow-up lists as added to or removed from the copy (#126).

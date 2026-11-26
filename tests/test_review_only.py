@@ -346,6 +346,7 @@ def test_a_human_finish_is_recorded_on_either_path_and_flagged_when_unsure(env, 
     claude = Service(bus, "claude", bus.register_session("claude"))
     tid = claude.request_review("codex", str(repo), base, h1)["thread"]["id"]
     monkeypatch.setenv("FAKE_APPROVE", "codex")
+    real_finish = Worker.finish_thread
     monkeypatch.setattr(Worker, "finish_thread", lambda self, status: (_ for _ in ()).throw(RuntimeError("died")))
     with pytest.raises(RuntimeError):
         run_job(bus, tid)
@@ -356,7 +357,10 @@ def test_a_human_finish_is_recorded_on_either_path_and_flagged_when_unsure(env, 
     # A human finish with no provenance recorded is flagged to agents, like a human message.
     h2 = commit("two\n")
     other = claude.request_review("codex", str(repo), base, h2)["thread"]["id"]
-    monkeypatch.undo()
+    # Not monkeypatch.undo(): that would also undo env's state and config dirs, and this
+    # worker's sweep would then reach the real snapshots (#164).
+    monkeypatch.setattr(Worker, "finish_thread", real_finish)
+    monkeypatch.delenv("FAKE_APPROVE")
     run_job(bus, other)
     bus.human_provenance = None
     f = Service(bus, HUMAN).finish_review(other, "unsure who")["thread"]["finished"]

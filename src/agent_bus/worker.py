@@ -220,6 +220,7 @@ class Worker:
         self._lost = threading.Event()
         self.quota_noticed: set[str] = set()
         self._quota_lock = threading.Lock()  # round 1 runs peers in parallel
+        self._snap_hold: int | None = None  # this job's hold on its thread's snapshot (#164)
 
     # ------------------------------------------------------------------ plumbing
 
@@ -230,6 +231,8 @@ class Worker:
         try:
             return self._run()
         finally:
+            snapshot.release(self._snap_hold)
+            self._snap_hold = None
             self.sweep_snapshots(self.thread_id)  # after finish_job: this one, if it is done
 
     def sweep_snapshots(self, only: str | None) -> None:
@@ -1539,10 +1542,18 @@ class Worker:
     def pin_snapshot(self, t: dict, refs: dict) -> snapshot.Snapshot:
         """The read-only snapshot of the pinned head the reviewer reads files from (#111),
         made now or reused from an earlier turn on the same head.  Best effort: without one,
-        the prompt says files on disk may not match the head."""
+        the prompt says files on disk may not match the head.  Held until the job ends, so
+        no other worker's sweep removes it while a turn reads it (#164)."""
+        if self._snap_hold is None and self.config.max_snapshot_bytes > 0:
+            self._snap_hold = snapshot.hold(t["id"], cancelled=self.cancelled)
         try:
-            snap = snapshot.ensure(refs["repo"], t["id"], refs["base_commit_id"], refs["head_commit_id"],
-                                   self.config.max_snapshot_bytes, cancelled=self.cancelled)
+            if self._snap_hold is None and self.config.max_snapshot_bytes > 0:
+                # Unheld, a sweep could remove it under the turn: none, rather than one that may go.
+                snap = snapshot.Snapshot(head=refs["head_commit_id"], reason=(
+                    "the review was cancelled" if self.cancelled() else "another worker is still removing it"))
+            else:
+                snap = snapshot.ensure(refs["repo"], t["id"], refs["base_commit_id"], refs["head_commit_id"],
+                                       self.config.max_snapshot_bytes, cancelled=self.cancelled)
         except Exception as e:  # noqa: BLE001 (never what fails a review)
             snap = snapshot.Snapshot(head=refs["head_commit_id"], reason=f"it could not be made ({e!r})")
         # A non-UTF-8 file name in it would fail the event's insert and a strict prompt encode.
@@ -2301,9 +2312,8 @@ def verdict_format(prior: dict[str, dict]) -> str:
     still = {"verdict": "request_changes", "summary": "One paragraph.",
              "earlier": [{"id": first, "status": "still_blocking", "note": "Why it still blocks."}]
              + [{"id": i, "status": "fixed", "note": "How it was fixed."} for i in ids[1:]],
-             "findings": [{"id": first, "file": "src/app.py", "line": 12, "severity": "high",
-                           "comment": "What is still wrong."},
-                          {"file": "src/app.py", "line": 30, "severity": "low", "comment": "A new, non-blocking note."}]}
+             # Still blocking: "earlier" alone carries it (#164), so it isn't repeated here.
+             "findings": [{"file": "src/app.py", "line": 30, "severity": "low", "comment": "A new, non-blocking note."}]}
     # One example (#159): the approving one only repeated it with every id fixed.
     return prompts.VERDICT_FORMAT + prompts.VERDICT_FOLLOWUP.format(
         ids=", ".join(ids), example=first, still=json.dumps(still))
