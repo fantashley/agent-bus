@@ -20,7 +20,8 @@ Standard library only; it never runs code from the pull request. Subcommands:
   post --state S --draft DIR --approved DIGEST [--no-resolve]
                                       post the draft with `gh api`; a retry skips what landed
 
-Every comment it drafts carries a hidden `<!-- agent-bus-finding: ID -->` marker, every reply
+Every comment it drafts carries a hidden `<!-- agent-bus-finding: ID -->` marker (one per finding
+when findings at the same line share a comment), every reply
 an `agent-bus-reply` one and every review an `agent-bus-review` one. A retry after a partial or
 lost post finds what already reached GitHub by those markers, counting only the ones posted
 from the user's own account (markers are public text anyone can copy).
@@ -134,6 +135,19 @@ def last_marker(text: str) -> str | None:
     """A comment's own marker is its last one: an earlier one may be quoted text."""
     found = MARKER_RE.findall(text or "")
     return found[-1] if found else None
+
+
+TAG_RE = re.compile(rf"\*\*\[({FINDING}(?:, {FINDING})*)\]\*\*")
+
+
+def own_markers(text: str) -> list[str]:
+    """The finding ids an inline comment carries: as many of its last markers as its leading
+    tag names ids (``**[codex-1, antigravity-1]**`` for a merged comment, #151), so a marker
+    quoted in a finding's text is never one of them."""
+    tag = TAG_RE.match(text or "")
+    found = MARKER_RE.findall(text or "")
+    n = len(tag.group(1).split(", ")) if tag else 1
+    return found[-n:] if len(found) >= n else found
 
 
 # ------------------------------------------------------------------ diff
@@ -283,6 +297,16 @@ def finding_body(f: dict) -> str:
     return f"**[{f['id']}]** ({severity_label(f)}) {f.get('comment', '').strip()}\n\n{MARKER.format(f['id'])}"
 
 
+def merged_body(fs: list[dict]) -> str:
+    """One inline comment for several findings at the same line (#151): tagged with every id,
+    each finding's own text, and each id's marker, so later drafts still settle each one."""
+    if len(fs) == 1:
+        return finding_body(fs[0])
+    parts = [f"**[{', '.join(f['id'] for f in fs)}]**"]
+    parts += [f"**{f['id']}** ({f['reviewer']}; {severity_label(f)}) {f.get('comment', '').strip()}" for f in fs]
+    return "\n\n".join(parts) + "\n\n" + "\n".join(MARKER.format(f["id"]) for f in fs)
+
+
 def where(f: dict) -> str:
     return f"{f['file']}:{f['line']}" if f.get("line") else str(f.get("file") or "?")
 
@@ -296,7 +320,8 @@ def build_draft(state: dict, history: dict, diff: str, ai_label: str | None = No
     lines = commentable_lines(diff)
     tracked = state.get("findings") or {}
     posted = {k: v for k, v in tracked.items() if v.get("status") not in SETTLED}
-    inline, outside, replies, resolve, settled_in_body, open_in_body, reopen = [], [], [], [], [], [], []
+    outside, replies, resolve, settled_in_body, open_in_body, reopen = [], [], [], [], [], []
+    at: dict[tuple, list[dict]] = {}  # new inline findings by (file, line)
 
     def reply(fid: str, status: str, text: str) -> dict:
         return {"finding": fid, "comment_id": tracked[fid]["comment_id"], "status": status,
@@ -326,9 +351,11 @@ def build_draft(state: dict, history: dict, diff: str, ai_label: str | None = No
             open_in_body.append(f"- **[{fid}]** still open ({f['reviewer']}) `{where(f)}`")
         elif fid in rv["anchored"] and f.get("line") and f["line"] in lines.get(f.get("file"), set()):
             # Only a location given on this head: a carried one may point at moved code.
-            inline.append({"path": f["file"], "line": f["line"], "side": "RIGHT", "body": finding_body(f)})
+            # Findings at the same file and line share one comment (#151).
+            at.setdefault((f["file"], f["line"]), []).append(f)
         else:
             outside.append(f)
+    inline = [{"path": p, "line": n, "side": "RIGHT", "body": merged_body(fs)} for (p, n), fs in at.items()]
     for fid, p in posted.items():
         st, note, who = rv["status"].get(fid, (None, "", ""))
         if fid in rv["open"] or st not in SETTLED:
@@ -336,9 +363,22 @@ def build_draft(state: dict, history: dict, diff: str, ai_label: str | None = No
         note = f": {note}" if note else ""
         if p.get("comment_id"):
             replies.append(reply(fid, st, f"**[{fid}]** {st} at `{short}` ({who}){note}"))
-            resolve.append({"finding": fid, "thread_id": p.get("thread_id")})
+            # A comment several findings share is resolved once none of them is open (#151).
+            if not any(o in rv["open"] for o, v in tracked.items() if v.get("comment_id") == p["comment_id"]):
+                resolve.append({"finding": fid, "thread_id": p.get("thread_id")})
         else:
             settled_in_body.append((fid, st, f"- **[{fid}]** {st} ({who}){note}"))
+    # A shared thread left open for a finding that has since been dropped without a settlement
+    # (a low note no longer listed): resolve it now, for the finding settled there earlier.
+    resolving = {r["finding"] for r in resolve}
+    shared: dict[int, list[str]] = {}
+    for fid, v in tracked.items():
+        if v.get("comment_id"):
+            shared.setdefault(v["comment_id"], []).append(fid)
+    for fids in shared.values():
+        later = [o for o in fids if tracked[o].get("resolve_later")]
+        if later and not any(o in rv["open"] or o in resolving for o in fids):
+            resolve.append({"finding": later[0], "thread_id": tracked[later[0]].get("thread_id")})
     names = ", ".join(rv["current"])
     body = [f"Review of `{short}` by {names} (relayed via agent-bus)."]
     for reviewer, v in rv["current"].items():
@@ -433,11 +473,14 @@ def write_draft(out: Path, draft: dict) -> str:
 
 def author_replies(state: dict, comments: list, me: str | None, author: str | None) -> list[dict]:
     """Replies on finding threads that aren't the user's own and weren't relayed yet."""
-    ids = {p["comment_id"]: fid for fid, p in (state.get("findings") or {}).items() if p.get("comment_id")}
+    ids: dict[int, list[str]] = {}  # a comment findings share (#151) names them all
+    for fid, p in (state.get("findings") or {}).items():
+        if p.get("comment_id"):
+            ids.setdefault(p["comment_id"], []).append(fid)
     seen = set(state.get("seen_replies") or [])
     out = []
     for c in comments:
-        fid = ids.get(c.get("in_reply_to_id"))
+        fid = ", ".join(ids.get(c.get("in_reply_to_id")) or [])
         login = (c.get("user") or {}).get("login")
         body = c.get("body") or ""
         if fid and c["id"] not in seen and login != me:  # markers are public: go by the account
@@ -560,11 +603,11 @@ def post(state_file: Path, draft_dir: Path, approved: str, history: dict, resolv
 
         def readback(review_id: int) -> None:
             """Record the review's comments (only its own, only the findings it carries)."""
-            mine = {last_marker(c["body"]) for c in draft["review"]["comments"]} - {None}
+            mine = {fid for c in draft["review"]["comments"] for fid in own_markers(c["body"])}
             for c in gh_pages(f"{base}/reviews/{review_id}/comments"):
-                fid = last_marker(c.get("body") or "")
-                if fid in mine:
-                    findings[fid] = {"comment_id": c["id"], "node_id": c.get("node_id"), "head": draft["head"]}
+                for fid in own_markers(c.get("body") or ""):  # a merged comment carries several
+                    if fid in mine:
+                        findings[fid] = {"comment_id": c["id"], "node_id": c.get("node_id"), "head": draft["head"]}
             for fid in body_findings(draft):  # in the review's body: no thread
                 findings.setdefault(fid, {"review_id": review_id, "head": draft["head"]})
             for fid, st in draft["settled_in_body"].items():
@@ -606,7 +649,7 @@ def post(state_file: Path, draft_dir: Path, approved: str, history: dict, resolv
             readback(review_id)  # recover what landed before anything else, stale or not
         else:
             fresh()
-            new = {last_marker(c["body"]) for c in draft["review"]["comments"]} | body_findings(draft)
+            new = {fid for c in draft["review"]["comments"] for fid in own_markers(c["body"])} | body_findings(draft)
             clash = sorted(new & set(findings))
             if clash:
                 raise Fail(f"{', '.join(clash)} were posted since this draft was made: draft again")
@@ -641,10 +684,13 @@ def post(state_file: Path, draft_dir: Path, approved: str, history: dict, resolv
                 if r["status"] in SETTLED:
                     entry["status"] = r["status"]
                     entry.pop("unresolve", None)  # settled again: its thread gets resolved instead
+                    if r["finding"] not in {x["finding"] for x in draft["resolve"]}:
+                        entry["resolve_later"] = True  # a shared thread another finding holds open
                 else:
                     if r["status"] == "reopened" and entry.get("status") in SETTLED:
                         entry["unresolve"] = True  # until its thread is unresolved, by this post or a later one
                     entry.pop("status", None)  # open (again)
+                    entry.pop("resolve_later", None)  # its thread waits for it again
                     entry["still_open_at"] = draft["head"]
                 save(state_file, state)
         resolved, failed = [], []
@@ -670,6 +716,7 @@ def post(state_file: Path, draft_dir: Path, approved: str, history: dict, resolv
                     if is_resolved != want:
                         mutation = RESOLVE_MUTATION if want else UNRESOLVE_MUTATION
                         gh(["api", "graphql", "-f", f"query={mutation}", "-f", f"id={tid}"])
+                        threads[findings[fid]["node_id"]] = (tid, want)  # a thread findings share: once
                     if want:
                         resolved.append(fid)
                     else:
@@ -680,6 +727,12 @@ def post(state_file: Path, draft_dir: Path, approved: str, history: dict, resolv
                         failed.append(fid)
                     print(f"pr_review.py: couldn't {'resolve' if want else 'reopen'} {fid}'s thread ({e}); "
                           "its reply was posted", file=sys.stderr)
+        # A deferred resolution (#151) is done with once a post covers its thread: resolved, refused
+        # or skipped with --no-resolve, as for a thread with one finding.
+        covered = {findings[r["finding"]].get("comment_id") for r in draft["resolve"]} - {None}
+        for e in findings.values():
+            if e.get("comment_id") in covered:
+                e.pop("resolve_later", None)
         state.setdefault("posted", []).append(key)
         state["posted_pass"] = max(state.get("posted_pass", 0), draft["pass"])
         state["posting"] = None

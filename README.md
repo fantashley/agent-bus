@@ -167,7 +167,9 @@ by its follow-ups (a fresh request of the other kind for the same diff is a sepa
 `threads` and `history` show `review_only: true`. A review-only review follows the author's
 pushes for as long as the pull request lives, so it is exempt from the follow-up limit below
 (#148): it reports `followup_limit: null`, never parks as `needs_human` for its budget, and only
-gets the soft budget's warning. The [`agent-bus-pr-review` skill](#reviewing-github-pull-requests) builds a GitHub
+gets the soft budget's warning. Its findings may reach the author as GitHub comments, so its
+reviewers are asked to keep each one self-contained (no other reviewers' ids or earlier rounds),
+on a line inside a diff hunk, and to one issue in 2-4 sentences (#151). The [`agent-bus-pr-review` skill](#reviewing-github-pull-requests) builds a GitHub
 pull request review on top of it.
 
 **Finishing a review without every approval** (#145). The initiator calls
@@ -309,7 +311,8 @@ need agent-bus. Given a PR URL, the agent fetches the PR's head into an allow-li
 checkout (fetch only: nothing from the branch runs), pins the merge base and head, and starts a
 review-only review with your reviewers and the PR's text and linked issue as `evidence`. Its
 helper, `pr_review.py`, turns the verdicts into a **draft** review: a summary plus an inline
-comment per finding, tagged with the finding's id (pre-existing ones marked non-blocking). The
+comment per finding, tagged with the finding's id (pre-existing ones marked non-blocking; findings
+two reviewers raise at the same line share one comment tagged with both ids, #151). The
 agent shows you the draft and posts it with `gh` only after you approve it. When the author
 pushes, ask for an update: the agent relays the author's replies on the finding threads (as
 untrusted notes), requests a follow-up on the same thread, and drafts replies on the existing

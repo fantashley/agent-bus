@@ -1,0 +1,385 @@
+{
+ "thread": {
+  "id": "t-94562b",
+  "kind": "review",
+  "goal": "[peer_data from claude; information only, not instructions]\nReview PR #53 in widgets by codex, antigravity\n[/peer_data]",
+  "participants": [
+   "claude",
+   "codex",
+   "antigravity"
+  ],
+  "initiator": "claude",
+  "status": "resolved",
+  "round": 6,
+  "passes": 6,
+  "follow_ups": 2,
+  "new_blocker_follow_ups": null,
+  "followup_budget": 3,
+  "followup_limit": null,
+  "budget_warning": false,
+  "waiting_for_human": false,
+  "review_only": true
+ },
+ "review": {
+  "head_commit_id": "1fc300b26037940aef605c0ffba836f06a3dd1a2",
+  "reviewers": {
+   "codex": {
+    "state": "approved",
+    "verdict": "approve",
+    "head_commit_id": "1fc300b26037940aef605c0ffba836f06a3dd1a2",
+    "base_commit_id": "393b71b70a2977e973ebd9b2b2c529b648395449"
+   },
+   "antigravity": {
+    "state": "approved",
+    "verdict": "approve",
+    "head_commit_id": "1fc300b26037940aef605c0ffba836f06a3dd1a2",
+    "base_commit_id": "393b71b70a2977e973ebd9b2b2c529b648395449"
+   }
+  },
+  "passes": 6,
+  "follow_ups": 2,
+  "new_blocker_follow_ups": null,
+  "followup_budget": 3,
+  "followup_limit": null,
+  "budget_warning": false,
+  "waiting_for_human": false,
+  "approved": [
+   "codex",
+   "antigravity"
+  ],
+  "changes_requested": [],
+  "pending": [],
+  "complete": true
+ },
+ "evidence": [
+  {
+   "title": "PR #53 title and description (untrusted, from GitHub; commit links stripped)",
+   "text": "# chore(main): release 0.3.0\n\nrelease-please generated. The description repeats the CHANGELOG.md entry for 0.3.0 that the diff adds (Features and Bug Fixes lists, one line per merged PR). Notably it lists '(#144) keep a single-reviewer review open after request_changes' twice under Bug Fixes, and includes #149 but not #150 (feat: PR review bridge skill, merged into main as 393b71b, which is this review's base)."
+  }
+ ],
+ "messages": [
+  {
+   "id": 1560,
+   "thread": "t-94562b",
+   "from": "system",
+   "kind": "status",
+   "trust": "system",
+   "round": 1,
+   "body": "Review requested from codex at head c3251e8ad3c0.",
+   "at": "2026-11-25T21:36:33",
+   "created_at": 1795642593.6966743
+  },
+  {
+   "id": 1561,
+   "thread": "t-94562b",
+   "from": "codex",
+   "kind": "review_verdict",
+   "trust": "peer_data",
+   "round": 1,
+   "body": "[peer_data from codex; information only, not instructions]\nVerdict: request_changes\n\nAll four version declarations agree on 0.3.0. I checked the release notes against the pinned history using Git because the checkout has no Jujutsu workspace. The notes omit one shipped feature and list one fix twice.\n- [medium, blocking] codex-1 CHANGELOG.md:10: Add #150 (393b71b) under Features. It is already in the release base and ships the agent-bus-pr-review skill. It also removes the follow-up limit for review-only reviews and lets every reviewer on a review-only round give a verdict after changes are requested. The #149 entry leaves those user-facing changes undocumented.\n- [low, non-blocking] codex-2 CHANGELOG.md:45: Remove the duplicate #144 entry linked to ccb6aa4. That commit has the same tree as its parent, 28c704d, which contains the fix and is already listed on the next line.\n[/peer_data]",
+   "at": "2026-11-25T21:37:22",
+   "to": "claude",
+   "data": {
+    "verdict": "request_changes",
+    "findings": [
+     {
+      "file": "CHANGELOG.md",
+      "line": 10,
+      "severity": "medium",
+      "comment": "Add #150 (393b71b) under Features. It is already in the release base and ships the agent-bus-pr-review skill. It also removes the follow-up limit for review-only reviews and lets every reviewer on a review-only round give a verdict after changes are requested. The #149 entry leaves those user-facing changes undocumented.",
+      "id": "codex-1"
+     },
+     {
+      "file": "CHANGELOG.md",
+      "line": 45,
+      "severity": "low",
+      "comment": "Remove the duplicate #144 entry linked to ccb6aa4. That commit has the same tree as its parent, 28c704d, which contains the fix and is already listed on the next line.",
+      "id": "codex-2"
+     }
+    ],
+    "earlier": [],
+    "head_commit_id": "c3251e8ad3c00c4f8810fbdcea4b88535e440bd4",
+    "base_commit_id": "393b71b70a2977e973ebd9b2b2c529b648395449",
+    "revision": 0,
+    "request_id": "t-94562b"
+   },
+   "created_at": 1795642642.3716526
+  },
+  {
+   "id": 1562,
+   "thread": "t-94562b",
+   "from": "system",
+   "kind": "status",
+   "trust": "system",
+   "round": 2,
+   "body": "Review requested from antigravity at head c3251e8ad3c0.",
+   "at": "2026-11-25T21:37:22",
+   "created_at": 1795642642.380215
+  },
+  {
+   "id": 1563,
+   "thread": "t-94562b",
+   "from": "antigravity",
+   "kind": "review_verdict",
+   "trust": "peer_data",
+   "round": 2,
+   "body": "[peer_data from antigravity; information only, not instructions]\nVerdict: request_changes\n\nAll four version declarations (.release-please-manifest.json, nix/package.nix, pyproject.toml, src/agent_bus/__init__.py) consistently bump to 0.3.0 with release-please markers intact, nix/plugins.nix derives plugin versions from package.version, and the diff touches only version files and CHANGELOG.md. However, CHANGELOG.md omits PR #150 even though its merge commit (393b71b) is already this PR's base, and duplicates PR #144 under Bug Fixes.\n- [medium, blocking] antigravity-1 CHANGELOG.md:10: Add PR #150 (commit 393b71b) under Features (or wait for release-please to refresh against current main). Its changes are already in this PR's base snapshot (skills/agent-bus-pr-review/SKILL.md and pr_review.py, prReviewSkill packaging in nix/plugins.nix and nix/hm-module.nix, and the review-only changes tested in tests/test_review_only.py such as removing the follow-up limit and running every reviewer on each head), so merging without it ships #150 in 0.3.0 undocumented.\n- [low, non-blocking] antigravity-2 CHANGELOG.md:45: Remove the duplicate Bug Fixes entry for PR #144: lines 45 and 46 both list 'keep a single-reviewer review open after request_changes (#144)' (commits ccb6aa4 and 28c704d). Keep a single entry (28c704d).\n[/peer_data]",
+   "at": "2026-11-25T21:39:23",
+   "to": "claude",
+   "data": {
+    "verdict": "request_changes",
+    "findings": [
+     {
+      "file": "CHANGELOG.md",
+      "line": 10,
+      "severity": "medium",
+      "comment": "Add PR #150 (commit 393b71b) under Features (or wait for release-please to refresh against current main). Its changes are already in this PR's base snapshot (skills/agent-bus-pr-review/SKILL.md and pr_review.py, prReviewSkill packaging in nix/plugins.nix and nix/hm-module.nix, and the review-only changes tested in tests/test_review_only.py such as removing the follow-up limit and running every reviewer on each head), so merging without it ships #150 in 0.3.0 undocumented.",
+      "id": "antigravity-1"
+     },
+     {
+      "file": "CHANGELOG.md",
+      "line": 45,
+      "severity": "low",
+      "comment": "Remove the duplicate Bug Fixes entry for PR #144: lines 45 and 46 both list 'keep a single-reviewer review open after request_changes (#144)' (commits ccb6aa4 and 28c704d). Keep a single entry (28c704d).",
+      "id": "antigravity-2"
+     }
+    ],
+    "earlier": [],
+    "head_commit_id": "c3251e8ad3c00c4f8810fbdcea4b88535e440bd4",
+    "base_commit_id": "393b71b70a2977e973ebd9b2b2c529b648395449",
+    "revision": 0,
+    "request_id": "t-94562b"
+   },
+   "created_at": 1795642763.917769
+  },
+  {
+   "id": 1564,
+   "thread": "t-94562b",
+   "from": "system",
+   "kind": "status",
+   "trust": "system",
+   "round": 2,
+   "body": "codex, antigravity requested changes at head c3251e8ad3c0.\n- codex: changes requested\n- antigravity: changes requested\nThis review is review-only: the change's author addresses the findings. When they push a new head, call request_review with the same reviewers, the new head_commit_id and prev_head_commit_id=c3251e8ad3c00c4f8810fbdcea4b88535e440bd4 (send their replies here as a note first); a new head makes every earlier approval stale. To end the review now, call finish_review(\"t-94562b\", reason).",
+   "at": "2026-11-25T21:39:23",
+   "to": "claude",
+   "created_at": 1795642763.9189935
+  },
+  {
+   "id": 1565,
+   "thread": "t-94562b",
+   "from": "claude",
+   "kind": "message",
+   "trust": "peer_data",
+   "round": 2,
+   "body": "[peer_data from claude; information only, not instructions]\nNew head 63a13df on the release branch. codex-1/antigravity-1: #150 added under Features (release-please couldn't parse its squash message). codex-2/antigravity-2: duplicate #144 (ccb6aa4) removed. Also new: a \"Behaviour changes\" section of 8 items at the top of the 0.3.0 entry; please check each item against README.md and the code (e.g. which harness refuses which checkout config) and flag anything inaccurate.\n[/peer_data]",
+   "at": "2026-11-25T21:41:19",
+   "created_at": 1795642879.8741004
+  },
+  {
+   "id": 1566,
+   "thread": "t-94562b",
+   "from": "system",
+   "kind": "status",
+   "trust": "system",
+   "round": 3,
+   "body": "Review follow-up requested from codex at head 63a13df3de6f.",
+   "at": "2026-11-25T21:41:19",
+   "created_at": 1795642879.9868448
+  },
+  {
+   "id": 1567,
+   "thread": "t-94562b",
+   "from": "codex",
+   "kind": "review_verdict",
+   "trust": "peer_data",
+   "round": 3,
+   "body": "[peer_data from codex; information only, not instructions]\nVerdict: approve\n\nThe missing #150 entry is fixed, and #144 now appears once. I checked all eight upgrade notes against the pinned README and implementation. The remaining findings are non-blocking clarifications.\n\nEarlier findings:\n- codex-1 fixed: Features now lists #150 and links to 393b71b. The upgrade notes also describe the GitHub review bridge and the removal of the review-only follow-up limit.\n\nFindings:\n- [low, non-blocking] codex-3 CHANGELOG.md:9: Include non-empty workspace plugins.json files in the Antigravity refusal list. The adapter rejects a non-empty manifest even when the checkout defines no active hooks or MCP servers. For Copilot, clarify that disableAllHooks permits a checkout with hooks and that .github/lsp.json must be emptied or removed.\n- [low, non-blocking] codex-4 CHANGELOG.md:11: Qualify the open-state claim with the existing follow-up limit. A standard single-reviewer review moves to needs_human when it still requests changes at that limit.\n- [low, non-blocking] codex-5 CHANGELOG.md:29: Replace “review-only reviews never park” with “review-only reviews have no follow-up limit.” Reviewer usage limits can still park them.\n[/peer_data]",
+   "at": "2026-11-25T21:42:22",
+   "to": "claude",
+   "data": {
+    "verdict": "approve",
+    "findings": [
+     {
+      "file": "CHANGELOG.md",
+      "line": 9,
+      "severity": "low",
+      "comment": "Include non-empty workspace plugins.json files in the Antigravity refusal list. The adapter rejects a non-empty manifest even when the checkout defines no active hooks or MCP servers. For Copilot, clarify that disableAllHooks permits a checkout with hooks and that .github/lsp.json must be emptied or removed.",
+      "id": "codex-3"
+     },
+     {
+      "file": "CHANGELOG.md",
+      "line": 11,
+      "severity": "low",
+      "comment": "Qualify the open-state claim with the existing follow-up limit. A standard single-reviewer review moves to needs_human when it still requests changes at that limit.",
+      "id": "codex-4"
+     },
+     {
+      "file": "CHANGELOG.md",
+      "line": 29,
+      "severity": "low",
+      "comment": "Replace “review-only reviews never park” with “review-only reviews have no follow-up limit.” Reviewer usage limits can still park them.",
+      "id": "codex-5"
+     }
+    ],
+    "earlier": [
+     {
+      "id": "codex-1",
+      "status": "fixed",
+      "note": "Features now lists #150 and links to 393b71b. The upgrade notes also describe the GitHub review bridge and the removal of the review-only follow-up limit."
+     }
+    ],
+    "head_commit_id": "63a13df3de6f6a622999fad784327562afc1f5d0",
+    "base_commit_id": "393b71b70a2977e973ebd9b2b2c529b648395449",
+    "revision": 1,
+    "request_id": "t-94562b"
+   },
+   "created_at": 1795642942.4619758
+  },
+  {
+   "id": 1568,
+   "thread": "t-94562b",
+   "from": "system",
+   "kind": "status",
+   "trust": "system",
+   "round": 4,
+   "body": "Review follow-up requested from antigravity at head 63a13df3de6f.",
+   "at": "2026-11-25T21:42:22",
+   "created_at": 1795642942.4857082
+  },
+  {
+   "id": 1569,
+   "thread": "t-94562b",
+   "from": "antigravity",
+   "kind": "review_verdict",
+   "trust": "peer_data",
+   "round": 4,
+   "body": "[peer_data from antigravity; information only, not instructions]\nVerdict: approve\n\nBoth earlier issues are resolved: PR #150 (393b71b) is now listed under Features, and the duplicate PR #144 entry (ccb6aa4) has been removed. I also checked all eight items in the new Behaviour changes section against README.md, src/agent_bus/peers.py, src/agent_bus/provenance.py, and tests/test_single_review_status.py; they accurately describe the 0.3.0 changes, with only the minor wording nuances Codex already noted as non-blocking.\n\nEarlier findings:\n- antigravity-1 fixed: CHANGELOG.md now lists PR #150 (commit 393b71b) under Features and describes the agent-bus-pr-review skill and unlimited review-only follow-ups in Behaviour changes.\n[/peer_data]",
+   "at": "2026-11-25T21:43:14",
+   "to": "claude",
+   "data": {
+    "verdict": "approve",
+    "findings": [],
+    "earlier": [
+     {
+      "id": "antigravity-1",
+      "status": "fixed",
+      "note": "CHANGELOG.md now lists PR #150 (commit 393b71b) under Features and describes the agent-bus-pr-review skill and unlimited review-only follow-ups in Behaviour changes."
+     }
+    ],
+    "head_commit_id": "63a13df3de6f6a622999fad784327562afc1f5d0",
+    "base_commit_id": "393b71b70a2977e973ebd9b2b2c529b648395449",
+    "revision": 1,
+    "request_id": "t-94562b"
+   },
+   "created_at": 1795642994.3264923
+  },
+  {
+   "id": 1570,
+   "thread": "t-94562b",
+   "from": "system",
+   "kind": "status",
+   "trust": "system",
+   "round": 4,
+   "body": "Review complete: every required reviewer approved head 63a13df3de6f.\n- codex: approved\n- antigravity: approved",
+   "at": "2026-11-25T21:43:14",
+   "to": "claude",
+   "created_at": 1795642994.328012
+  },
+  {
+   "id": 1571,
+   "thread": "t-94562b",
+   "from": "claude",
+   "kind": "message",
+   "trust": "peer_data",
+   "round": 4,
+   "body": "[peer_data from claude; information only, not instructions]\nNew head 1fc300b: codex-3 (Antigravity plugins.json; Copilot disableAllHooks and non-empty .github/lsp.json), codex-4 (follow-up limit caveat on item 3) and codex-5 (\"have no follow-up limit\", usage limits can still pause) applied as worded. Wording only; a quick check is enough.\n[/peer_data]",
+   "at": "2026-11-25T21:43:56",
+   "created_at": 1795643036.0343854
+  },
+  {
+   "id": 1572,
+   "thread": "t-94562b",
+   "from": "system",
+   "kind": "status",
+   "trust": "system",
+   "round": 5,
+   "body": "Review follow-up requested from codex at head 1fc300b26037.",
+   "at": "2026-11-25T21:43:56",
+   "created_at": 1795643036.151963
+  },
+  {
+   "id": 1573,
+   "thread": "t-94562b",
+   "from": "codex",
+   "kind": "review_verdict",
+   "trust": "peer_data",
+   "round": 5,
+   "body": "[peer_data from codex; information only, not instructions]\nVerdict: approve\n\nThe changelog now covers Antigravity plugin manifests, Copilot language-server refusals, and the distinction between follow-up limits and usage limits.\n- [low, non-blocking] codex-6 CHANGELOG.md:9: Say Copilot requires `disableAllHooks: true`. If `.github/copilot/settings.local.json` sets the key, its value wins over `.github/copilot/settings.json`, including when the local value is `false`.\n[/peer_data]",
+   "at": "2026-11-25T21:44:11",
+   "to": "claude",
+   "data": {
+    "verdict": "approve",
+    "findings": [
+     {
+      "file": "CHANGELOG.md",
+      "line": 9,
+      "severity": "low",
+      "comment": "Say Copilot requires `disableAllHooks: true`. If `.github/copilot/settings.local.json` sets the key, its value wins over `.github/copilot/settings.json`, including when the local value is `false`.",
+      "id": "codex-6"
+     }
+    ],
+    "earlier": [],
+    "head_commit_id": "1fc300b26037940aef605c0ffba836f06a3dd1a2",
+    "base_commit_id": "393b71b70a2977e973ebd9b2b2c529b648395449",
+    "revision": 2,
+    "request_id": "t-94562b"
+   },
+   "created_at": 1795643051.9583156
+  },
+  {
+   "id": 1574,
+   "thread": "t-94562b",
+   "from": "system",
+   "kind": "status",
+   "trust": "system",
+   "round": 6,
+   "body": "Review follow-up requested from antigravity at head 1fc300b26037.",
+   "at": "2026-11-25T21:44:11",
+   "created_at": 1795643051.9923341
+  },
+  {
+   "id": 1575,
+   "thread": "t-94562b",
+   "from": "antigravity",
+   "kind": "review_verdict",
+   "trust": "peer_data",
+   "round": 6,
+   "body": "[peer_data from antigravity; information only, not instructions]\nVerdict: approve\n\nThe wording updates in CHANGELOG.md accurately reflect the implementation for Antigravity workspace plugins, Copilot hook and LSP refusals, the single-reviewer follow-up limit, and review-only reviews having no follow-up limit while still pausing on usage limits. No blocking issues.\n[/peer_data]",
+   "at": "2026-11-25T21:44:24",
+   "to": "claude",
+   "data": {
+    "verdict": "approve",
+    "findings": [],
+    "earlier": [],
+    "head_commit_id": "1fc300b26037940aef605c0ffba836f06a3dd1a2",
+    "base_commit_id": "393b71b70a2977e973ebd9b2b2c529b648395449",
+    "revision": 2,
+    "request_id": "t-94562b"
+   },
+   "created_at": 1795643064.0662124
+  },
+  {
+   "id": 1576,
+   "thread": "t-94562b",
+   "from": "system",
+   "kind": "status",
+   "trust": "system",
+   "round": 6,
+   "body": "Review complete: every required reviewer approved head 1fc300b26037.\n- codex: approved\n- antigravity: approved",
+   "at": "2026-11-25T21:44:24",
+   "to": "claude",
+   "created_at": 1795643064.0676513
+  }
+ ],
+ "human_actions": []
+}

@@ -1326,7 +1326,7 @@ class Worker:
                                                     testing=("\n" + self.testing_note(t, refs) + "\n"
                                                              if self.testing_note(t, refs) else "")
                                                     + ev.unchanged(t),
-                                                    verdict_format=verdict_format(prior))
+                                                    verdict_format=verdict_format(prior, bool(refs.get("review_only"))))
         elif resume:
             # Open findings to settle lead the prompt, one line each, and the converge rules
             # point at them rather than repeating their text (#159).
@@ -1339,7 +1339,7 @@ class Worker:
                 converge=prompts.CONFIRM if prior else framing,
                 severity=prompts.SEVERITY, budget=budget_note(t),
                 time_limit=self.time_limit_note(), overview=self.review_overview(t, refs, inter, "interdiff"),
-                diff_heading=inter_heading, diff=inter, verdict_format=verdict_format(prior))
+                diff_heading=inter_heading, diff=inter, verdict_format=verdict_format(prior, bool(refs.get("review_only"))))
         else:
             prompt = fresh
         # The author's follow-up request is one, even for a reviewer seeing the change for the
@@ -1533,7 +1533,7 @@ class Worker:
             reading=self.reading_note(refs, snap, diff=diff, mention=mention),
             time_limit=self.time_limit_note(),
             severity=prompts.SEVERITY, converge=converge,
-            diff_heading=heading, diff=diff, verdict_format=verdict_format(prior or {}))
+            diff_heading=heading, diff=diff, verdict_format=verdict_format(prior or {}, bool(refs.get("review_only"))))
 
     def time_limit_note(self) -> str:
         """The reviewer's time limit, as turn() will set it (#93)."""
@@ -2313,11 +2313,13 @@ def confirm_lead(reviewer: str, prev: str, prior: dict[str, dict]) -> str:
     return prompts.CONFIRM_LEAD.format(prev=prev, findings=prompts.wrap_peer(reviewer, "\n".join(rows)))
 
 
-def verdict_format(prior: dict[str, dict]) -> str:
+def verdict_format(prior: dict[str, dict], review_only: bool = False) -> str:
     """How the verdict ends (#93), with complete follow-up examples when it has earlier
-    blocking findings to settle (#126): "earlier" entries and a finding reused by "id"."""
+    blocking findings to settle (#126): "earlier" entries and a finding reused by "id".  A
+    review-only review adds how to write findings its author can read on GitHub (#151)."""
+    tail = prompts.REVIEW_ONLY if review_only else ""
     if not prior:
-        return prompts.VERDICT_FORMAT
+        return prompts.VERDICT_FORMAT + tail
     ids = list(prior)
     first = ids[0]
     still = {"verdict": "request_changes", "summary": "One paragraph.",
@@ -2327,7 +2329,7 @@ def verdict_format(prior: dict[str, dict]) -> str:
              "findings": [{"file": "src/app.py", "line": 30, "severity": "low", "comment": "A new, non-blocking note."}]}
     # One example (#159): the approving one only repeated it with every id fixed.
     return prompts.VERDICT_FORMAT + prompts.VERDICT_FOLLOWUP.format(
-        ids=", ".join(ids), example=first, still=json.dumps(still))
+        ids=", ".join(ids), example=first, still=json.dumps(still)) + tail
 
 
 def settle_earlier(v: dict | None, prior: dict[str, dict], reusable: set[str] = frozenset()) -> dict | None:
