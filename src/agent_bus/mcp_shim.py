@@ -6,7 +6,9 @@ is a small line proxy that owns the client's stdio for the whole connection and 
 real server as a child.  When a client calls a tool while nothing else is in flight and
 the `agent-bus` on PATH has become a different build, the shim starts that build as a new
 child, replays the client's ``initialize`` handshake to it, and only then retires the old
-child and hands it the call.  The bus session is registered once, by the shim, and every
+child and hands it the call (on MCP's handshake-free 2026-07-28 protocol, which Claude Code
+speaks, there is no handshake: the shim asks it ``server/discover`` and re-opens the client's
+``subscriptions/listen`` streams on it).  The bus session is registered once, by the shim, and every
 child serves that same session, so read cursors, the threads it started and its hooks'
 binding to the client carry over.
 
@@ -36,6 +38,9 @@ from . import procinfo
 from .db import Bus
 
 SESSION_ENV = "AGENT_BUS_MCP_SESSION"
+# Set on the child too: the shim's log file, which the stale_build hint names (a shim from
+# before the log has none, so a child it started points at the client's MCP log instead).
+LOG_ENV = "AGENT_BUS_MCP_SHIM_LOG"
 # How long a move may hold the call that triggered it, in all: inside clients' 60 s tool
 # timeouts together with a 55 s wait.  A server starts in about half a second; a build that
 # takes longer is tried again later.  (The variable is for tests on loaded machines.)
@@ -49,6 +54,16 @@ SETTLES_ON_CANCEL = frozenset({"wait"})
 # The shim's own requests to a candidate child; their replies never reach the client.
 INIT_ID = "agent-bus-shim-initialize"
 LIST_ID = "agent-bus-shim-tools-list"
+DISCOVER_ID = "agent-bus-shim-discover"
+# MCP 2026-07-28 (handshake-free): every request carries the client's version, info and
+# capabilities in its _meta, and server notifications ride `subscriptions/listen` requests,
+# which stay open for the whole connection and are tagged with the listen request's id.
+MODERN_META_PREFIX = "io.modelcontextprotocol/"
+PROTOCOL_META = "io.modelcontextprotocol/protocolVersion"
+SUBSCRIPTION_META = "io.modelcontextprotocol/subscriptionId"
+LISTEN = "subscriptions/listen"
+LISTEN_ACK = "notifications/subscriptions/acknowledged"
+LOG_MAX_BYTES = 256 * 1024
 
 
 def resolve(harness: str, participant: str | None, config: cfg.Config) -> str:
@@ -135,8 +150,25 @@ def without_wrapper_dirs(path: str, added: set[str]) -> str:
     return os.pathsep.join(parts)
 
 
-def _log(text: str) -> None:
+_log_file: Path | None = None  # the session's shim log, once the shim runs
+
+
+def _log(text: str) -> bool:
+    """To stderr (which some clients don't keep) and to the session's shim log, kept to
+    about LOG_MAX_BYTES: one older file is kept beside it.  Whether the log took it."""
     print(f"agent-bus mcp: {text}", file=sys.stderr, flush=True)
+    if _log_file is None:
+        return False
+    try:
+        _log_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)  # as the workers' logs
+        if _log_file.exists() and _log_file.stat().st_size > LOG_MAX_BYTES:
+            os.replace(_log_file, _log_file.with_name(_log_file.name + ".1"))
+        fd = os.open(_log_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} pid {os.getpid()}: {text}\n")
+        return True
+    except OSError:
+        return False
 
 
 def _parse(line: bytes) -> list[dict]:
@@ -162,6 +194,51 @@ def _is_response(m: dict) -> bool:
     return "method" not in m and m.get("id") is not None and ("result" in m or "error" in m)
 
 
+def _modern_meta(m: dict) -> dict | None:
+    """The 2026-07-28 envelope (protocol version, client info and capabilities) a request
+    carries in its _meta, or None for a request without one."""
+    params = m.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    if not isinstance(meta, dict) or not isinstance(meta.get(PROTOCOL_META), str):
+        return None
+    return {k: v for k, v in meta.items() if k.startswith(MODERN_META_PREFIX)}
+
+
+def _stream_of(m: dict) -> str | None:
+    """The listen stream a server frame belongs to (its id, subscription tag or the request
+    it cancels), as a key."""
+    params = m.get("params") if isinstance(m.get("params"), dict) else {}
+    meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+    for rid in (m.get("id") if "method" not in m else None, meta.get(SUBSCRIPTION_META), params.get("requestId")):
+        if rid is not None:
+            return _key(rid)
+    return None
+
+
+def _covers(new: dict, old: dict) -> bool:
+    """Whether a listen stream honoring ``new`` delivers everything one honoring ``old`` did."""
+    for k, v in old.items():
+        if isinstance(v, list):
+            if not set(map(json.dumps, v)) <= set(map(json.dumps, new.get(k) or [])):
+                return False
+        elif v and not new.get(k):
+            return False
+    return True
+
+
+def _listen_ack(m: dict) -> Any:
+    """The listen request id a subscriptions-acknowledged notification answers, or None."""
+    if m.get("method") != LISTEN_ACK:
+        return None
+    meta = (m.get("params") or {}).get("_meta") if isinstance(m.get("params"), dict) else None
+    return meta.get(SUBSCRIPTION_META) if isinstance(meta, dict) else None
+
+
+class Mismatch(RuntimeError):
+    """A candidate that can't serve the client's current streams or envelope: tried again
+    once those change, not only when the installed build does."""
+
+
 class Child:
     """One server process of some build, serving the shim's session."""
 
@@ -170,6 +247,7 @@ class Child:
         self.proc = subprocess.Popen([exe, "mcp", *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
         self.replies: queue.Queue = queue.Queue()  # replies to the shim's own requests
         self.private: set[str] = set()  # the shim's own request ids not answered yet
+        self.acks: set[str] = set()     # client listen streams re-opened here, not acknowledged yet
         self.eof = False
         self._lock = threading.Lock()
         self._on_line, self._on_eof = on_line, on_eof
@@ -178,9 +256,17 @@ class Child:
     def _pump(self) -> None:
         for line in iter(self.proc.stdout.readline, b""):
             msgs = _parse(line)
-            if len(msgs) == 1 and _is_response(msgs[0]) and msgs[0]["id"] in self.private:
-                self.private.discard(msgs[0]["id"])
+            if len(msgs) == 1 and _is_response(msgs[0]) and _key(msgs[0]["id"]) in self.private:
+                self.private.discard(_key(msgs[0]["id"]))
+                self.acks.discard(_key(msgs[0]["id"]))
                 self.replies.put(msgs[0])
+                continue
+            sub = _listen_ack(msgs[0]) if len(msgs) == 1 else None
+            if sub is not None and _key(sub) in self.acks:
+                # The ack of a listen stream the shim re-opened here: the client has its own.
+                self.acks.discard(_key(sub))
+                self.private.discard(_key(sub))  # from now on, the stream's frames are the client's
+                self.replies.put({"id": sub, "ack": (msgs[0].get("params") or {}).get("notifications") or {}})
                 continue
             self._on_line(self, line, msgs)
         self.eof = True
@@ -194,7 +280,7 @@ class Child:
 
     def request(self, rid: str, method: str, params: Any, deadline: float) -> dict:
         """Send the shim's own request and wait for its reply until ``deadline``."""
-        self.private.add(rid)
+        self.private.add(_key(rid))
         self.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}).encode())
         while True:
             reply = self.replies.get(timeout=max(0.0, deadline - time.monotonic()))
@@ -206,6 +292,23 @@ class Child:
                 if not isinstance(reply.get("result"), dict):
                     raise RuntimeError(f"{method} returned no result")
                 return reply["result"]
+
+    def listen(self, request: dict, deadline: float) -> dict:
+        """Re-open one of the client's listen streams here, under the client's own request id
+        (its frames are tagged with it), and wait for the acknowledgement that opens it: the
+        notifications it honors."""
+        sub = request["id"]
+        self.acks.add(_key(sub))
+        self.private.add(_key(sub))  # a refusal comes back as a reply
+        self.write(json.dumps(request).encode())
+        while True:
+            reply = self.replies.get(timeout=max(0.0, deadline - time.monotonic()))
+            if reply is None:
+                raise RuntimeError("it exited")
+            if _key(reply["id"]) == _key(sub):
+                if "ack" in reply:
+                    return reply["ack"]
+                raise RuntimeError(f"{LISTEN} ended at once: {reply.get('error') or reply.get('result')}")
 
     def stop(self) -> None:
         """End it the way a client does (close stdin), then harder if it doesn't exit."""
@@ -245,9 +348,22 @@ class Shim:
         self.initialized: bytes | None = None    # and its notifications/initialized line
         self.protocol: str | None = None         # the protocol version the client agreed
         self.tools: list | None = None           # the tool list the client last saw
+        # A 2026-07-28 client (no initialize): the envelope of its latest request the server
+        # accepted (and of those in flight), and its listen streams, which stay open rather
+        # than being calls in flight: id -> {"request", "honored"} (None until acknowledged).
+        self.meta: dict | None = None
+        self.pending_meta: dict[str, dict] = {}
+        self.listens: dict[str, dict] = {}
+        # During a move: the candidate, and what it sent before taking over (passed on then).
+        self.candidate: Child | None = None
+        self.held: list[tuple[bytes, list[dict]]] = []
+        self.replayed: dict[str, Any] = {}       # the listen streams re-opened on it (key -> id)
+        self.last_skip: str | None = None        # why the last move didn't happen, as logged
         # A build that wouldn't start, and when to try it again (never, unless it timed
         # out): retried sooner only once the installed build changes.
+        # A Mismatch also names the listen streams it was tried with (a change retries it).
         self.failed: tuple[str, float] | None = None
+        self.failed_with: frozenset[str] | None = None
         self.closing = False
         self.child = self._spawn(exe)
 
@@ -256,6 +372,8 @@ class Shim:
     def _spawn(self, exe: str) -> Child:
         env = dict(os.environ)
         env[SESSION_ENV] = self.session_id
+        if _log_file is not None:
+            env[LOG_ENV] = str(_log_file)
         # The caller's PATH from before this build's Nix wrapper changed it, when the wrapper
         # recorded it: another build's wrapper adds its own bin and git/jj.
         caller = os.environ.get("AGENT_BUS_CALLER_PATH")
@@ -265,26 +383,44 @@ class Shim:
 
     def _from_child(self, child: Child, line: bytes, msgs: list[dict]) -> None:
         with self.lock:
+            if child is self.candidate:
+                self.held.append((line, msgs))  # its listen streams' frames, for after it takes over
+                return
             if child is not self.child:
-                return  # a candidate before it takes over, or a retired child
-            for m in msgs:
-                if _is_response(m):
-                    key = _key(m["id"])
-                    method = (self.in_flight.pop(key, None) or (None, None))[0]
-                    self.cancelled.discard(key)
-                    result = m.get("result")
-                    if method == "initialize" and isinstance(result, dict):
-                        # Tell the client the tool list can change, for after an upgrade.
-                        caps = result.setdefault("capabilities", {})
-                        tools = caps.get("tools")
-                        caps["tools"] = {**(tools if isinstance(tools, dict) else {}), "listChanged": True}
-                        self.protocol = result.get("protocolVersion")
-                        line = json.dumps(m).encode() + b"\n"
-                    elif method == "tools/list" and isinstance(result, dict) and isinstance(result.get("tools"), list):
-                        self.tools = result["tools"]
-                elif _is_request(m):
-                    self.server_pending.add(_key(m["id"]))
-            self._to_client(line)
+                return  # a failed candidate, or a retired child
+            self._from_server(line, msgs)
+
+    def _from_server(self, line: bytes, msgs: list[dict]) -> None:
+        """Pass on what the serving child sent, noting what it settles (under the lock)."""
+        for m in msgs:
+            sub = _listen_ack(m)
+            if sub is not None and _key(sub) in self.listens:
+                listen = self.listens[_key(sub)]
+                listen["honored"] = (m.get("params") or {}).get("notifications") or {}
+                self.meta = _modern_meta(listen["request"]) or self.meta
+            elif m.get("method") == "notifications/cancelled":  # the server ended a stream
+                self.listens.pop(_key((m.get("params") or {}).get("requestId")), None)
+            if _is_response(m):
+                key = _key(m["id"])
+                self.listens.pop(key, None)  # a listen stream the server ended
+                method = (self.in_flight.pop(key, None) or (None, None))[0]
+                self.cancelled.discard(key)
+                meta = self.pending_meta.pop(key, None)
+                if meta is not None and "result" in m:
+                    self.meta = meta  # an envelope this server accepted
+                result = m.get("result")
+                if method == "initialize" and isinstance(result, dict):
+                    # Tell the client the tool list can change, for after an upgrade.
+                    caps = result.setdefault("capabilities", {})
+                    tools = caps.get("tools")
+                    caps["tools"] = {**(tools if isinstance(tools, dict) else {}), "listChanged": True}
+                    self.protocol = result.get("protocolVersion")
+                    line = json.dumps(m).encode() + b"\n"
+                elif method == "tools/list" and isinstance(result, dict) and isinstance(result.get("tools"), list):
+                    self.tools = result["tools"]
+            elif _is_request(m):
+                self.server_pending.add(_key(m["id"]))
+        self._to_client(line)
 
     def _child_gone(self, child: Child) -> None:
         with self.lock:
@@ -319,6 +455,8 @@ class Shim:
             elif method == "notifications/cancelled":
                 key = _key((m.get("params") or {}).get("requestId"))
                 with self.lock:
+                    self.listens.pop(key, None)
+                    self.pending_meta.pop(key, None)
                     call = self.in_flight.pop(key, None)
                     if call is not None and call[1] not in SETTLES_ON_CANCEL:
                         self.cancelled.add(key)
@@ -326,8 +464,15 @@ class Shim:
                 if method == "tools/call":
                     self._maybe_swap()
                 tool = (m.get("params") or {}).get("name") if method == "tools/call" else None
+                meta = _modern_meta(m)
                 with self.lock:
-                    self.in_flight[_key(m["id"])] = (method, tool if isinstance(tool, str) else None)
+                    if method == LISTEN:
+                        # Open for the whole connection, not a call in flight: moved with the session.
+                        self.listens[_key(m["id"])] = {"request": m, "honored": None}
+                    else:
+                        self.in_flight[_key(m["id"])] = (method, tool if isinstance(tool, str) else None)
+                        if meta is not None:
+                            self.pending_meta[_key(m["id"])] = meta
             elif _is_response(m):
                 with self.lock:
                     self.server_pending.discard(_key(m["id"]))
@@ -339,19 +484,46 @@ class Shim:
     # ------------------------------------------------------------------ upgrades
 
     def _busy(self) -> bool:
+        return self._busy_reason() is not None
+
+    def _busy_reason(self) -> str | None:
         with self.lock:
-            return bool(self.in_flight or self.cancelled or self.server_pending)
+            parts = [f"{what} {sorted(ids)}" for what, ids in (
+                ("client requests in flight", [f"{k} ({m}{' ' + t if t else ''})" for k, (m, t) in self.in_flight.items()]),
+                ("cancelled calls not settled", self.cancelled),
+                ("server requests unanswered", self.server_pending),
+                ("listen streams not acknowledged", [k for k, v in self.listens.items() if v["honored"] is None]))
+                if ids]
+        return "; ".join(parts) or None
 
     def _probe(self, cand: Child, before: float, deadline: float) -> list:
-        """Hand the candidate the client's handshake and check it can take over: same
-        protocol, a tool list, and the shim's session taken up (not one of its own)."""
-        result = cand.request(INIT_ID, "initialize", self.init.get("params"), deadline)
-        if self.protocol and result.get("protocolVersion") != self.protocol:
-            raise RuntimeError(f"it speaks MCP {result.get('protocolVersion')}, the client {self.protocol}")
-        cand.write(self.initialized)
-        tools = cand.request(LIST_ID, "tools/list", {}, deadline).get("tools")
+        """Hand the candidate the client's handshake (or, on 2026-07-28, ask it what it
+        supports and re-open the client's listen streams on it) and check it can take over:
+        same protocol, a tool list, and the shim's session taken up (not one of its own)."""
+        if self.init is not None:
+            result = cand.request(INIT_ID, "initialize", self.init.get("params"), deadline)
+            if self.protocol and result.get("protocolVersion") != self.protocol:
+                raise RuntimeError(f"it speaks MCP {result.get('protocolVersion')}, the client {self.protocol}")
+            cand.write(self.initialized)
+            params: dict = {}
+        else:
+            meta = self.meta or {}
+            params = {"_meta": meta}
+            result = cand.request(DISCOVER_ID, "server/discover", params, deadline)
+            versions = result.get("supportedVersions")
+            if not isinstance(versions, list) or meta.get(PROTOCOL_META) not in versions:
+                raise Mismatch(f"it speaks MCP {versions}, the client {meta.get(PROTOCOL_META)}")
+        tools = cand.request(LIST_ID, "tools/list", params, deadline).get("tools")
         if not isinstance(tools, list):
             raise RuntimeError("tools/list returned no tools")
+        with self.lock:
+            listens = list(self.listens.items())
+        self.replayed = {key: listen["request"]["id"] for key, listen in listens}
+        for key, listen in listens:
+            honored = cand.listen(listen["request"], deadline)
+            if not _covers(honored, listen["honored"] or {}):
+                raise Mismatch(f"it honors {honored} on listen stream {key}, the current build "
+                                   f"{listen['honored']}")
         # A build that serves SESSION_ENV touches the session at startup; the old child is
         # idle, so a later last_seen is the candidate's.  One from before the shim registers
         # a session of its own instead.
@@ -363,28 +535,50 @@ class Shim:
     def _maybe_swap(self) -> None:
         """Before forwarding a tool call: move onto the installed build if it changed and
         nothing is in flight.  Never resends or drops a message: the call is forwarded
-        once, to whichever child serves after this.  Only for a client that opened the
-        session with ``initialize`` (a client on MCP's newer handshake-free protocol stays
-        on its build, as before)."""
-        if self.init is None or self.initialized is None or self._busy():
-            return
+        once, to whichever child serves after this.  When it doesn't move, the shim log
+        says why (once per reason)."""
         target = cfg.installed()
-        if not target or os.path.islink(target):  # mid-switch: the profile link is being replaced
+        if not target:
             return
-        if self.failed and self.failed[0] != target:
-            self.failed = None  # the install changed since: a later fix of that build is tried
-        if target == self.child.exe or (self.failed and time.monotonic() < self.failed[1]) or not enabled():
+        self._forget_failure(target)
+        if target == self.child.exe:
+            self.last_skip = None
             return
+        before = None
+        if os.path.islink(target):  # mid-switch: the profile link is being replaced
+            why = f"the installed {target} is mid-switch"
+        elif self.init is None and self.meta is None:
+            why = "the client opened the connection with neither initialize nor a 2026-07-28 request"
+        elif self.init is not None and self.initialized is None:
+            why = "the client hasn't sent notifications/initialized"
+        elif self.failed and time.monotonic() < self.failed[1]:
+            why = ("it didn't start before; tried again once the installed build changes"
+                   if self.failed[1] == float("inf")
+                   else "it was slow to start before; tried again after " +
+                   time.strftime("%H:%M:%S", time.localtime(time.time() + self.failed[1] - time.monotonic())))
+        elif not enabled():
+            why = "auto_restart_mcp is off"
+        elif (busy := self._busy_reason()) is not None:
+            why = f"busy: {busy}"
+        elif (before := last_seen(self.session_id)) is None:
+            why = "can't read the session's last_seen from the bus"  # so can't tell whether a candidate takes it up
+        else:
+            why = None
+        if why is not None:
+            if why != self.last_skip:  # once per reason, not on every call
+                _log(f"not moving to the installed build {target} yet: {why}")
+                self.last_skip = why
+            return
+        self.last_skip = None
         deadline = time.monotonic() + SWAP_DEADLINE_S
-        before = last_seen(self.session_id)
-        if before is None:
-            return  # can't read the bus now, so can't tell whether a candidate takes the session up
         try:
-            cand = self._spawn(target)
+            with self.lock:
+                self.candidate = cand = self._spawn(target)
         except OSError as e:
             _log(f"can't start the installed build {target}: {e}")
-            self.failed = (target, float("inf"))
+            self._fail(target, float("inf"))
             return
+        self.replayed = {}
         # The whole probe runs on a thread so that one deadline bounds every step of it
         # (a candidate that never reads its stdin blocks a write); killing the candidate
         # unblocks the thread.
@@ -404,8 +598,8 @@ class Shim:
         if timed_out or isinstance(error, queue.Empty):
             _log(f"staying on {self.child.exe} for now: the installed build {target} didn't start "
                  f"within {SWAP_DEADLINE_S:g} s")
-            self.failed = (target, time.monotonic() + RETRY_AFTER_TIMEOUT_S)
-            cand.kill()
+            self._fail(target, time.monotonic() + RETRY_AFTER_TIMEOUT_S)
+            self._drop_candidate(cand)
             return
         with self.lock:
             # Checked under the lock its reader takes at EOF, so a candidate that exits now
@@ -413,29 +607,70 @@ class Shim:
             if error is None and (cand.eof or cand.proc.poll() is not None):
                 error = RuntimeError("it exited")
             if error is None:
-                old, self.child = self.child, cand
+                old, self.child, self.candidate = self.child, cand, None
+                # A stream the old build ended after the candidate re-opened it (the client
+                # has its end): closed on the candidate too, and nothing more is sent on it.
+                gone = {key: rid for key, rid in self.replayed.items() if key not in self.listens}
+                # What it sent on the other listen streams meanwhile goes to the client first.
+                held, self.held = self.held, []
+                for line, msgs in held:
+                    if not any(_stream_of(m) in gone for m in msgs):
+                        self._from_server(line, msgs)
         if error is not None:
             _log(f"staying on {self.child.exe}: the installed build {target} didn't start: {error}")
-            self.failed = (target, float("inf"))
-            cand.kill()
+            self._fail(target, float("inf"), error)
+            self._drop_candidate(cand)
             return
+        for rid in gone.values():
+            try:
+                cand.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                       "params": {"requestId": rid}}).encode())
+            except OSError:
+                pass
         tools = box["tools"]
         # Off the call's path: the old child ends the way a client ends it.
         threading.Thread(target=old.stop, daemon=True).start()
         _log(f"moved from {old.exe} to the installed build {target}")
         changed = self.tools is not None and tools != self.tools
         self.tools = tools
-        if changed:
+        if changed and self.init is not None:
             self._to_client(json.dumps({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}).encode())
+        elif changed:  # 2026-07-28: on each listen stream that asked for it, tagged with its id
+            with self.lock:
+                listens = list(self.listens.values())
+            for listen in listens:
+                if (listen["honored"] or {}).get("toolsListChanged"):  # as the server agreed
+                    self._to_client(json.dumps({"jsonrpc": "2.0", "method": "notifications/tools/list_changed",
+                                                "params": {"_meta": {SUBSCRIPTION_META: listen["request"]["id"]}}}).encode())
+
+    def _forget_failure(self, target: str) -> None:
+        """Forget a failed build once the install changed (a later fix of it is tried), or,
+        for one that couldn't serve the client's streams, once those changed."""
+        if self.failed and (self.failed[0] != target or
+                            (self.failed_with is not None and self.failed_with != frozenset(self.listens))):
+            self.failed = self.failed_with = None
+
+    def _fail(self, target: str, until: float, error: BaseException | None = None) -> None:
+        self.failed = (target, until)
+        self.failed_with = frozenset(self.listens) if isinstance(error, Mismatch) else None
+
+    def _drop_candidate(self, cand: Child) -> None:
+        with self.lock:
+            self.candidate, self.held = None, []
+        cand.kill()
 
 
 def main(harness: str, role: str | None, participant: str | None) -> int:
+    global _log_file
     agent = resolve(harness, participant, cfg.Config.load())
     bus = Bus()
     try:
         session_id = register(bus, harness, agent, role)
     finally:
         bus.close()
+    _log_file = cfg.shim_log_path(session_id)
+    if not _log(f"session {session_id} for {harness}, serving {cfg._LAUNCHED_FROM}"):
+        _log_file = None  # can't keep one: the hint points at the client's MCP log instead
     args = ["--agent", harness] + (["--participant", participant] if participant else []) + \
         (["--role", role] if role else [])
     try:

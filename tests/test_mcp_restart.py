@@ -199,7 +199,7 @@ def test_no_swap_while_a_call_is_in_flight(env, installs):
     me = client.call("whoami")
     tid = client.call("send", to="codex", body="hi")["thread"]["id"]
     client.call("wait", thread=tid, timeout_s=1)  # nothing left unread: the next wait blocks
-    waiting = client.request("tools/call", {"name": "wait", "arguments": {"thread": tid, "timeout_s": 8}})
+    waiting = client.request("tools/call", {"name": "wait", "arguments": {"thread": tid, "timeout_s": 15}})
     installs["switch"](make_build(installs["tmp"], "new", installs["log"]))
     during = client.call("whoami")
     assert during["session_id"] == me["session_id"]
@@ -227,8 +227,9 @@ def bare_shim():
     shim = mcp_shim.Shim.__new__(mcp_shim.Shim)
     shim.lock = threading.Lock()
     shim.in_flight, shim.server_pending, shim.cancelled = {}, set(), set()
-    shim.init = shim.initialized = None
-    shim.child = type("C", (), {"write": lambda self, line: None})()
+    shim.init = shim.initialized = shim.meta = shim.failed = shim.failed_with = shim.last_skip = None
+    shim.listens, shim.pending_meta, shim.candidate, shim.held = {}, {}, None, []
+    shim.child = type("C", (), {"write": lambda self, line: None, "exe": "/x/agent-bus"})()
     return shim
 
 
@@ -252,7 +253,7 @@ def test_a_cancelled_synchronous_call_keeps_the_session_on_its_server():
 
 def test_a_client_id_like_the_shims_own_is_answered(env, installs):
     client, _ = installs["connect"]()
-    for rid in (mcp_shim.INIT_ID, mcp_shim.LIST_ID):
+    for rid in (mcp_shim.INIT_ID, mcp_shim.LIST_ID, mcp_shim.DISCOVER_ID):
         client.send({"jsonrpc": "2.0", "id": rid, "method": "tools/call",
                      "params": {"name": "which_build", "arguments": {}}})
         assert client.response(rid, timeout=30)["result"]["content"][0]["text"] == "old"
@@ -442,3 +443,182 @@ def test_children_get_the_callers_path_when_the_wrapper_recorded_it(env, monkeyp
     mcp_shim.Shim(["--agent", "claude"], "s-1", "/x/agent-bus")
     assert seen["PATH"] == "/nix/store/jj/bin:/usr/bin" and seen[mcp_shim.SESSION_ENV] == "s-1"
 
+
+
+DATA = Path(__file__).resolve().parent / "data" / "mcp"
+
+
+def recorded(name: str) -> list[dict]:
+    """A real client's messages to `agent-bus mcp`, as recorded through a tee (ids sanitized)."""
+    return [json.loads(line) for line in (DATA / name).read_text().splitlines()]
+
+
+def replay_until_last_call(client: Client, msgs: list[dict]) -> dict:
+    """Send a recorded session up to its last tools/call, answering nothing the client
+    doesn't wait for (a listen stream stays open); returns that last call."""
+    calls = [m for m in msgs if m.get("method") == "tools/call"]
+    for m in msgs:
+        if m is calls[-1]:
+            return m
+        client.send(m)
+        if m.get("id") is not None and m["method"] != "subscriptions/listen":
+            res = client.response(m["id"], timeout=60)
+            assert "result" in res, res
+            if m["method"] == "tools/call":
+                assert "stale_build" not in res["result"]["structuredContent"]
+    raise AssertionError("no tools/call recorded")
+
+
+def call_like(client: Client, model: dict, rid, name: str, **arguments) -> dict:
+    """A tools/call in the shape (envelope included) the recorded client sends."""
+    msg = json.loads(json.dumps(model))
+    msg["id"], msg["params"]["name"], msg["params"]["arguments"] = rid, name, arguments
+    client.send(msg)
+    return client.response(rid, timeout=60)
+
+
+@pytest.mark.parametrize("name", ["claude-code-2.1.332.jsonl", "codex-0.172.0.jsonl"])
+def test_a_recorded_clients_session_moves(env, installs, name):
+    """The #139 follow-up: Claude Code 2.1.332 speaks MCP 2026-07-28 (no initialize; a
+    `subscriptions/listen` request open for the whole connection), and its session never
+    moved. Replayed from a real recording, it moves at its next idle call, and the changed
+    tool list is announced on its listen stream; Codex's initialize session still moves."""
+    msgs = recorded(name)
+    modern = msgs[0]["method"] == "server/discover"
+    client = Client([str(installs["link"]), "mcp", "--agent", "claude"], dict(os.environ))
+    last = replay_until_last_call(client, msgs)
+    if modern:  # the listen stream is open, and acknowledged by the old build
+        assert [n for n in client.notes if n.get("method") == "notifications/subscriptions/acknowledged"]
+    installs["switch"](make_build(installs["tmp"], "new", installs["log"], extra_tool=True))
+    client.send(last)
+    res = client.response(last["id"])["result"]["structuredContent"]
+    assert "stale_build" not in res
+    assert [b[0] for b in installs["started"]()] == ["old", "new"]
+    assert call_like(client, last, 900, "which_build")["result"]["content"][0]["text"] == "new"
+    changed = [n for n in client.notes if n.get("method") == "notifications/tools/list_changed"]
+    if modern:
+        # Tagged with the listen request's id, as 2026-07-28 requires; the new build's ack of
+        # the re-opened stream isn't passed on (the client already has one).
+        assert [n["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] for n in changed] == ["listen:0"]
+        assert len([n for n in client.notes if n.get("method") == "notifications/subscriptions/acknowledged"]) == 1
+    else:
+        assert len(changed) == 1 and "params" not in changed[0]
+    log = cfg.shim_log_path(res["session_id"]).read_text()
+    assert "moved from" in log and "new" in log
+    assert client.close() == 0
+
+
+def test_the_shim_log_says_why_it_did_not_move(env, installs):
+    """A move held back by a call in flight is logged with that call's id, once; the
+    listen stream isn't counted as one, and the stale_build hint names the log."""
+    msgs = recorded("claude-code-2.1.332.jsonl")
+    client = Client([str(installs["link"]), "mcp", "--agent", "claude"], dict(os.environ))
+    last = replay_until_last_call(client, msgs)
+    tid = call_like(client, last, 901, "send", to="codex", body="hi")["result"]["structuredContent"]["thread"]["id"]
+    call_like(client, last, 902, "wait", thread=tid, timeout_s=1)
+    waiting = json.loads(json.dumps(last))
+    waiting["id"], waiting["params"]["name"], waiting["params"]["arguments"] = 903, "wait", {"thread": tid, "timeout_s": 50}
+    client.send(waiting)
+    installs["switch"](make_build(installs["tmp"], "new", installs["log"]))
+    for rid in (904, 905):
+        during = call_like(client, last, rid, "whoami")["result"]["structuredContent"]
+        assert "moves onto the installed build by itself" in during["stale_build"]["hint"]
+    path = cfg.shim_log_path(during["session_id"])
+    assert str(path) in during["stale_build"]["hint"]
+    skips = [line for line in path.read_text().splitlines() if "not moving" in line]
+    assert len(skips) == 1 and "903 (tools/call wait)" in skips[0] and "listen" not in skips[0]
+    # A cancelled wait settles at once (no timing to race on a loaded machine): the next call moves.
+    client.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 903}})
+    assert call_like(client, last, 906, "which_build")["result"]["content"][0]["text"] == "new"
+    client.close()
+
+
+def test_listen_streams_and_envelopes_follow_what_the_server_accepted():
+    """Review of #167: an unacknowledged listen holds a move; a stream the server ends (by
+    reply or notifications/cancelled) is forgotten; the probe's envelope is one the serving
+    build accepted; and a candidate's frames wait until it takes over."""
+    import io
+    shim = bare_shim()
+    shim.out_lock, shim.stdout = threading.Lock(), io.BytesIO()
+    good = {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
+    bad = {"io.modelcontextprotocol/protocolVersion": "1999-01-01"}
+
+    def client(msg):
+        shim._from_client(json.dumps(msg).encode())
+
+    def server(msg, child=None):
+        shim._from_child(child or shim.child, json.dumps(msg).encode(), [msg])
+
+    client({"jsonrpc": "2.0", "id": "listen:0", "method": "subscriptions/listen",
+            "params": {"_meta": good, "notifications": {"toolsListChanged": True}}})
+    assert "listen streams not acknowledged ['listen:0']" in shim._busy_reason()
+    server({"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+            "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": "listen:0"},
+                       "notifications": {"toolsListChanged": True}}})
+    assert not shim._busy() and shim.listens["listen:0"]["honored"] == {"toolsListChanged": True}
+    assert shim.meta == good
+    # A call the server refuses doesn't become the envelope a candidate is probed with.
+    client({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": bad}})
+    server({"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "unsupported version"}})
+    assert shim.meta == good
+    # The server ends the stream with a cancellation (no reply on stdio): it's gone.
+    server({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "listen:0"}})
+    assert shim.listens == {}
+    # A candidate's frames are held, not dropped or passed on, until it takes over.
+    cand = object()
+    shim.candidate = cand
+    sent = shim.stdout.getvalue()
+    server({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}, child=cand)
+    assert len(shim.held) == 1 and shim.stdout.getvalue() == sent
+
+
+def test_a_candidate_must_honor_what_the_stream_was_promised():
+    assert mcp_shim._covers({"toolsListChanged": True, "resourcesListChanged": True}, {"toolsListChanged": True})
+    assert not mcp_shim._covers({}, {"toolsListChanged": True})
+    assert mcp_shim._covers({"resourceSubscriptions": ["a", "b"]}, {"resourceSubscriptions": ["a"]})
+    assert not mcp_shim._covers({"resourceSubscriptions": ["b"]}, {"resourceSubscriptions": ["a"]})
+
+
+def test_the_shim_log_is_private(tmp_path, monkeypatch):
+    log = tmp_path / "state" / "logs" / "mcp-shim-s-1.log"
+    monkeypatch.setattr(mcp_shim, "_log_file", log)
+    old = os.umask(0o022)
+    try:
+        mcp_shim._log("hello")
+    finally:
+        os.umask(old)
+    assert log.parent.stat().st_mode & 0o777 == 0o700 and log.stat().st_mode & 0o777 == 0o600
+    assert "hello" in log.read_text()
+
+
+def test_the_hint_names_the_shim_log_only_when_the_shim_keeps_one(monkeypatch):
+    monkeypatch.setattr(cfg, "_LAUNCHED_FROM", "/old/bin/agent-bus")
+    monkeypatch.setattr(cfg, "installed", lambda: "/new/bin/agent-bus")
+    assert "/x/mcp-shim-s-1.log says why" in cfg.stale_build(True, shim_log="/x/mcp-shim-s-1.log")["hint"]
+    assert "client's MCP log" in cfg.stale_build(True)["hint"]
+
+
+def test_a_build_that_cannot_serve_the_streams_is_retried_once_they_change():
+    """codex-7: a candidate refused for the client's listen streams isn't written off for
+    good: once those streams change, the same build is tried again (an ordinary failure
+    still waits for the install to change)."""
+    shim = bare_shim()
+    shim.listens = {"listen:0": {"request": {"id": "listen:0"}, "honored": {"toolsListChanged": True}}}
+    shim._fail("/new", float("inf"), mcp_shim.Mismatch("narrower filter"))
+    shim._forget_failure("/new")
+    assert shim.failed is not None
+    shim.listens = {}  # the client ended that stream
+    shim._forget_failure("/new")
+    assert shim.failed is None
+    shim._fail("/new", float("inf"), RuntimeError("it exited"))
+    shim.listens = {"listen:1": {}}
+    shim._forget_failure("/new")
+    assert shim.failed is not None
+
+
+def test_held_frames_of_a_stream_the_old_build_ended_are_dropped():
+    assert mcp_shim._stream_of({"jsonrpc": "2.0", "method": "notifications/tools/list_changed",
+                                "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": 7}}}) == "7"
+    assert mcp_shim._stream_of({"jsonrpc": "2.0", "id": "listen:0", "result": {}}) == "listen:0"
+    assert mcp_shim._stream_of({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                "params": {"requestId": "listen:0"}}) == "listen:0"

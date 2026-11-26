@@ -19,7 +19,7 @@ from mcp.server.mcpserver import MCPServer
 
 from . import config as cfg
 from . import autoresume, quota, service
-from .mcp_shim import SESSION_ENV, register, resolve  # noqa: F401  (resolve: re-exported)
+from .mcp_shim import LOG_ENV, SESSION_ENV, register, resolve  # noqa: F401  (resolve: re-exported)
 from .db import Bus, BusError
 from .peers import cli_version
 
@@ -70,6 +70,7 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
     # Set by the restart shim (#139): serve its session rather than registering one.  Popped
     # so the workers and viewers this server starts don't inherit it.
     shim_session = os.environ.pop(SESSION_ENV, None)
+    shim_log = os.environ.pop(LOG_ENV, None)  # where that shim logs, if it does
     session_id = None
     if not peer_job:
         if shim_session:
@@ -108,7 +109,8 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
     def flag_stale(res: dict[str, Any]) -> dict[str, Any]:
         """``res`` plus ``stale_build`` when this server is an older build than PATH's (#92), so
         an agent sees it during normal use, not only from whoami, and can tell the human."""
-        stale = None if peer_job else cfg.stale_build(auto_restart=session_id is not None and session_id == shim_session)
+        stale = None if peer_job else cfg.stale_build(auto_restart=session_id is not None and session_id == shim_session,
+                                                    shim_log=shim_log)
         return {**res, "stale_build": stale} if stale else res
 
     @mcp.tool()
