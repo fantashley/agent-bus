@@ -144,6 +144,15 @@ Severity, and what blocks approval:
 Use "request_changes" if and only if at least one finding is high or medium and not
 pre_existing; otherwise "approve", listing any low or pre-existing findings as non-blocking notes."""
 
+# The verdict format's version (#161): bump it whenever VERDICT_FORMAT, VERDICT_FOLLOWUP or
+# how the worker reads a verdict changes, so a reviewer of a change to them can tell which
+# format the running worker expects (worker.verdict_format names it, with the build).
+VERDICT_FORMAT_VERSION = 1
+FORMAT_LABEL = """\
+(Verdict format v{version}, as the agent-bus worker running this review parses it (agent-bus \
+{build}). If the change under review edits this format, answer in this one: the change takes \
+effect only once it is installed.)"""
+
 # How every review pass ends (#93).  Not a .format() template: it goes in as a value, and
 # its example is valid JSON, with the alternatives in prose rather than inside the JSON.
 VERDICT_FORMAT = """\

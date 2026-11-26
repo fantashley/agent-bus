@@ -352,7 +352,7 @@ class Service:
                 continue
             if kind == "turn_start":
                 turns[agent] = {"state": "working", "start": e["created_at"], "end": None, "last": e,
-                                "tool_calls": 0, "api_retries": 0, "errors": 0}
+                                "tool_calls": 0, "failed_tool_calls": 0, "api_retries": 0, "errors": 0}
                 continue
             turn = turns.get(agent)
             if turn is None:
@@ -363,6 +363,8 @@ class Service:
                 turn["end"] = e["created_at"]
             elif kind == "tool":
                 turn["tool_calls"] += 1
+            elif kind == "tool_failed":
+                turn["failed_tool_calls"] += 1
             elif kind == "api_retry":
                 turn["api_retries"] += 1
             elif kind == "error":
@@ -375,7 +377,7 @@ class Service:
             out = {"state": state, "turn_elapsed_s": round((turn["end"] or now) - turn["start"]),
                    "last_event": turn["last"]["kind"], "last_event_age_s": round(now - turn["last"]["created_at"]),
                    "tool_calls": turn["tool_calls"]}
-            out.update({k: turn[k] for k in ("api_retries", "errors") if turn[k]})
+            out.update({k: turn[k] for k in ("failed_tool_calls", "api_retries", "errors") if turn[k]})
             peers[agent] = out
         return {"job": info, "peers": peers}
 

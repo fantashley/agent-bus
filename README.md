@@ -237,7 +237,9 @@ same things in parallel:
   directories, and the prompt says so; over that too, or with `max_snapshot_bytes` set to 0,
   there is none and the prompt says files on disk may not match. Codex also gets copyable
   read-only `git` (and `jj`) commands for the pinned commits' history. The prompt
-  states the turn's time limit, and that only the JSON verdict is posted.
+  states the turn's time limit, and that only the JSON verdict is posted. It names the verdict
+  format's version and the running build (`Verdict format v1 … agent-bus 0.3.0, <store item>`),
+  so a reviewer of a change to the format can tell which one the running worker expects.
 - A verdict counts only for the base and head it was given on. **Any new head (or a new base)
   makes every earlier approval stale**, so the review is complete (the thread resolves) once
   every required reviewer has approved the same base..head. Re-reviews are follow-ups, so
@@ -575,8 +577,18 @@ turns on it and tells you when it should be back. This was agreed on agent-bus t
   ```sh
   agent-bus usage                    # the last 24 hours, per agent and per thread
   agent-bus usage --hours 168 --agent codex --json
-  agent-bus usage --thread t-1a2b3c
+  agent-bus usage --thread t-1a2b3c   # a review's also per pass
   ```
+
+  For a review thread, `--thread` also lists each pass (one reviewer's turns in one job: its
+  pass plus any repair turn) with its uncached and cached input and output, oldest first, and
+  a note when its counts are short (only a session total, counted in part). A pass is labelled
+  by its verdict, as the follow-up budget counts them: `first pass`, `confirm-only` (no
+  blocking finding), `still blocking` (only findings its previous verdict left open) or `new
+  blocker` (a high or medium finding with another id). Why each turn ran is also recorded as
+  the `purpose` of its `turn_start` event: `pass`, `repair`, `retry` (a pass or round run
+  again after an earlier turn of it gave nothing) or `debrief`, empty on events from before it
+  was recorded. So repair and retry counts are one query on the bus's `events` table.
 
   Claude reports each turn's own tokens. Codex (`exec resume`) and Antigravity (a resumed
   `--conversation`) report the whole session's running total instead, checked live on codex
@@ -901,7 +913,11 @@ documents each.
 `tail <thread> --events --once` is also what agents run to see whether a peer is still working.
 `--events-only` prints just the event lines for tools, turns, errors and retries (no header,
 messages, or the peers' streamed text and thinking), so grepping them for denials, timeouts or
-retries doesn't match what the peers wrote.
+retries doesn't match what the peers wrote. A tool call that failed, where the CLI's stream
+says so, gets a `tool_failed` line after its `tool` line: a Claude tool result marked as an
+error, a Codex command that exited non-zero or was declined (or a failed MCP call or file
+change), an Antigravity tool step that ended in `ERROR`, and a Copilot tool that reported no
+success. Event text is printed on one line, with line breaks and control characters escaped.
 
 ## Notifications: `agent-bus stream`
 
