@@ -409,3 +409,26 @@ def test_a_confirmation_pass_leads_with_the_open_findings(env, no_spawn, monkeyp
     assert f"use the read-only git commands from your first\npass with base {base} and head {h2}" in p
     assert "git -C" not in p and "git -C" in first
     assert "--no-replace-objects show" not in p and "For history and the other pinned commits:" in first
+
+
+def test_a_review_only_review_asks_for_findings_the_author_can_read_on_github(env, no_spawn, monkeypatch):
+    """#151: a review-only review's findings may be posted to a PR author who never sees the
+    thread, on every pass (first and resumed follow-up); a normal review's prompts don't say so."""
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    plain = claude.request_review("codex", str(repo), base, h1)["thread"]["id"]
+    run_job(bus, plain)
+    assert "review-only" not in calls(env)[-1]["prompt"]
+    tid = claude.request_review(None, str(repo), base, h1, reviewers=BOTH, review_only=True)["thread"]["id"]
+    run_job(bus, tid)
+    h2 = commit("two\n")
+    claude.request_review(None, str(repo), base, h2, prev_head_commit_id=h1, reviewers=BOTH, thread=tid)
+    run_job(bus, tid)
+    review_only = [c["prompt"] for c in calls(env)[1:]]
+    assert len(review_only) == 4 and any("Your open blocking findings" in p for p in review_only)
+    for p in review_only:
+        assert "never sees this thread" in p and "no other reviewers' finding ids" in p
+        assert "head-side line inside a diff hunk" in p and "in 2-4 sentences" in p
+        no_doubled_braces(p)

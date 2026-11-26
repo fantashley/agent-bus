@@ -173,6 +173,14 @@ severity, file or line on this head. A new finding has no "id" (agent-bus number
 If every earlier finding is fixed or withdrawn and you have no new blocking finding, list each
 so in "earlier" and approve."""
 
+# Added to the verdict format on a review-only review (#151): its findings may be relayed as
+# GitHub comments to an author who never sees the bus thread.
+REVIEW_ONLY = """
+This review is review-only: your findings may be posted as GitHub comments to the change's author,
+who never sees this thread. Make each finding self-contained (no other reviewers' finding ids, no
+earlier rounds), on a head-side line inside a diff hunk when you can, and about one issue: what
+breaks, a concrete trigger and the smallest fix, in 2-4 sentences."""
+
 # How a reviewer can read the pinned head (#93).  The repository's working copy is whatever
 # its owner has checked out, which can differ from the pinned head.
 READ_HEAD_SHELL = """

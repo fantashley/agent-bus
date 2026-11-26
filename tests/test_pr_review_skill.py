@@ -806,3 +806,222 @@ def test_a_finding_fixed_while_its_reopening_is_pending_gets_resolved(tmp_path, 
     mutations = [a for c in calls(log) for a in c["args"] if "ReviewThread(" in a]
     assert mutations and all("unresolveReviewThread" not in m for m in mutations)
     assert "unresolve" not in prr.load(path)["findings"]["codex-1"]
+
+
+# ------------------------------------------------------------------ helper: shared comments (#151)
+
+# A real review-only thread (sanitized `agent-bus history --json`): a release PR's changelog, where
+# codex and antigravity both raised the same two issues at the same lines on the first head.
+REAL = json.loads((ROOT / "tests" / "data" / "pr-review" / "relay-history.json").read_text())
+REAL_BASE = REAL["review"]["reviewers"]["codex"]["base_commit_id"]
+CL_DIFF = ("diff --git a/CHANGELOG.md b/CHANGELOG.md\n--- a/CHANGELOG.md\n+++ b/CHANGELOG.md\n"
+           "@@ -0,0 +1,50 @@\n" + "".join(f"+line {i}\n" for i in range(1, 51)))
+
+
+def real_at(last_id):
+    """The real thread as `history --json` showed it after message ``last_id``."""
+    msgs = [m for m in REAL["messages"] if m["id"] <= last_id]
+    verdicts = [m for m in msgs if m["kind"] == "review_verdict"]
+    head = verdicts[-1]["data"]["head_commit_id"]
+    reviewers = {}
+    for m in verdicts:
+        d = m["data"]
+        state = ("approved" if d["verdict"] == "approve" else "changes_requested") \
+            if d["head_commit_id"] == head else "stale"
+        reviewers[m["from"]] = {"state": state, "verdict": d["verdict"], "head_commit_id": d["head_commit_id"],
+                                "base_commit_id": d["base_commit_id"]}
+    return {**REAL, "thread": {**REAL["thread"], "passes": len(verdicts)}, "messages": msgs,
+            "review": {**REAL["review"], "head_commit_id": head, "reviewers": reviewers, "passes": len(verdicts)}}
+
+
+def test_findings_at_one_line_share_a_comment_and_settle_by_id(tmp_path, monkeypatch):
+    """Both reviewers flagged CHANGELOG.md:10 (and :45): one comment each, tagged with both ids and
+    carrying both texts and markers; the next head settles each id on that one thread."""
+    first, second = real_at(1564), real_at(1570)
+    h1, h2 = first["review"]["head_commit_id"], second["review"]["head_commit_id"]
+    state = {**new_state(h1), "thread": REAL["thread"]["id"], "base": REAL_BASE}
+    d = prr.build_draft(state, first, CL_DIFF)
+    by = {(c["path"], c["line"]): c["body"] for c in d["review"]["comments"]}
+    assert set(by) == {("CHANGELOG.md", 10), ("CHANGELOG.md", 45)}
+    shared = by[("CHANGELOG.md", 10)]
+    assert shared.startswith("**[codex-1, antigravity-1]**\n\n**codex-1** (codex; medium, blocking) Add #150")
+    assert "\n\n**antigravity-1** (antigravity; medium, blocking) Add PR #150" in shared
+    assert shared.endswith("<!-- agent-bus-finding: codex-1 -->\n<!-- agent-bus-finding: antigravity-1 -->")
+    assert prr.own_markers(shared) == ["codex-1", "antigravity-1"]
+    assert prr.own_markers(by[("CHANGELOG.md", 45)]) == ["codex-2", "antigravity-2"]
+    assert "Blocking: `codex-1`, `antigravity-1`." in d["review"]["body"]
+    # Posted: both ids point at the one comment.
+    monkeypatch.setenv("AGENT_BUS_PR_STATE_DIR", str(tmp_path / "state"))
+    log, world = fake_gh(tmp_path, monkeypatch, head=h1, merge_base=REAL_BASE)
+    path = tmp_path / "state" / "s.json"
+    prr.save(path, state)
+    prr.post(path, tmp_path / "d1", prr.write_draft(tmp_path / "d1", d), first)
+    saved = prr.load(path)["findings"]
+    assert saved["codex-1"]["comment_id"] == saved["antigravity-1"]["comment_id"]
+    assert saved["codex-2"]["comment_id"] == saved["antigravity-2"]["comment_id"] != saved["codex-1"]["comment_id"]
+    # The next head fixes both: a reply per id on the shared thread, which is resolved once.
+    assert prr.main(["reviewed", "--state", str(path), "--base", REAL_BASE, "--head", h2]) == 0
+    d2 = prr.build_draft(prr.load(path), second, CL_DIFF)
+    cid = saved["codex-1"]["comment_id"]
+    assert sorted((r["finding"], r["comment_id"], r["status"]) for r in d2["replies"]) == [
+        ("antigravity-1", cid, "fixed"), ("codex-1", cid, "fixed")]
+    assert {r["finding"] for r in d2["resolve"]} == {"codex-1", "antigravity-1"}
+    assert [prr.own_markers(c["body"]) for c in d2["review"]["comments"]] == [["codex-3"], ["codex-4"], ["codex-5"]]
+    fake_gh(tmp_path, monkeypatch, head=h2, merge_base=REAL_BASE)
+    n = len(calls(log))
+    res = prr.post(path, tmp_path / "d2", prr.write_draft(tmp_path / "d2", d2), second)
+    assert sorted(res["resolved"]) == ["antigravity-1", "codex-1"]
+    assert len([c for c in calls(log, n) if any("resolveReviewThread" in a for a in c["args"])]) == 1
+    saved = prr.load(path)["findings"]
+    assert saved["codex-1"]["status"] == saved["antigravity-1"]["status"] == "fixed"
+
+
+def test_a_shared_comment_resolves_only_once_every_id_is_settled():
+    state = new_state(H2)
+    state["findings"] = {"codex-1": {"comment_id": 101, "node_id": "C_101", "head": H1},
+                         "antigravity-1": {"comment_id": 101, "node_id": "C_101", "head": H1}}
+    one_fixed = history(H2, verdict("codex", H2, "approve", earlier=[{"id": "codex-1", "status": "fixed", "note": ""}]),
+                        verdict("antigravity", H2, findings=[finding("antigravity-1")],
+                                earlier=[{"id": "antigravity-1", "status": "still_blocking", "note": ""}]))
+    d = prr.build_draft(state, one_fixed, DIFF)
+    assert [(r["finding"], r["status"]) for r in d["replies"]] == [("antigravity-1", "still_open"),
+                                                                   ("codex-1", "fixed")]
+    assert d["resolve"] == [] and d["review"]["comments"] == []
+    state["findings"]["codex-1"]["status"] = "fixed"  # as `post` records it
+    both = history(H2, verdict("antigravity", H2, "approve",
+                               earlier=[{"id": "antigravity-1", "status": "withdrawn", "note": ""}]))
+    d = prr.build_draft(state, both, DIFF)
+    assert [(r["finding"], r["status"]) for r in d["replies"]] == [("antigravity-1", "withdrawn")]
+    assert d["resolve"] == [{"finding": "antigravity-1", "thread_id": None}]
+    # One id blocking again reopens the shared thread for it alone.
+    state["findings"]["antigravity-1"]["status"] = "withdrawn"
+    again = history(H2, verdict("codex", H2, findings=[finding("codex-1")]))
+    d = prr.build_draft(state, again, DIFF)
+    assert d["reopen"] == ["codex-1"] and [r["finding"] for r in d["replies"]] == ["codex-1"]
+
+
+def test_a_quoted_marker_in_a_shared_comment_isnt_one_of_its_ids():
+    fs = [{**finding("codex-1", comment="see <!-- agent-bus-finding: codex-9 -->"), "reviewer": "codex"},
+          {**finding("antigravity-1"), "reviewer": "antigravity"}]
+    assert prr.own_markers(prr.merged_body(fs)) == ["codex-1", "antigravity-1"]
+    assert prr.own_markers(prr.finding_body(fs[0])) == ["codex-1"]
+
+
+def test_a_shared_comment_resolves_once_its_low_note_is_dropped_too():
+    """A low note isn't settled by id: once no reviewer lists it, it no longer holds the thread."""
+    state = new_state(H2)
+    state["findings"] = {"codex-1": {"comment_id": 101, "node_id": "C_101", "head": H1},
+                         "antigravity-1": {"comment_id": 101, "node_id": "C_101", "head": H1}}
+    low = finding("antigravity-1", severity="low")
+    kept = history(H2, verdict("codex", H2, "approve", earlier=[{"id": "codex-1", "status": "fixed", "note": ""}]),
+                   verdict("antigravity", H2, "approve", findings=[low]))
+    assert prr.build_draft(state, kept, DIFF)["resolve"] == []
+    dropped = history(H2, verdict("codex", H2, "approve", earlier=[{"id": "codex-1", "status": "fixed", "note": ""}]),
+                      verdict("antigravity", H2, "approve"))
+    assert prr.build_draft(state, dropped, DIFF)["resolve"] == [{"finding": "codex-1", "thread_id": None}]
+
+
+def test_a_reply_on_a_shared_comment_names_every_finding_on_it():
+    state = new_state()
+    state["findings"] = {"codex-1": {"comment_id": 101}, "antigravity-1": {"comment_id": 101}}
+    new = prr.author_replies(state, [{"id": 5, "in_reply_to_id": 101, "user": {"login": "author"}, "body": "done"}],
+                             "me", "author")
+    assert [r["finding"] for r in new] == ["codex-1, antigravity-1"]
+    assert "codex-1, antigravity-1 (@author, PR author)" in prr.replies_note(new, REPO, 7)
+
+
+def shared_post(tmp_path, monkeypatch, path, hist, head, resolve=True):
+    """Draft and post ``hist`` on ``head`` (after `reviewed` if the head moved)."""
+    if prr.load(path)["last_reviewed_head"] != head:
+        assert prr.main(["reviewed", "--state", str(path), "--base", BASE, "--head", head]) == 0
+    fake_gh(tmp_path, monkeypatch, head=head)
+    d = prr.build_draft(prr.load(path), hist, DIFF)
+    out = tmp_path / f"d-{head[:4]}-{hist['thread'].get('passes', 0)}"
+    return d, prr.post(path, out, prr.write_draft(out, d), hist, resolve)
+
+
+def test_a_shared_thread_held_open_by_a_note_resolves_once_the_note_is_dropped(tmp_path, monkeypatch):
+    """codex-1 is fixed while antigravity-1, a kept pre-existing note on the same comment, holds
+    the thread open; a later head that drops the note resolves it."""
+    monkeypatch.setenv("AGENT_BUS_PR_STATE_DIR", str(tmp_path / "state"))
+    log, world = fake_gh(tmp_path, monkeypatch)
+    path = tmp_path / "state" / "s.json"
+    prr.save(path, new_state())
+    note = finding("antigravity-1", severity="low", pre_existing=True)
+    first = history(H1, verdict("codex", H1, findings=[finding("codex-1")]), verdict("antigravity", H1, "approve",
+                                                                                    findings=[note]))
+    d, _ = shared_post(tmp_path, monkeypatch, path, first, H1)
+    assert [prr.own_markers(c["body"]) for c in d["review"]["comments"]] == [["codex-1", "antigravity-1"]]
+    fixed = [{"id": "codex-1", "status": "fixed", "note": ""}]
+    kept = history(H2, verdict("codex", H2, "approve", earlier=fixed),
+                   verdict("antigravity", H2, "approve", findings=[note]))
+    d, res = shared_post(tmp_path, monkeypatch, path, kept, H2)
+    assert d["resolve"] == [] and res["resolved"] == []
+    assert prr.load(path)["findings"]["codex-1"]["resolve_later"] is True
+    h3 = "d" * 40
+    dropped = history(h3, verdict("codex", h3, "approve"), verdict("antigravity", h3, "approve"))
+    n = len(calls(log))
+    d, res = shared_post(tmp_path, monkeypatch, path, dropped, h3)
+    assert d["replies"] == [] and [r["finding"] for r in d["resolve"]] == ["codex-1"] and res["resolved"] == ["codex-1"]
+    assert len([c for c in calls(log, n) if any("resolveReviewThread" in a for a in c["args"])]) == 1
+    assert "resolve_later" not in prr.load(path)["findings"]["codex-1"]
+    assert prr.build_draft(prr.load(path), dropped, DIFF)["resolve"] == []  # once
+
+
+def test_a_shared_comment_moved_into_the_body_tracks_each_id(tmp_path, monkeypatch):
+    """Moved into the review body as one line per id (as the skill says), each id is tracked, so
+    a later draft never posts it again."""
+    monkeypatch.setenv("AGENT_BUS_PR_STATE_DIR", str(tmp_path / "state"))
+    fake_gh(tmp_path, monkeypatch)
+    path = tmp_path / "state" / "s.json"
+    prr.save(path, new_state())
+    h = history(H1, verdict("codex", H1, findings=[finding("codex-1")]),
+                verdict("antigravity", H1, findings=[finding("antigravity-1")]))
+    d = prr.build_draft(new_state(), h, DIFF)
+    assert len(d["review"]["comments"]) == 1
+    d["review"]["comments"] = []
+    d["review"]["body"] += "".join(f"\n- **[{i}]** broken {prr.MARKER.format(i)}" for i in ("codex-1", "antigravity-1"))
+    assert prr.body_findings(d) == {"codex-1", "antigravity-1"}
+    prr.post(path, tmp_path / "d", prr.write_draft(tmp_path / "d", d), h)
+    saved = prr.load(path)["findings"]
+    assert "review_id" in saved["codex-1"] and "review_id" in saved["antigravity-1"]
+    assert prr.build_draft({**prr.load(path), "revision": 1}, h, DIFF)["review"]["comments"] == []
+
+
+def held_open(tmp_path, monkeypatch):
+    """codex-1 fixed on H2 while antigravity-1, a kept note on the same comment, holds it open."""
+    monkeypatch.setenv("AGENT_BUS_PR_STATE_DIR", str(tmp_path / "state"))
+    log, world = fake_gh(tmp_path, monkeypatch)
+    path = tmp_path / "state" / "s.json"
+    prr.save(path, new_state())
+    note = finding("antigravity-1", severity="low", pre_existing=True)
+    shared_post(tmp_path, monkeypatch, path, history(H1, verdict("codex", H1, findings=[finding("codex-1")]),
+                                                     verdict("antigravity", H1, "approve", findings=[note])), H1)
+    shared_post(tmp_path, monkeypatch, path, history(
+        H2, verdict("codex", H2, "approve", earlier=[{"id": "codex-1", "status": "fixed", "note": ""}]),
+        verdict("antigravity", H2, "approve", findings=[note])), H2)
+    assert prr.load(path)["findings"]["codex-1"]["resolve_later"] is True
+    return log, path
+
+
+def test_a_deferred_resolution_skipped_with_no_resolve_isnt_kept(tmp_path, monkeypatch):
+    log, path = held_open(tmp_path, monkeypatch)
+    h3, h4 = "d" * 40, "e" * 40
+    dropped = history(h3, verdict("codex", h3, "approve"), verdict("antigravity", h3, "approve"))
+    d, res = shared_post(tmp_path, monkeypatch, path, dropped, h3, resolve=False)
+    assert [r["finding"] for r in d["resolve"]] == ["codex-1"] and res["resolved"] == []
+    assert not any("resolveReviewThread" in " ".join(c["args"]) for c in calls(log))
+    assert "resolve_later" not in prr.load(path)["findings"]["codex-1"]
+    assert prr.main(["reviewed", "--state", str(path), "--base", BASE, "--head", h4]) == 0
+    later = history(h4, verdict("codex", h4, "approve"), verdict("antigravity", h4, "approve"))
+    assert prr.build_draft(prr.load(path), later, DIFF)["resolve"] == []
+
+
+def test_a_reopened_finding_drops_its_deferred_resolution(tmp_path, monkeypatch):
+    log, path = held_open(tmp_path, monkeypatch)
+    h3 = "d" * 40
+    reopened = history(h3, verdict("codex", h3, findings=[finding("codex-1")]), verdict("antigravity", h3, "approve"))
+    d, _ = shared_post(tmp_path, monkeypatch, path, reopened, h3)
+    assert d["reopen"] == ["codex-1"] and d["resolve"] == []
+    saved = prr.load(path)["findings"]["codex-1"]
+    assert "resolve_later" not in saved and "status" not in saved

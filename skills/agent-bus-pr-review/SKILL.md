@@ -113,7 +113,11 @@ history, base or head isn't the state's. The draft holds:
   location on this head) listed in the body;
 - one inline comment per new finding at its file and line, tagged with its stable finding id
   (`**[codex-1]** (high, blocking) ...`) and a hidden `<!-- agent-bus-finding: codex-1 -->`
-  marker that later drafts find it by. Pre-existing findings say `pre-existing, non-blocking`;
+  marker that later drafts find it by. Pre-existing findings say `pre-existing, non-blocking`.
+  New findings at the same file and line (two reviewers raising the same issue) share one
+  comment, tagged with every id (`**[codex-1, antigravity-1]**`), with each finding's text and
+  each id's marker; later drafts still reply on it per id, and resolve it once none of its
+  findings is still open;
 - on later heads: replies on the earlier findings' threads (fixed, withdrawn or still open)
   and the threads of fixed or withdrawn findings to resolve, judged over the whole thread, so a
   head you didn't post still counts. A finding is never commented on twice.
@@ -124,11 +128,13 @@ default `COMMENT`; only use them when the user asks.
 
 **Show the user `draft.md`** (in full, or summarised with the path) and ask whether to post it.
 If they want changes, edit the text in `draft.json` (`review.body`, `review.comments[].body`,
-`replies[].body`), keeping each `<!-- agent-bus-... -->` marker, then run
+`replies[].body`), keeping each `<!-- agent-bus-... -->` marker (and a shared comment's leading
+`**[id, id]**` tag, which says how many markers it carries), then run
 `PRR show --draft "$D"`, which re-renders `draft.md` and prints the new digest, and show it
 again. To move an inline comment into the review body, remove it from `review.comments` and add
-it to the body as one line, `- **[id]** text <!-- agent-bus-finding: id -->` (only lines of that
-form count as findings the body carries). A body over GitHub's size limit is refused rather than
+it to the body as one line per finding, `- **[id]** text <!-- agent-bus-finding: id -->` (only
+lines of that form, one id each, count as findings the body carries; a shared comment becomes one
+line per id). A body over GitHub's size limit is refused rather than
 cut: shorten it.
 
 ## 3. Post (only after explicit approval)
