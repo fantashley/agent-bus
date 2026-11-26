@@ -33,6 +33,12 @@ line (a fake diff in a test, ``"+def key_0(): pass"``) defines nothing.
 
 Debrief follow-ups (#156): a name's hits outside test files are listed first, and a name with
 no room for its full list gets a sample of SAMPLE hits before it falls back to one line.
+
+#161: names a Python line reads off a common standard-library module (``fcntl.LOCK_SH``) and
+generic words (``repo``, ``path``) are dropped before the caps, as mentions of them are; and a
+mention qualified by a module or object (``snapshot.ensure()``, ``monkeypatch.undo()``) whose
+last part is a generic word is searched as written (its last two parts), which finds the calls
+meant rather than every ``ensure``.
 """
 
 from __future__ import annotations
@@ -87,6 +93,28 @@ _SKIP = frozenset({"self", "cls", "this", "main", "init", "None", "True", "False
                    "teardown", "if", "for", "while", "return", "print", "len", "str", "int", "dict", "list",
                    "set", "type", "args", "kwargs", "data", "name", "value", "values", "result", "text"})
 
+# Words too generic to search for when an added line only reads them, or a note mentions them
+# (#161): they would use up a cap on hits that say nothing about the change.  A definition by
+# one of these names is still searched (it is what changed).
+_GENERIC = frozenset({"repo", "path", "paths", "line", "lines", "file", "files", "key", "keys", "items", "kind",
+                      "mode", "state", "status", "error", "errors", "message", "body", "head", "base", "info",
+                      "config", "options", "params", "parts", "count", "size", "index", "start", "stop", "time",
+                      "stdout", "stderr", "returncode", "encode", "decode", "strip", "split", "join", "append",
+                      "extend", "update", "copy", "format", "replace", "lower", "upper", "open", "close", "read",
+                      "write", "load", "dump", "dumps", "loads", "ensure", "check", "parse", "render", "build",
+                      "create", "delete", "remove", "reset", "clear", "apply", "undo", "fetch", "send", "call",
+                      "wait", "kill", "exists", "flush", "run", "get", "pop", "add", "sort", "sorted", "group",
+                      "match", "search", "sub", "findall", "finditer", "fullmatch", "now", "sleep", "exit"})
+# Common standard-library modules: an attribute read off one (``os.O_RDWR``) is the module's
+# own.  Not every name in sys.stdlib_module_names: `queue.claim_next_job()` may well be a
+# project's own object (codex-11).
+_STDLIB = frozenset({"os", "sys", "re", "json", "time", "fcntl", "errno", "signal", "stat", "subprocess", "shutil",
+                     "tempfile", "hashlib", "itertools", "functools", "collections", "typing", "math", "socket",
+                     "struct", "threading", "logging", "datetime", "pathlib", "textwrap", "string", "random",
+                     "uuid", "base64", "select", "termios", "contextlib", "dataclasses", "argparse", "sqlite3",
+                     "urllib", "posixpath", "builtins", "operator", "asyncio"})
+# A bare name just before an attribute (``fcntl``.LOCK_SH, not ``self.queue``.x).
+_RECEIVER = re.compile(r"(?<![\w.])([A-Za-z_][A-Za-z0-9_]*)$")
 
 # A changed class-level annotated name (a dataclass field): ``name: type`` or ``name: type = x``.
 _FIELD = re.compile(r"^(\s+)([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[^=\s,(][^=]*?(?:=(?!=).*)?$")
@@ -139,6 +167,11 @@ def _defs(text: str, path: str) -> list[str]:
 def _ok(name: str) -> bool:
     return (len(name) >= 4 and name not in _SKIP and not name.startswith("test")
             and not (name.startswith("__") and name.endswith("__")))
+
+
+def _specific(name: str) -> bool:
+    """Whether ``name`` is worth a search as a read or mentioned name (#161): not generic."""
+    return _ok(name) and name not in _GENERIC
 
 
 def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], dict[str, str], dict[str, None],
@@ -199,7 +232,11 @@ def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], 
         meth = _METHOD.match(body)
         touched: list[str] = []  # the names this line touches, whatever they turn out to be
         if line[0] == "+" and not body.lstrip().startswith(("#", "//")):
-            read = [k.group(1) for k in _KEY.finditer(body)], [a.group(1) for a in _ATTR.finditer(body)]
+            # An attribute a Python line reads off a standard-library module is the module's (#161).
+            py = path.endswith((".py", ".pyi"))
+            read = [k.group(1) for k in _KEY.finditer(body)], [
+                a.group(1) for a in _ATTR.finditer(body)
+                if not (py and (r := _RECEIVER.search(body[:a.start()])) and r.group(1) in _STDLIB)]
             keys.update(dict.fromkeys(read[0]))
             attrs.update(dict.fromkeys(read[1]))
             touched += read[0] + read[1]
@@ -258,7 +295,19 @@ def mentioned(texts: list[str], exclude: set[str] | frozenset[str] = frozenset()
             parts = m.group(1).split(".")
             if len(parts) > 1 and parts[-1].lower() in _EXT:
                 continue
-            name = next((p for p in (parts[-1], parts[0]) if _ok(p)), None)
+            if len(parts) > 1 and parts[0] in _STDLIB:
+                continue  # a standard-library module's own name (`fcntl.LOCK_SH`, `os.path.join`)
+            owner = parts[-2] if len(parts) > 1 else ""
+            if (parts[-1] in _GENERIC and owner and not owner[:1].isupper()
+                    and (owner in ("self", "cls") or (len(owner) >= 2 and owner not in _SKIP
+                                                      and not owner.startswith(("test", "__"))))):
+                # A generic name qualified by a module or object (`snapshot.ensure()`,
+                # `db.close()`, `self.reset()`): searched as written, its last two parts,
+                # which finds the calls meant (#161).  Not a builtin's (`str.split`).
+                name = ".".join(parts[-2:])
+            else:
+                # Failing that its last part, or its first.
+                name = next((p for p in (parts[-1], parts[0]) if _specific(p)), None)
             if name and name not in exclude:
                 out.setdefault(name)
     return list(out)[:limit]
@@ -290,7 +339,8 @@ def terms(diff: str, mention: list[str] | None = None, limit: int = MAX_SYMBOLS)
              if not (n.startswith("__") and n.endswith("__")) and n not in _SKIP and not n.startswith("test")]
     found += meths[:MAX_METHODS]
     have = {t.pattern for t in found} | set(out)
-    found += [Term(n, "read", test=first(n)) for n in sorted(reads, key=first) if n not in have and _ok(n)][:MAX_READ]
+    found += [Term(n, "read", test=first(n)) for n in sorted(reads, key=first)
+              if n not in have and _specific(n)][:MAX_READ]
     have = {t.pattern for t in found}
     found += [Term(n, "mentioned") for n in (mention or []) if n not in have][:MAX_MENTIONED]
     return found

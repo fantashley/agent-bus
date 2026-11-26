@@ -1293,11 +1293,17 @@ class Worker:
             self.report_missing(t, e, followup or bool(refs.get("revision")) or len(refs.get("heads") or []) > 1)
             raise
         snap = self.pin_snapshot(t, refs)
+        # Large new data files, readable in full in the copy, are summarized (#161).  Only now,
+        # so the interdiff checks above compared the diffs as git gave them (codex-3).
+        full_diff = self.summarize_data(full_diff, snap)
+        if resume and not pushback:
+            inter = self.summarize_data(inter, snap)
         # Names in backticks in the findings and notes since this reviewer's last pass (and the
         # request's own notes) are searched too, for a reviewer that can't search (#122).
         # The newest first: this request's focus, then the notes since its last pass; the
         # first request's note only on a first pass (later ones would crowd out the new names).
-        texts = [refs.get("focus") or ""] + [m["body"] for m in reversed(notes(everything))
+        # This head's testing note too (#161): authors name the calls they checked there.
+        texts = [refs.get("focus") or "", refs.get("testing") or ""] + [m["body"] for m in reversed(notes(everything))
                                              if mine is None or m["id"] > mine["id"]]
         if mine is None:
             texts.append(refs.get("opening_focus") or "")
@@ -1966,7 +1972,16 @@ class Worker:
 
     def cap_diff(self, diff: str) -> str:
         # The file list comes from the whole diff, so a truncated one still names every file (#93).
-        return Diff(self._cap_diff(diff), diff_overview(diff))
+        return Diff(self._cap_diff(diff), diff_overview(diff), raw=diff)
+
+    def summarize_data(self, diff, snap: snapshot.Snapshot):
+        """``diff`` (a Diff) with its large new data files summarized against ``snap`` (see
+        summarize_data_files), capped again from the uncapped text, so what the summary saves
+        goes to the files after it; anything else as it is."""
+        if not isinstance(diff, Diff) or diff.raw is None or not snap.path:
+            return diff
+        short = summarize_data_files(diff.raw, snap)
+        return diff if short == diff.raw else Diff(self._cap_diff(short), diff.overview, raw=diff.raw)
 
     def _cap_diff(self, diff: str) -> str:
         limit = self.config.max_diff_bytes
@@ -2078,12 +2093,76 @@ RANGE_DIFF_MAX = 4_000
 RANGE_DIFF_COMMITS = 50
 
 
+# A data or fixture file (#161): by extension, or under a fixtures/data directory.  A new one
+# whose section of a reviewer's diff adds more than DATA_LINES lines, or is over DATA_BYTES, is
+# shown as its headers and first DATA_HEAD added lines (each cut to DATA_LINE characters), with
+# where to read it in full: a 385-line JSON fixture inlined made the rest of a first-pass diff
+# hard to scan.  Only a new file, and only one the head's copy holds: every line it adds is
+# then in the copy, whatever tools the reviewer has (codex-1).
+DATA_EXT = frozenset({"json", "jsonl", "ndjson", "csv", "tsv", "yaml", "yml", "xml", "txt", "log", "snap",
+                      "svg", "lock", "har", "ipynb", "pem", "b64"})
+_DATA_DIR = re.compile(r"(?:^|/)(?:fixtures?|testdata|test_data|__snapshots__|tests?/data)/")
+# Never data, wherever it sits (a script among fixtures is code).
+_CODE_EXT = frozenset({"py", "pyi", "js", "mjs", "cjs", "ts", "tsx", "jsx", "rs", "go", "c", "h", "cc", "cpp", "hpp",
+                       "java", "kt", "rb", "sh", "bash", "zsh", "nix", "swift", "cs", "php", "lua", "pl", "sql"})
+DATA_LINES = 150
+DATA_BYTES = 24_000
+DATA_HEAD = 12
+DATA_LINE = 200
+# Antigravity's read_file returns at most 46,080 bytes, in whole lines: a file with a longer
+# line can't be read in full from the copy, so it stays inline (codex-1).
+DATA_READABLE_LINE = 40_000
+
+
+def is_data_file(path: str) -> bool:
+    """Whether ``path`` is a data or fixture file rather than code (see DATA_EXT)."""
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path.rsplit("/", 1)[-1] else ""
+    return ext in DATA_EXT or (ext not in _CODE_EXT and bool(_DATA_DIR.search(path)))
+
+
+def summarize_data_files(diff: str, snap: snapshot.Snapshot) -> str:
+    """``diff`` with each large new data file the copy ``snap`` holds cut to its headers and
+    first DATA_HEAD added lines, and a note with its size and its path in the copy (#161).
+    Code files, changed or deleted files and files not in the copy are never cut here."""
+    if not snap.path:
+        return diff
+    have = set(snap.files)
+    out: list[str] = []
+    for section in re.split(r"(?m)^(?=diff --git )", diff):
+        first = section.split("\n", 1)[0]
+        paths = _header_paths(first[len("diff --git "):]) if first.startswith("diff --git ") else None
+        lines = section.split("\n")
+        start = next((i for i, l in enumerate(lines) if l.startswith("@@")), None)
+        if (not paths or start is None or not is_data_file(paths[1]) or paths[1] not in have
+                or not any(l.startswith("new file mode ") for l in lines[:start])):
+            out.append(section)
+            continue
+        added = [l for l in lines[start:] if l.startswith("+")]
+        if (len(added) <= DATA_LINES and len(section.encode()) <= DATA_BYTES) or \
+                any(len(l.encode()) > DATA_READABLE_LINE for l in added):
+            out.append(section)
+            continue
+        kept = [lines[start]]
+        for l in [l for l in lines[start + 1:] if l][:DATA_HEAD]:
+            kept.append(l if len(l) <= DATA_LINE else l[:DATA_LINE] + " [... line cut]")
+        shown = sum(1 for l in kept if l.startswith("+"))
+        path = paths[1]
+        note = (f"[agent-bus: new data file {path} summarized: {len(added)} lines, {len(section.encode()):,} bytes "
+                f"of diff; only its first lines are shown. Read it in full in the head's copy: "
+                f"{os.path.join(snap.path, path)}]")
+        more = [f"[... {len(added) - shown} more added lines of {path} not shown ...]"] if len(added) > shown else []
+        out.append("\n".join(lines[:start] + [note] + kept + more)
+                   + ("\n" if section.endswith("\n") else ""))
+    return "".join(out)
+
+
 class Diff(str):
     """A diff as sent (maybe truncated), with the file list of the whole diff (#93)."""
 
-    def __new__(cls, text: str, overview: str):
+    def __new__(cls, text: str, overview: str, raw: str | None = None):
         obj = super().__new__(cls, text)
         obj.overview = overview
+        obj.raw = raw  # the diff before any cap or summary
         return obj
 
 

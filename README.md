@@ -218,7 +218,10 @@ same things in parallel:
   it was given on) and your notes; one that reviewed before resumes its own conversation with
   the interdiff since the head it last saw and everything posted since.
 - Each review prompt starts with the changed files (with lines added and removed, listing every
-  file even when the diff is cut short), the commit messages of base..head, and an optional
+  file even when the diff is cut short or a data file in it is summarized: a new data or fixture
+  file adding over 150 lines or 24,000 bytes, by extension or under a `fixtures`/`tests/data`
+  directory, shows only its headers and first 12 lines, with its path in the head's copy to
+  read it in full; only when the copy holds it and every line fits one `read_file` call), the commit messages of base..head, and an optional
   `testing` note from `request_review` saying how you tested the head. Reviewers can't run
   tests, so they see it as your claim. The diff heading names the base and head, and says
   whether it is the whole change or an interdiff, and why. The checkout may have moved on since
@@ -488,7 +491,10 @@ codex 0.171.0 and 0.172.0, and agy 1.5.13:
   defines or edits are used (with changed class fields, the other definitions of changed
   methods, and names in backticks in the thread's findings and notes since its last pass),
   fewest hits first, with a very common name collapsed to one line, each name's hits outside
-  test files first, and a name short of room cut to a sample of its hits. A prompt too long for one
+  test files first, and a name short of room cut to a sample of its hits. Names read off a
+  common standard-library module and generic words (`repo`, `path`) aren't searched, and a
+  backticked generic name qualified by a module or object (`snapshot.ensure()`) is searched as
+  written. A prompt too long for one
   argument goes in as far as fits and continues in numbered part files, each small enough for
   one `read_file` call (agy reads at most 800 lines or 46,080 bytes per call; a part stays under
   750 lines and 44,000 bytes). Turns also
