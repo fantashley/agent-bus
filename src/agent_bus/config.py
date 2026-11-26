@@ -229,6 +229,11 @@ def state_dir() -> Path:
     return _xdg("XDG_STATE_HOME", ".local/state") / "agent-bus"
 
 
+def shim_log_path(session_id: str) -> Path:
+    """Where the restart shim of an MCP session logs its moves, and why it didn't move (#139)."""
+    return state_dir() / "logs" / f"mcp-shim-{session_id}.log"
+
+
 def config_path() -> Path:
     env = os.environ.get("AGENT_BUS_CONFIG")
     if env:
@@ -719,7 +724,7 @@ def self_command() -> list[str]:
     return [sys.executable, "-m", "agent_bus"]
 
 
-def stale_build(auto_restart: bool = False) -> dict | None:
+def stale_build(auto_restart: bool = False, shim_log: str | None = None) -> dict | None:
     """When this process runs a different agent-bus install than the `agent-bus` on PATH.
 
     After an upgrade, a long-lived MCP server keeps running the build it started with (and
@@ -733,10 +738,11 @@ def stale_build(auto_restart: bool = False) -> dict | None:
     if not on_path or _LAUNCHED_FROM == on_path:
         return None
     if auto_restart:
+        why = (f"{shim_log} says why it didn't move" if shim_log
+               else "the new build failed to start (see the client's MCP log)")
         hint = ("This agent-bus MCP server is a different build from the agent-bus on PATH (likely "
                 "started before an upgrade). It moves onto the installed build by itself at a tool call "
-                "made while no other agent-bus call is running. If it stays stale, the new build failed "
-                "to start (see the client's MCP log): tell the user.")
+                f"made while no other agent-bus call is running. If it stays stale, tell the user: {why}.")
     else:
         hint = ("This agent-bus MCP server is a different build from the agent-bus on PATH "
                 "(likely started before an upgrade), and the review workers it starts use it "

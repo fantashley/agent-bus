@@ -1091,21 +1091,25 @@ by themselves: no `/reload-plugins` or client restart (#139). `agent-bus mcp` is
 holds the client's connection and runs the real MCP server as a child. When the client calls an
 agent-bus tool while no other agent-bus call of that session is running, and the `agent-bus` on
 PATH has become another build, the shim starts that build, replays the session's MCP handshake to
-it, and hands it the call; the old server is stopped only once the new one is up. Every call goes
+it (on MCP's handshake-free 2026-07-28 protocol, which Claude Code speaks, it re-opens the client's
+`subscriptions/listen` streams on it instead), and hands it the call; the old server is stopped only once the new one is up. Every call goes
 to exactly one server, none is dropped or repeated, and a call made while another runs (say, during
 a `wait`) goes to the old build, with the next idle one moving. Each server serves the same bus
 session, which the shim registers once, so read cursors, the threads you started and hooks' link
 to the session carry over, and the review workers start from the new build from then on. If the
 tool list changed, the client is sent `notifications/tools/list_changed`; the server's MCP
 instructions can't be refreshed that way, so a change to them waits for the next session. If the
-new build fails to start, the session stays on the old one (the reason is in the client's MCP log)
-and that build isn't tried again until the installed one changes (one that was only slow, over 4 s,
+new build fails to start, the session stays on the old one and that build isn't tried again until the installed one changes (one that was only slow, over 4 s,
 is tried again after 5 minutes). Nor does a session move onto a build from before the shim, which
 would register a session of its own. A cancelled tool call other than `wait` keeps the session on its
 server until that call's reply comes (the server may still be running it, and sends none for a
-cancelled call), so after such a cancellation the session may need a manual restart. The same applies under Claude Code, Codex, Antigravity and
-Copilot CLI, for clients that open the connection with MCP's `initialize` handshake (a client on
-the newer handshake-free protocol stays on its build until restarted). The installed build is the
+cancelled call), so after such a cancellation the session may need a manual restart. The same
+applies under Claude Code, Codex, Antigravity and Copilot CLI, whichever MCP protocol they speak.
+The shim logs each move, and why it didn't move when the installed build differs (a call in flight,
+with its id; a build that failed to start, and until when it isn't retried), to
+`$XDG_STATE_HOME/agent-bus/logs/mcp-shim-<session>.log` (`~/.local/state/…`; the session id is
+`whoami`'s, and the file is kept to about 256 KB, with one older `.1` beside it); a tool result's
+`stale_build` hint names that file. The installed build is the
 `agent-bus` the client's MCP entry names in `AGENT_BUS_INSTALLED` (the Home Manager plugins set it
 to the profile's), else the one on PATH. Hooks need nothing: each one runs the profile's
 `agent-bus` afresh.
