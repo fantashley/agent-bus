@@ -936,8 +936,10 @@ def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
         rows = []
         for t in ts:
             job = bus.active_job(t["id"])
-            # Reviews: pass and follow-ups against the budget (#71), e.g. "pass5,fu2/3".
+            # Reviews: pass, follow-ups, and those with new blockers against the budget (#71,
+            # #140), e.g. "pass5,fu3,nb1/3".
             rounds = (format_progress(t).replace("pass ", "pass").replace(", follow-ups ", ",fu")
+                      .replace(", new blockers ", ",nb")
                       .replace(", budget warning", ",warn").replace(", waiting for human", ",human")
                       if t["kind"] == "review" else f"{t['round']}/{t['max_rounds']}")
             rows.append((t["id"], t["status"], t["kind"], rounds,

@@ -268,16 +268,21 @@ finding (fixed, withdrawn or still blocking), and a new blocking finding must co
 the latest changes introduced or exposed, unless it is a newly substantiated `high`.
 
 A review counts your follow-up requests (each new base or head, and each pushback; reviewer
-handoffs, retries and repeats are free) against a soft budget, `review_followup_budget` in the
-config (default 3). Once it is spent, reviewers are told the review has run long and your
+handoffs, retries and repeats are free). The soft budget, `review_followup_budget` in the config
+(default 3), counts only the follow-ups that drew a new blocking finding from a reviewer's
+re-review (#140): one whose passes only confirm fixes, or find an earlier finding still blocking,
+is free, and so is a reviewer's first look at a later head. Once the budget is spent, or one
+follow-up before the hard limit below, reviewers are told the review has run long and your
 changes-requested notices suggest deferring non-blocking findings to a follow-up issue. A review
-that still asks for changes after twice the budget goes to `needs_human` and refuses follow-ups
+that still asks for changes after twice the budget in follow-ups of any kind goes to `needs_human` and refuses follow-ups
 with `REVIEW_LIMIT_REACHED` (review-only reviews excepted, above) until the human runs
 `agent-bus resume <thread>`, which allows
 another budget's worth. A pushback at the limit that is still due its verdict (say it hit a usage
 limit) is the exception: the error says to wait for that verdict, because a resume reruns the
-pushback without raising the limit. Reviews report `passes`, `follow_ups` and `followup_budget` instead of a
-discussion's `max_rounds` (`agent-bus threads` shows e.g. `pass5,fu2/3`).
+pushback without raising the limit. Reviews report `passes`, `follow_ups`, `new_blocker_follow_ups` and
+`followup_budget` instead of a discussion's `max_rounds` (`agent-bus threads` shows e.g. `pass5,fu3,nb1/3`:
+three follow-ups, one of them with new blockers, budget 3). A review started before this count
+existed reports `new_blocker_follow_ups: null` and keeps counting every follow-up against its budget.
 
 If the repo doesn't have a pinned commit (base, head, or the previous head a follow-up diffs
 against), the reviewer isn't started. The thread goes to `needs_human` with a notice naming the

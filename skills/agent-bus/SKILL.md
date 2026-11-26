@@ -158,7 +158,9 @@ prev_head_commit_id?, focus?, evidence?, testing?, thread?, model?, effort?, pee
   says; `agent-bus resume` is theirs to run.
 
 **Severity.** Only `high` and `medium` findings block; `low` never does. Fix the blocking ones;
-low ones are optional (defer them to a follow-up issue if they're real work). A finding the
+low ones are optional (defer them to a follow-up issue if they're real work). An approval can
+carry low findings too; nothing follows them up once the review resolves, so open an issue for
+any worth keeping. A finding the
 reviewer marks `pre_existing` (a problem already in the base, not introduced by the change) is
 listed apart and never blocks, whatever its severity.
 
@@ -177,10 +179,13 @@ blocking), and the verdict shows how.
 (or pass it as `focus`), then request the **same** head again (`prev_head_commit_id` =
 `head_commit_id`). The reviewer that asked for changes reconsiders, once per reviewer per head.
 
-**Follow-up budget.** Each new head, new base or pushback counts against a soft budget
-(`review_followup_budget`, default 3). Once it's spent, reviewers are told the review has run
-long: defer non-blocking work to a follow-up issue. A review still asking for changes after
-twice the budget goes to `needs_human` (`REVIEW_LIMIT_REACHED`): stop and tell the user.
+**Follow-up budget.** Each new head, new base or pushback is a follow-up. The soft budget
+(`review_followup_budget`, default 3) counts only those where a reviewer's re-review raised a
+new blocking finding; follow-ups that only confirm fixes are free. Once it's spent (or one
+follow-up before the hard limit), reviewers are told the review has run long: defer
+non-blocking work to a follow-up issue. A review still asking for changes after twice the
+budget in follow-ups of any kind goes to `needs_human` (`REVIEW_LIMIT_REACHED`): stop and tell
+the user.
 A review-only review (below) keeps the warning but never parks: it has no follow-up limit.
 
 If the repo is missing a pinned commit after the request, the worker reports it on the thread
