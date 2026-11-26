@@ -39,10 +39,22 @@ generic words (``repo``, ``path``) are dropped before the caps, as mentions of t
 mention qualified by a module or object (``snapshot.ensure()``, ``monkeypatch.undo()``) whose
 last part is a generic word is searched as written (its last two parts), which finds the calls
 meant rather than every ``ensure``.
+
+#174, #175: in a Python file, which definition a changed line touches is read from the file
+itself, parsed with ``ast`` (pinned_python): a changed ``def`` or ``class`` line defines its
+name unless it sits in a function (a local helper), and any other changed line touches the
+outermost function it sits in (a method also gets its overrides searched), or failing that
+its class.  The head's files are read from git, each one's size checked before it is read,
+within a budget per search; the old side is rebuilt from the head's file and the diff's own
+hunks (old_text), so a removed line is placed in the file it was removed from, whichever
+commit the diff starts at.  When a side can't be rebuilt or parsed, the lines are matched as
+before.  Elsewhere definitions are matched as before, except that a comment line defines
+nothing, and prose files (``.md``, ``.rst``, ``.txt`` ...) touch no names.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import threading
@@ -72,9 +84,20 @@ GENERIC_HITS = 100
 # shown, at worst as one line; the rest go, highest hit count first, when space runs out.
 KINDS = {"defined": 0, "field": 0, "enclosing": 1, "override": 1, "read": 2, "mentioned": 2}
 
+# Python sources read for the scopes of their changed lines (#174): at most this many bytes each,
+# and in all per search (the old sides rebuilt from them count too).
+MAX_SOURCE = 1_000_000
+MAX_SOURCES = 4_000_000
+
 # A definition on a changed line: Python, JS/TS, Rust, Go (methods too), C-like type keywords.
 _DEF = re.compile(r"\b(?:def|class|function|fn|func|struct|enum|interface|trait|type|macro_rules!)\s+"
                   r"(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)")
+# A comment line (#175): it defines nothing.  Only ``//``, or ``#`` or a doc block's ``*``
+# followed by a space or the line's end (not ``#define``, ``#[``, ``*/``).
+_COMMENT = re.compile(r"\s*(?://|[#*](?:\s|$))")
+# Prose files: their changed lines touch no names (#175).
+_PROSE = (".md", ".markdown", ".mdx", ".rst", ".txt", ".adoc")
+_PY = (".py", ".pyi")
 # A string literal on one line, or from its opening quote to the end of the line (a multi-line
 # one starting there): a definition keyword inside one defines nothing.  Rust's lifetimes
 # ('a) aren't quotes, so a .rs file's single quotes are left alone.
@@ -85,8 +108,9 @@ _TEST_PATH = re.compile(r"(?:^|/)(?:tests?|__tests__|spec)/|(?:^|/)(?:test_[^/]*
                         r"|[^/]*\.(?:test|spec)\.[^/]+|conftest\.py)$")
 # A module-level constant (FOO_BAR = ..., FOO: int = ...), assigned at the start of the line.
 _CONST = re.compile(r"^([A-Z][A-Z0-9_]+)\s*(?::[^=]*)?=(?!=)")
+_UPPER = re.compile(r"[A-Z][A-Z0-9_]+")
 # The function or class git names in a hunk header, failing a definition: the first call-like name.
-_HUNK = re.compile(r"^@@ [^@]*@@ ?(.*)$")
+_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
 _CALL = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 # Too common, or not worth a search: these would list half the tree, or nothing useful.
 _SKIP = frozenset({"self", "cls", "this", "main", "init", "None", "True", "False", "test", "tests", "setup",
@@ -160,7 +184,10 @@ def _mask(text: str, path: str) -> str:
 
 
 def _defs(text: str, path: str) -> list[str]:
-    """The names ``text`` (one line of ``path``) defines, outside string literals."""
+    """The names ``text`` (one line of ``path``) defines, outside string literals; none on a
+    comment line (#175)."""
+    if _COMMENT.match(text):
+        return []
     return [d.group(1) for d in _DEF.finditer(_mask(text, path))]
 
 
@@ -174,13 +201,267 @@ def _specific(name: str) -> bool:
     return _ok(name) and name not in _GENERIC
 
 
-def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], dict[str, str], dict[str, None],
-                              set[str]]:
+@dataclass(frozen=True)
+class PyScopes:
+    """Where one side of a Python file defines what (#174), by line number: the ``def``,
+    ``class`` and ``type`` lines of the definitions outside any function (line -> name,
+    whether it is a method), what each line sits in (``at[line]``: the outermost function,
+    with whether it is a method, or failing that the innermost class), class-level annotated
+    names (line -> (name, class) ...) and module-level constants (line -> names)."""
+    defs: dict[int, tuple[tuple[str, bool], ...]]
+    at: list[tuple[str, str] | None]  # ("method", name), ("function", name), ("class", name); [0] unused
+    fields: dict[int, tuple[tuple[str, str], ...]]
+    consts: dict[int, tuple[str, ...]]
+
+    def touch(self, ln: int) -> list[tuple[str, str, str]]:
+        """What a change to line ``ln`` touches, as (what, name, class) each: "defined" (a
+        definition's line, or a constant's), "method" (a method's ``def`` line), "in_method" (a
+        line in a method, a local definition there included), "enclosing" (in a function, or
+        failing that a class), "field"; nothing at module level."""
+        if ln in self.defs:
+            return [("method" if method else "defined", name, "") for name, method in self.defs[ln]]
+        where = self.at[ln] if 0 < ln < len(self.at) else None
+        if where is not None and where[0] != "class":
+            return [("in_method" if where[0] == "method" else "enclosing", where[1], "")]
+        if ln in self.fields:
+            return [("field", name, cls) for name, cls in self.fields[ln]]
+        if ln in self.consts:
+            return [("defined", name, "") for name in self.consts[ln]]
+        return [("enclosing", where[1], "")] if where is not None else []
+
+
+def py_scopes(source: str) -> PyScopes | None:
+    """``source`` (a Python file's text) indexed for PyScopes, or None if it doesn't parse."""
+    try:
+        tree = ast.parse(source.removeprefix("\ufeff"))
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    defs: dict[int, list[tuple[str, bool]]] = {}
+    at: list[tuple[str, str] | None] = [None] * (source.count("\n") + 2)
+    fields: dict[int, list[tuple[str, str]]] = {}
+    consts: dict[int, list[str]] = {}
+    alias = getattr(ast, "TypeAlias", ())  # Python 3.12's ``type X = ...``
+
+    def mark(start: int, end: int, what: tuple[str, str]) -> None:
+        end = min(end, len(at) - 1)
+        at[start:end + 1] = [what] * max(0, end + 1 - start)
+
+    def walk(body: list, cls: str | None) -> None:
+        for n in body:
+            start = min([d.lineno for d in getattr(n, "decorator_list", [])] + [n.lineno])
+            end = n.end_lineno or n.lineno
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Not walked into: whatever it defines is local to it.
+                defs.setdefault(n.lineno, []).append((n.name, cls is not None))
+                mark(start, end, ("method" if cls is not None else "function", n.name))
+            elif isinstance(n, ast.ClassDef):
+                defs.setdefault(n.lineno, []).append((n.name, False))
+                mark(start, end, ("class", n.name))
+                walk(n.body, n.name)  # after its own span: a nested class's lines are its own
+            elif alias and isinstance(n, alias) and isinstance(n.name, ast.Name):
+                defs.setdefault(n.lineno, []).append((n.name.id, False))
+            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and cls is not None:
+                for ln in range(n.lineno, end + 1):
+                    fields.setdefault(ln, []).append((n.target.id, cls))
+            elif isinstance(n, (ast.Assign, ast.AnnAssign)) and cls is None:
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                names = tuple(t.id for t in targets if isinstance(t, ast.Name) and _UPPER.fullmatch(t.id))
+                for ln in range(n.lineno, end + 1) if names else ():
+                    consts.setdefault(ln, []).extend(names)
+            else:
+                # A compound statement (if, try, with, for, match ...): its blocks are still at this level.
+                for block in ("body", "orelse", "finalbody"):
+                    walk(getattr(n, block, None) or [], cls)
+                for h in [*getattr(n, "handlers", []), *getattr(n, "cases", [])]:
+                    walk(h.body, cls)
+
+    try:
+        walk(tree.body, None)
+    except RecursionError:
+        return None
+    return PyScopes({k: tuple(v) for k, v in defs.items()}, at, {k: tuple(v) for k, v in fields.items()},
+                    {k: tuple(v) for k, v in consts.items()})
+
+
+def _header(line: str, old: str, new: str) -> tuple[str, str, bool]:
+    """A file header line of a diff (``diff --git``, ``---``, ``+++``): the file's old and new
+    paths after it, and whether it says that side is /dev/null."""
+    from .worker import _header_paths, git_unquote  # here: worker imports this module
+
+    if line.startswith("diff --git "):
+        old, new = _header_paths(line[len("diff --git "):]) or ("", "")
+        return old, new, False
+    # A path with a space ends in a tab; a tab in a path itself is quoted.
+    try:
+        p = git_unquote(line[4:].split("\t", 1)[0])
+    except ValueError:
+        p = ""
+    if p.startswith("a/") and line[0] == "-":
+        old = p[2:]
+    elif p.startswith("b/") and line[0] == "+":
+        new = p[2:]
+    return old, new, p == "/dev/null"
+
+
+@dataclass
+class _File:
+    old: str
+    new: str
+    deleted: bool = False
+    # (old start, old count, new start, new count, old lines, new lines), lines without their prefix
+    hunks: list[tuple[int, int, int, int, list[str], list[str]]] = field(default_factory=list)
+    removed: bool = False  # it has removed lines
+
+
+def _files(diff: str) -> list[_File]:
+    """The files of ``diff`` with their hunks."""
+    out: list[_File] = []
+    f: _File | None = None
+    in_hunk = False
+    for line in diff.split("\n"):
+        if line.startswith("diff --git "):
+            old, new, _ = _header(line, "", "")
+            f = _File(old, new)
+            out.append(f)
+            in_hunk = False
+            continue
+        if f is None:
+            continue
+        if not in_hunk and line.startswith(("--- ", "+++ ")):
+            f.old, f.new, null = _header(line, f.old, f.new)
+            if null and line[0] == "+":
+                f.deleted = True
+            continue
+        m = _HUNK.match(line)
+        if m:
+            in_hunk = True
+            f.hunks.append((int(m.group(1)), int(m.group(2) or 1), int(m.group(3)), int(m.group(4) or 1), [], []))
+            continue
+        if line == "" and in_hunk and f.hunks:
+            h = f.hunks[-1]
+            if len(h[4]) < h[1] and len(h[5]) < h[3]:
+                line = " "  # a blank context line without its space (diff.suppressBlankEmpty)
+        if in_hunk and f.hunks and line[:1] in ("+", "-", " "):
+            h = f.hunks[-1]
+            if line[0] != "+":
+                h[4].append(line[1:])
+            if line[0] != "-":
+                h[5].append(line[1:])
+            f.removed |= line[0] == "-"
+    return out
+
+
+def _lines(text: str) -> list[str]:
+    lines = text.split("\n")
+    return lines[:-1] if lines and lines[-1] == "" else lines
+
+
+def old_text(head: list[str], hunks: list[tuple[int, int, int, int, list[str], list[str]]]) -> list[str] | None:
+    """A file's old lines, rebuilt from its ``head`` lines and the hunks of a diff whose new
+    side is that head: the head's lines between the hunks, and each hunk's old side.  None if
+    the hunks don't fit the head (a cut diff, another head)."""
+    out: list[str] = []
+    pos = 0
+    for os_, oc, ns, nc, olds, news in hunks:
+        start = ns if nc == 0 else ns - 1
+        if ((len(olds), len(news)) != (oc, nc) or start < pos or start + nc > len(head)
+                or head[start:start + nc] != news):
+            return None
+        out += head[pos:start]
+        if (os_ if oc == 0 else os_ - 1) != len(out):
+            return None
+        out += olds
+        pos = start + nc
+    return out + head[pos:]
+
+
+def _cat(repo: str, env: dict, argv: list[str], stdin: bytes) -> bytes | None:
+    try:
+        proc = subprocess.run(["git", "--no-replace-objects", "cat-file", *argv], cwd=repo, env=env, input=stdin,
+                              capture_output=True, timeout=GREP_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def pinned_python(repo: str, head: str, diff: str, budget: int = MAX_SOURCES) -> dict[tuple[str, str], PyScopes]:
+    """The PyScopes of the Python files ``diff`` changes, by (side, path): ("+", its path at
+    ``head``) read from git, and ("-", its old path) rebuilt from that and ``diff``'s hunks
+    (old_text).  Each file's size is checked before it is read: one over MAX_SOURCE, or past
+    ``budget`` bytes in all (rebuilt old sides count too), is left out, as is any side that
+    can't be rebuilt or parsed; its lines are then matched as before."""
+    files = [f for f in _files(diff) if f.hunks and (f.new.endswith(_PY) or f.old.endswith(_PY))]
+    if not files:
+        return {}
+    env = snapshot._git_env(repo)
+    if env is None:
+        return {}
+    # The head's blobs: sizes first (one call), then the ones that fit (another).
+    wanted = [f for f in files if not f.deleted and not any(c in f.new for c in "\n\r\0")]
+    sizes: dict[str, tuple[str, int]] = {}
+    if wanted:
+        out = _cat(repo, env, ["--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+                   "".join(f"{head}:{f.new}\n" for f in wanted).encode("utf-8", "surrogateescape"))
+        if out is None:
+            return {}
+        for f, rec in zip(wanted, out.decode("utf-8", "replace").split("\n")):
+            parts = rec.split()
+            if len(parts) == 3 and parts[1] == "blob" and parts[2].isdigit():
+                sizes[f.new] = (parts[0], int(parts[2]))
+    used = 0
+    take: dict[str, int] = {}  # oid -> size: a blob two paths share is read once
+    for f in wanted:
+        oid, size = sizes.get(f.new, ("", MAX_SOURCE + 1))
+        if oid not in take and size <= MAX_SOURCE and used + size <= budget:
+            used += size
+            take[oid] = size
+    blobs: dict[str, str] = {}
+    if take:
+        out = _cat(repo, env, ["--batch"], "".join(f"{oid}\n" for oid in take).encode())
+        if out is None:
+            return {}
+        pos = 0
+        for oid, size in take.items():
+            nl = out.find(b"\n", pos)
+            if nl < 0 or out[pos:nl].split()[:1] != [oid.encode()]:
+                break
+            # Lines as the worker's diff has them: decoded as text, with universal newlines.
+            text = out[nl + 1:nl + 1 + size].decode("utf-8", "replace")
+            blobs[oid] = text.replace("\r\n", "\n").replace("\r", "\n")
+            pos = nl + 1 + size + 1
+    found: dict[tuple[str, str], PyScopes] = {}
+    parsed: dict[str, PyScopes | None] = {}  # by oid: a blob two paths share is parsed once
+    for f in files:
+        oid = "" if f.deleted else sizes.get(f.new, ("", 0))[0]
+        if not f.deleted and oid not in blobs:
+            continue
+        head_lines = _lines(blobs[oid]) if oid else []
+        if oid and f.new.endswith(_PY):
+            if oid not in parsed:
+                parsed[oid] = py_scopes(blobs[oid])
+            if parsed[oid] is not None:
+                found["+", f.new] = parsed[oid]
+        if f.removed and f.old.endswith(_PY):
+            old = old_text(head_lines, f.hunks)
+            text = "\n".join(old) + "\n" if old is not None else ""
+            size = len(text.encode("utf-8", "replace"))
+            if old is not None and size <= MAX_SOURCE and used + size <= budget:
+                used += size
+                s = py_scopes(text)
+                if s is not None:
+                    found["-", f.old] = s
+    return found
+
+
+def _scan(diff: str, scopes: dict[tuple[str, str], PyScopes] | None = None
+          ) -> tuple[dict[str, None], dict[str, str], dict[str, None], dict[str, str], dict[str, None], set[str]]:
     """The names ``diff`` touches: definitions and constants on changed lines, changed class
     fields (name -> class), the definitions the changed lines sit in, the changed methods
     (indented definitions on changed lines, or the method a changed line sits in), the
     names added lines read (string keys first, then attributes not called), and which of
-    them it touches in a file that isn't a test file."""
+    them it touches in a file that isn't a test file.  ``scopes``: the PyScopes of Python
+    files' sides (pinned_python); a changed line of one is placed by its line number (#174).
+    Prose files touch nothing (#175)."""
     keys: dict[str, None] = {}
     attrs: dict[str, None] = {}
     defined: dict[str, None] = {}
@@ -190,57 +471,75 @@ def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], 
     current = None
     method = ""  # ``current``'s keyword if it is a method (def or fn), else ""
     cls: tuple[int, str] | None = None  # the class a changed line sits in directly: (indent, name)
-    from .worker import _header_paths, git_unquote  # here: worker imports this module
+    scopes = scopes or {}
 
     old = new = ""  # the file's old and new paths: removed lines are in the old one (#135)
     prod: set[str] = set()  # the names touched in a file that isn't a test file
     in_hunk = False  # past the file's first hunk header: a "+++ x" line is content (codex-7)
-    for line in diff.splitlines():
+    old_ln = new_ln = 0  # the next old and new line numbers in the hunk
+    rem_old = rem_new = 0  # the hunk's old and new lines still to come
+    for line in diff.split("\n"):
         if line.startswith("diff --git ") or (not in_hunk and line.startswith(("+++", "---"))):
             if line.startswith("diff --git "):
-                old, new = _header_paths(line[len("diff --git "):]) or ("", "")
                 in_hunk = False
-            elif line.startswith(("--- ", "+++ ")):
-                # A path with a space ends in a tab; a tab in a path itself is quoted.
-                try:
-                    p = git_unquote(line[4:].split("\t", 1)[0])
-                except ValueError:
-                    p = ""
-                if p.startswith("a/") and line[0] == "-":
-                    old = p[2:]
-                elif p.startswith("b/") and line[0] == "+":
-                    new = p[2:]
+            if line.startswith(("diff --git ", "--- ", "+++ ")):
+                old, new, _ = _header(line, old, new)
             current, method, cls = None, "", None
             continue
         m = _HUNK.match(line)
         if m:
             in_hunk = True
-            text = _mask(m.group(1), new)
-            d = _DEF.search(text) or _CALL.search(text) if text else None
+            old_ln, new_ln = int(m.group(1)), int(m.group(3))
+            rem_old, rem_new = int(m.group(2) or 1), int(m.group(4) or 1)
+            text = _mask(m.group(5), new)
+            d = (_DEF.search(text) or _CALL.search(text)
+                 if text and not new.endswith(_PROSE) and not _COMMENT.match(text) else None)
             current = d.group(1) if d else None
             mm = _METHOD.match(text)
             method = mm.group(2) if mm else (_SELF.search(text).group(1) if _SELF.search(text) else "")
             c = _CLASS.match(text)
             cls = (len(c.group(1)), c.group(2)) if c else None
             continue
+        if line == "" and in_hunk and rem_old > 0 and rem_new > 0:
+            line = " "  # a blank context line, which diff.suppressBlankEmpty leaves without its space
         if not line.startswith(("+", "-", " ")):
             continue
+        ln = old_ln if line[0] == "-" else new_ln
+        old_ln += line[0] != "+"
+        new_ln += line[0] != "-"
+        rem_old -= line[0] != "+"
+        rem_new -= line[0] != "-"
         body = line[1:]
         path = old if line[0] == "-" else new
+        if path.endswith(_PROSE):
+            continue
         found = _defs(body, path)
         c = _CLASS.match(body)
         meth = _METHOD.match(body)
         touched: list[str] = []  # the names this line touches, whatever they turn out to be
         if line[0] == "+" and not body.lstrip().startswith(("#", "//")):
             # An attribute a Python line reads off a standard-library module is the module's (#161).
-            py = path.endswith((".py", ".pyi"))
+            py = path.endswith(_PY)
             read = [k.group(1) for k in _KEY.finditer(body)], [
                 a.group(1) for a in _ATTR.finditer(body)
                 if not (py and (r := _RECEIVER.search(body[:a.start()])) and r.group(1) in _STDLIB)]
             keys.update(dict.fromkeys(read[0]))
             attrs.update(dict.fromkeys(read[1]))
             touched += read[0] + read[1]
-        if line[0] in "+-":
+        index = scopes.get((line[0], path)) if line[0] in "+-" else None
+        if index is not None:
+            # Placed by its line in the parsed file (#174), not by the hunk's text.
+            for what, name, owner in index.touch(ln):
+                if what in ("defined", "method"):
+                    defined.setdefault(name)
+                elif what == "field":
+                    fields.setdefault(name, owner)
+                else:
+                    enclosing.setdefault(name)
+                if what in ("method", "in_method"):
+                    methods.setdefault(name, "def")
+                touched.append(name)
+        elif line[0] in "+-":
             defined.update(dict.fromkeys(found))
             touched += found
             k = _CONST.match(body)
@@ -253,7 +552,7 @@ def _scan(diff: str) -> tuple[dict[str, None], dict[str, str], dict[str, None], 
             if f and cls is not None and 0 < len(f.group(1).expandtabs(4)) - cls[0] <= 4 and not found:
                 fields.setdefault(f.group(2), cls[1])
                 touched.append(f.group(2))
-            if meth:
+            if meth and meth.group(3) in found:  # a definition outside comments and strings
                 methods.setdefault(meth.group(3), meth.group(2))
                 touched.append(meth.group(3))
             elif current and not found:
@@ -313,13 +612,15 @@ def mentioned(texts: list[str], exclude: set[str] | frozenset[str] = frozenset()
     return list(out)[:limit]
 
 
-def terms(diff: str, mention: list[str] | None = None, limit: int = MAX_SYMBOLS) -> list[Term]:
+def terms(diff: str, mention: list[str] | None = None, limit: int = MAX_SYMBOLS,
+          scopes: dict[tuple[str, str], PyScopes] | None = None) -> list[Term]:
     """What to search for ``diff``: its names (see symbols, at most ``limit``), the other
     definitions of its changed methods (at most MAX_METHODS), the names its added lines only
     read (at most MAX_READ), and the names in ``mention`` that aren't among them (at most
     MAX_MENTIONED).  Within each group, the names it touches outside test files come first;
-    its own names and changed methods touched only in tests are marked ``test`` (#135)."""
-    defined, fields, enclosing, methods, reads, prod = _scan(diff)
+    its own names and changed methods touched only in tests are marked ``test`` (#135).
+    ``scopes``: see _scan."""
+    defined, fields, enclosing, methods, reads, prod = _scan(diff, scopes)
 
     def first(name: str) -> bool:  # a sort key: False (outside tests) sorts first; sorted() is stable
         return name not in prod
@@ -569,7 +870,9 @@ def note(repo: str, head: str, diff: str, readable: frozenset[str] | set[str] | 
     """(rendered hits, whether git grep's output was cut, whether a hit is outside
     ``readable``) for ``diff`` at ``head``, and for the names in ``mention`` (see
     mentioned()); ("", False, False) when there is nothing to search or git can't."""
-    found = terms(diff, mention)
+    # The Python files' scopes, from the full diff (a capped one keeps it as ``raw``), whose
+    # hunks rebuild the old sides; the names come from the diff the reviewer sees.
+    found = terms(diff, mention, scopes=pinned_python(repo, head, getattr(diff, "raw", None) or diff))
     if not found:
         return "", False, False
     u = search(repo, head, [t.pattern for t in found])
