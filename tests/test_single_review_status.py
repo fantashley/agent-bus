@@ -68,7 +68,9 @@ def test_snapshot_of_a_review_waiting_for_its_fix_is_swept(env, no_spawn):
     h1 = commit("one\n")
     claude = Service(bus, "claude", bus.register_session("claude"))
     tid = claude.request_review("codex", str(repo), base, h1)["thread"]["id"]
-    assert snapshot.ensure(str(repo), tid, base, h1, 10**9).path
+    snap = snapshot.ensure(str(repo), tid, base, h1, 10**9)
+    assert snap.path
+    snapshot.release(snap.hold)  # as the worker that made it does when its job ends (#166)
     snapshot.sweep(bus)
     assert (snapshot.root() / tid).exists()  # its job is still queued
     run_job(bus, tid)  # the worker sweeps after its job

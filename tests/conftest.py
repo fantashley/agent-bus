@@ -16,14 +16,17 @@ FAKE = Path(__file__).resolve().parent / "fake_peer.py"
 
 
 @pytest.fixture(autouse=True)
-def no_real_state(tmp_path_factory, monkeypatch):
+def no_real_state(tmp_path_factory):
     """Never the real state and config dirs, even in a test without ``env``: a worker's
-    sweep there removed a running review's snapshot (#164)."""
+    sweep there removed a running review's snapshot (#164).  With its own MonkeyPatch, so a
+    test's ``monkeypatch.undo()`` never puts the real ones back (#166)."""
     home = tmp_path_factory.mktemp("xdg")
-    monkeypatch.setenv("XDG_STATE_HOME", str(home / "state"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
-    monkeypatch.delenv("AGENT_BUS_DB", raising=False)
-    monkeypatch.delenv("AGENT_BUS_CONFIG", raising=False)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("XDG_STATE_HOME", str(home / "state"))
+        mp.setenv("XDG_CONFIG_HOME", str(home / "config"))
+        mp.delenv("AGENT_BUS_DB", raising=False)
+        mp.delenv("AGENT_BUS_CONFIG", raising=False)
+        yield
 
 
 @pytest.fixture(autouse=True)

@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -603,17 +604,60 @@ def test_a_build_that_cannot_serve_the_streams_is_retried_once_they_change():
     good: once those streams change, the same build is tried again (an ordinary failure
     still waits for the install to change)."""
     shim = bare_shim()
-    shim.listens = {"listen:0": {"request": {"id": "listen:0"}, "honored": {"toolsListChanged": True}}}
-    shim._fail("/new", float("inf"), mcp_shim.Mismatch("narrower filter"))
+    stream = {"request": {"id": "listen:0"}, "honored": {"toolsListChanged": True}}
+    shim.listens = {"listen:0": stream}
+    shim._fail("/new", float("inf"), mcp_shim.Mismatch("narrower filter", shim._streams()))
     shim._forget_failure("/new")
     assert shim.failed is not None
     shim.listens = {}  # the client ended that stream
     shim._forget_failure("/new")
     assert shim.failed is None
     shim._fail("/new", float("inf"), RuntimeError("it exited"))
-    shim.listens = {"listen:1": {}}
+    shim.listens = {"listen:1": {"request": {}, "honored": None}}
     shim._forget_failure("/new")
     assert shim.failed is not None
+
+
+def test_a_mismatch_is_kept_against_what_its_probe_saw():
+    """#168: the failure is recorded against the probe's snapshot of the streams and the
+    envelope, not the live streams when it is recorded: a stream the old build ended in
+    between, a listen id re-used with another filter, or a new envelope retries it."""
+    shim = bare_shim()
+    stream = {"request": {"id": "listen:0", "params": {"filter": "a"}}, "honored": {"toolsListChanged": True}}
+    shim.listens = {"listen:0": stream}
+    probed = shim._streams()
+    shim.listens = {}  # ended by the old build after the probe, before the failure is recorded
+    shim._fail("/new", float("inf"), mcp_shim.Mismatch("narrower filter", probed))
+    shim._forget_failure("/new")
+    assert shim.failed is None  # the streams differ from what was probed: tried again
+    shim.listens = {"listen:0": stream}
+    shim._fail("/new", float("inf"), mcp_shim.Mismatch("narrower filter", shim._streams()))
+    shim.listens = {"listen:0": {**stream, "request": {"id": "listen:0", "params": {"filter": "b"}}}}
+    shim._forget_failure("/new")
+    assert shim.failed is None  # the same id, another filter
+    shim.listens = {"listen:0": stream}
+    shim._fail("/new", float("inf"), mcp_shim.Mismatch("narrower filter", shim._streams()))
+    shim.meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "other": 1}
+    shim._forget_failure("/new")
+    assert shim.failed is None  # another envelope
+
+
+def test_forget_failure_reads_the_streams_under_the_lock():
+    """#168: _forget_failure reads the streams only while it holds the lock the old child's
+    reader takes to end one."""
+    shim = bare_shim()
+    shim.listens = {"listen:0": {"request": {"id": "listen:0"}, "honored": {}}}
+    shim._fail("/new", float("inf"), mcp_shim.Mismatch("narrower filter", shim._streams()))
+    seen = []
+
+    class Watch(dict):
+        def items(self):
+            seen.append(shim.lock.locked())
+            return super().items()
+
+    shim.listens = Watch(shim.listens)
+    shim._forget_failure("/new")
+    assert seen == [True] and shim.failed is not None
 
 
 def test_held_frames_of_a_stream_the_old_build_ended_are_dropped():
@@ -622,3 +666,51 @@ def test_held_frames_of_a_stream_the_old_build_ended_are_dropped():
     assert mcp_shim._stream_of({"jsonrpc": "2.0", "id": "listen:0", "result": {}}) == "listen:0"
     assert mcp_shim._stream_of({"jsonrpc": "2.0", "method": "notifications/cancelled",
                                 "params": {"requestId": "listen:0"}}) == "listen:0"
+
+
+class _Candidate:
+    """A candidate build for _probe: it answers discover and tools/list, and refuses the
+    listen streams named in ``refuse`` at once.  ``during_list`` runs while tools/list is
+    in flight (the serving child's reader ending a stream meanwhile)."""
+
+    def __init__(self, refuse=(), during_list=None):
+        self.refuse, self.during_list, self.listened = set(refuse), during_list, []
+
+    def request(self, rid, method, params, deadline):
+        if method == "tools/list":
+            if self.during_list:
+                self.during_list()
+            return {"tools": []}
+        return {"supportedVersions": ["2026-07-28"]}
+
+    def listen(self, request, deadline):
+        self.listened.append(request["id"])
+        if request["id"] in self.refuse:
+            raise mcp_shim.ListenRefused("subscriptions/listen ended at once: {'code': -32602}")
+        return {"toolsListChanged": True}
+
+
+def test_a_stream_ended_during_the_probe_is_not_replayed_and_a_refusal_is_retried(monkeypatch):
+    """codex-1 (#169): the streams are read after tools/list, so one the serving child ended
+    meanwhile isn't replayed; and a candidate that refuses a stream at once (one the serving
+    child ended during the replay, say) is a Mismatch, tried again once the streams change,
+    so a later idle call can move to the same build."""
+    monkeypatch.setattr(mcp_shim, "last_seen", lambda sid: 2.0)
+    shim = bare_shim()
+    shim.session_id = "s-1"
+    shim.meta = {mcp_shim.PROTOCOL_META: "2026-07-28"}
+    a = {"request": {"id": "listen:a"}, "honored": {"toolsListChanged": True}}
+    b = {"request": {"id": "listen:b"}, "honored": {"toolsListChanged": True}}
+    shim.listens = {"listen:a": a, "listen:b": b}
+    cand = _Candidate(during_list=lambda: shim.listens.pop("listen:a"))
+    assert shim._probe(cand, 1.0, time.monotonic() + 5) == [] and cand.listened == ["listen:b"]
+    shim.listens = {"listen:a": a, "listen:b": b}
+    with pytest.raises(mcp_shim.Mismatch) as e:
+        shim._probe(_Candidate(refuse={"listen:a"}), 1.0, time.monotonic() + 5)
+    shim._fail("/new", float("inf"), e.value)
+    shim._forget_failure("/new")
+    assert shim.failed is not None  # nothing changed: still skipped
+    del shim.listens["listen:a"]  # the client's stream ended
+    shim._forget_failure("/new")
+    assert shim.failed is None
+    assert shim._probe(_Candidate(refuse={"listen:a"}), 1.0, time.monotonic() + 5) == []

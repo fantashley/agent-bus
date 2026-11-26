@@ -221,6 +221,7 @@ class Worker:
         self.quota_noticed: set[str] = set()
         self._quota_lock = threading.Lock()  # round 1 runs peers in parallel
         self._snap_hold: int | None = None  # this job's hold on its thread's snapshot (#164)
+        self._head_holds: dict[str, int] = {}  # and on each head's copy its turns read (#166)
 
     # ------------------------------------------------------------------ plumbing
 
@@ -231,6 +232,9 @@ class Worker:
         try:
             return self._run()
         finally:
+            for fd in self._head_holds.values():
+                snapshot.release(fd)
+            self._head_holds.clear()
             snapshot.release(self._snap_hold)
             self._snap_hold = None
             self.sweep_snapshots(self.thread_id)  # after finish_job: this one, if it is done
@@ -1378,8 +1382,6 @@ class Worker:
                 else:
                     self.finish_thread("needs_human")
                 return None
-            if res2.incomplete:
-                res = res2
             first = verdict
             raw2 = extract_reply(res2.text, "summary") if res2.text else None
             verdict = normalize_verdict(raw2)
@@ -1543,10 +1545,10 @@ class Worker:
         """The read-only snapshot of the pinned head the reviewer reads files from (#111),
         made now or reused from an earlier turn on the same head.  Best effort: without one,
         the prompt says files on disk may not match the head.  Held until the job ends, so
-        no other worker's sweep removes it while a turn reads it (#164)."""
-        if self._snap_hold is None and self.config.max_snapshot_bytes > 0:
-            self._snap_hold = snapshot.hold(t["id"], cancelled=self.cancelled)
+        no other worker's sweep (#164) or build (#166) removes it while a turn reads it."""
         try:
+            if self._snap_hold is None and self.config.max_snapshot_bytes > 0:
+                self._snap_hold = snapshot.hold(t["id"], cancelled=self.cancelled)
             if self._snap_hold is None and self.config.max_snapshot_bytes > 0:
                 # Unheld, a sweep could remove it under the turn: none, rather than one that may go.
                 snap = snapshot.Snapshot(head=refs["head_commit_id"], reason=(
@@ -1554,6 +1556,13 @@ class Worker:
             else:
                 snap = snapshot.ensure(refs["repo"], t["id"], refs["base_commit_id"], refs["head_commit_id"],
                                        self.config.max_snapshot_bytes, cancelled=self.cancelled)
+                if snap.hold is not None:
+                    # Held until the job ends, as the thread is (#166): one hold per head is enough.
+                    if snap.head in self._head_holds:
+                        snapshot.release(snap.hold)
+                    else:
+                        self._head_holds[snap.head] = snap.hold
+                    snap.hold = None
         except Exception as e:  # noqa: BLE001 (never what fails a review)
             snap = snapshot.Snapshot(head=refs["head_commit_id"], reason=f"it could not be made ({e!r})")
         # A non-UTF-8 file name in it would fail the event's insert and a strict prompt encode.
@@ -2172,7 +2181,9 @@ _REFUSAL = re.compile(r"(?:(?:I['’]m|I am)\s+sorry|sorry|apologies|unfortunate
                       r"not\s+able\s+to|must\s+decline\s+to)\s+(?:assist|help|comply)\b(?!\s+but\b)", re.I)
 
 
-_CLOSER = re.compile(r"(?:if|let me know|is there|please|feel free|i(?:['’]d| would) be happy|i can|happy to)\b", re.I)
+# A closer offers help; "I can" alone may start a finding ("I can confirm the path ...", #161).
+_CLOSER = re.compile(r"(?:if|let me know|is there|please|feel free|i(?:['’]d| would) be happy|happy to"
+                     r"|i can (?:help|assist))\b", re.I)
 
 
 def is_refusal(text: str | None) -> bool:
