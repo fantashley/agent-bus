@@ -8,7 +8,7 @@ import pytest
 
 from agent_bus import prompts
 from agent_bus.db import HUMAN, SYSTEM
-from agent_bus.peers import extract_json
+from agent_bus.peers import TurnResult, extract_json
 from agent_bus.service import Service
 from agent_bus.worker import Worker, diff_overview, is_refusal, normalize_verdict, repair_reason, verdict_problem
 
@@ -124,6 +124,38 @@ def test_a_bare_refusal_is_named_as_one(env, no_spawn, monkeypatch):
         (e["kind"], e["text"]) for e in bus.events(tid)]
     assert any(m["body"].startswith("codex's reply was a refusal and had no valid proposal")
                for m in bus.history(tid)["messages"] if m["sender"] == SYSTEM)
+
+
+@pytest.mark.parametrize("text, refusal", [
+    ("I cannot assist with that request.", True),
+    ("I'm sorry, but I can't help with that.", True),
+    ("Sorry, I am unable to comply. Let me know if you need anything else.", True),
+    ("I can't help but notice the retry loop never backs off.", False),  # prose, not a refusal
+    ('The model said "I cannot assist with that request."', False),  # a quoted refusal
+    ("Looking at the diff. I cannot assist with that.", False),  # not where the reply starts
+    ("I cannot assist with that. The diff is large. It touches the worker.", False),  # more than a refusal
+    ("Unfortunately, I can't help with that request.", True),
+    ("I'm sorry. I can't help with that.", True),
+    ("I can't help you with the benchmark. The restore path still clears the queue.", False),  # a finding
+])
+def test_only_a_standalone_refusal_counts(text, refusal):
+    # #156 (codex-2): a substring match counted prose and quotes as refusals.
+    assert is_refusal(text) is refusal
+
+
+def test_the_refusal_notice_reads_the_turn_the_verdict_came_from(env, no_spawn, monkeypatch):
+    # #156 (codex-3): a repair turn that failed after streaming refusal-like text is reported by
+    # its error, not as a refusal judged from its text against the first turn's error.
+    bus = env["bus"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(env["repo"]), "a" * 40, "b" * 40)["thread"]["id"]
+    monkeypatch.setattr(Worker, "review_diff", lambda self, refs, interdiff: ("+x", "Diff:"))
+    turns = iter([TurnResult(ok=True, text="no verdict here", external_id="s1"),
+                  TurnResult(ok=False, text="I cannot assist with that.", error="codex exited with status 2")])
+    monkeypatch.setattr(Worker, "turn", lambda self, *a, **k: next(turns))
+    run_job(bus, tid)
+    notice = bus.history(tid)["messages"][-1]["body"]
+    assert "exited with status 2" in notice and "refusal" not in notice
 
 
 def test_review_prompt_leads_with_files_commits_and_testing(env, no_spawn, monkeypatch):
@@ -344,3 +376,33 @@ def test_pushback_without_a_note_keeps_the_heads_testing_note(env, no_spawn, rev
     head2 = commit("two\n")
     claude.request_review(who, str(repo), base, head2, prev_head_commit_id=head, reviewers=reviewers)
     assert bus.thread(tid)["refs"]["testing"] is None  # a new head: the old note no longer applies
+
+
+def test_a_confirmation_pass_leads_with_the_open_findings(env, no_spawn, monkeypatch):
+    # #159: a resumed follow-up with findings to settle leads with their ids and one line each,
+    # then the interdiff, then the author's notes and testing; the read commands are named,
+    # not listed again, and a new blocker must say why the earlier head didn't show it.
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    h1 = commit("one\n")
+    long = "The lock is released too early. " + "It then races with the writer, " * 20
+    monkeypatch.setenv("FAKE_REPLY_CODEX", json.dumps({"verdict": "request_changes", "summary": "s", "findings": [
+        {"file": "a.txt", "line": 1, "severity": "high", "comment": long}]}))
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    tid = claude.request_review("codex", str(repo), base, h1)["thread"]["id"]
+    run_job(bus, tid)
+    first = calls(env)[-1]["prompt"]
+    h2 = commit("two\n")
+    claude.send("codex-1: `release_lock` now runs after the write.", thread=tid)
+    claude.request_review("codex", str(repo), base, h2, prev_head_commit_id=h1, testing="pytest: 12 passed")
+    run_job(bus, tid)
+    p = calls(env)[-1]["prompt"]
+    assert "- codex-1 [high] a.txt:1: The lock is released too early.\n" in p and "races with the writer" not in p
+    order = ["Your open blocking findings", "confirm or reopen it", "```diff", "`release_lock` now runs",
+             "pytest: 12 passed", "Reading the pinned head", "settle the findings listed at the top"]
+    assert [p.index(s) for s in order] == sorted(p.index(s) for s in order)
+    assert "why it wasn't visible on\nthe earlier head" in p
+    # The snapshot's path first, then the commands by name with the pinned ids.
+    assert f"use the read-only git commands from your first\npass with base {base} and head {h2}" in p
+    assert "git -C" not in p and "git -C" in first
+    assert "--no-replace-objects show" not in p and "For history and the other pinned commits:" in first

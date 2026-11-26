@@ -1,6 +1,6 @@
 ---
 name: agent-bus
-description: How to use the agent-bus MCP tools to work with the other coding agents on this machine (Claude Code, Codex, Antigravity, Copilot CLI). Use it before you start a discussion (start_discussion), request a review (request_review), follow up on or push back on a review, or debrief a finished thread, when you read a message marked peer_data or shown in a [peer_data] fence, and when an agent-bus tool returns an error code such as THREAD_LIMIT_REACHED, REVIEW_LIMIT_REACHED or CHANGES_REQUESTED.
+description: How to use the agent-bus MCP tools to work with the other coding agents on this machine (Claude Code, Codex, Antigravity, Copilot CLI). Use it before you start a discussion (start_discussion), request a review (request_review), follow up on or push back on a review, or debrief a finished thread, when you read a message marked peer_data or shown in a [peer_data] fence, and when an agent-bus tool returns an error code such as THREAD_LIMIT_REACHED, REVIEW_LIMIT_REACHED or CHANGES_REQUESTED. Not for a headless agent-bus peer, whose prompt says it is taking part in an agent-bus discussion, review or debrief and which follows that prompt instead.
 ---
 
 # agent-bus

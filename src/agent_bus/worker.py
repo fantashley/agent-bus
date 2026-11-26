@@ -1313,7 +1313,7 @@ class Worker:
         if resume and pushback:
             prompt = prompts.REVIEW_PUSHBACK.format(head=refs["head_commit_id"], replies=replies,
                                                     reading=self.reading_note(refs, snap, listing=False,
-                                                                              mention=mention),
+                                                                              mention=mention, brief=True),
                                                     severity=prompts.SEVERITY, budget=budget_note(t),
                                                     time_limit=self.time_limit_note(), earlier=earlier_note,
                                                     testing=("\n" + self.testing_note(t, refs) + "\n"
@@ -1321,11 +1321,15 @@ class Worker:
                                                     + ev.unchanged(t),
                                                     verdict_format=verdict_format(prior))
         elif resume:
+            # Open findings to settle lead the prompt, one line each, and the converge rules
+            # point at them rather than repeating their text (#159).
+            lead = confirm_lead(reviewer, mine["data"].get("head_commit_id") or refs["prev_head_commit_id"],
+                                prior) if prior else ""
             prompt = prompts.REVIEW_FOLLOWUP.format(
-                head=refs["head_commit_id"], prev=refs["prev_head_commit_id"], replies=replies,
+                head=refs["head_commit_id"], prev=refs["prev_head_commit_id"], replies=replies, lead=lead,
                 rebase=rebase_note, reading=self.reading_note(refs, snap, diff=inter, since=refs["prev_head_commit_id"],
-                                                              mention=mention),
-                converge=framing,
+                                                              mention=mention, brief=True),
+                converge=prompts.CONFIRM if prior else framing,
                 severity=prompts.SEVERITY, budget=budget_note(t),
                 time_limit=self.time_limit_note(), overview=self.review_overview(t, refs, inter, "interdiff"),
                 diff_heading=inter_heading, diff=inter, verdict_format=verdict_format(prior))
@@ -1394,8 +1398,8 @@ class Worker:
             if self.finish_thread("needs_human"):
                 why = (f"gave an inconsistent verdict ({problem})" if problem else
                        "did not return a usable verdict: its reply was a refusal, with no JSON verdict"
-                       if not res.error and is_refusal(gave.text) else
-                       f"did not return a usable verdict: {clause(res.error or 'no valid JSON verdict')}")
+                       if not gave.error and is_refusal(gave.text) else  # one turn's result (#156)
+                       f"did not return a usable verdict: {clause(gave.error or 'no valid JSON verdict')}")
                 self.safe_post(SYSTEM, f"{reviewer} {why}. Run `agent-bus resume` to retry.",
                                kind="status", recipient=t["initiator"])
             return None
@@ -1551,7 +1555,8 @@ class Worker:
         return snap
 
     def reading_note(self, refs: dict, snap: snapshot.Snapshot | None = None, listing: bool = True,
-                     diff: str | None = None, since: str | None = None, mention: list[str] | None = None) -> str:
+                     diff: str | None = None, since: str | None = None, mention: list[str] | None = None,
+                     brief: bool = False) -> str:
         """How the reviewer can read the pinned head: the snapshot's path (#111), with its
         file list for a reviewer that can't list directories or search, and where the names
         ``diff`` defines or edits are used at the head (#117); copyable read-only git
@@ -1559,8 +1564,10 @@ class Worker:
         work in a read-only sandbox in a jj repository (#93, #76), with a hint to read a few
         files or a line range at a time; with neither, a note that files on disk may not
         match the head.  ``since``: the head a resumed session's earlier prompt listed the
-        copy of; only the files added or removed since are listed then (#126)."""
-        out = self._reading_note(refs, snap, listing, since)
+        copy of; only the files added or removed since are listed then (#126).  ``brief``: for
+        a resumed session, which had the full note on its first pass: the copy's path first,
+        and the commands named rather than listed (#159)."""
+        out = self._reading_note(refs, snap, listing, since, brief)
         try:
             ad = ADAPTERS[self.config.harness_of(refs["reviewer"])]
         except (KeyError, ValueError):
@@ -1621,7 +1628,7 @@ class Worker:
         return rows[-1]["text"] if rows and rows[-1]["text"] != "none" else None
 
     def _reading_note(self, refs: dict, snap: snapshot.Snapshot | None, listing: bool,
-                      since: str | None = None) -> str:
+                      since: str | None = None, brief: bool = False) -> str:
         try:
             ad = ADAPTERS[self.config.harness_of(refs["reviewer"])]
         except (KeyError, ValueError):
@@ -1638,8 +1645,11 @@ class Worker:
             if not (shell and commands):
                 return out + prompts.READ_HEAD_FILES
             return out + prompts.READ_HEAD_SHELL.format(commands=commands.format(**ids))
-        out = prompts.SNAPSHOT.format(path=snap.path, head=snap.head)
-        if shell:
+        if brief:
+            out = prompts.SNAPSHOT_BRIEF.format(path=snap.path, head=snap.head)
+        else:
+            out = prompts.SNAPSHOT.format(path=snap.path, head=snap.head)
+        if shell and not brief:
             out += prompts.SNAPSHOT_SHELL.format(path=shlex.quote(snap.path))
         if snap.mode == "sparse":
             out += prompts.SNAPSHOT_SPARSE.format(n=len(snap.files), total=snap.tree_files)
@@ -1658,7 +1668,11 @@ class Worker:
                 out += prompts.SNAPSHOT_DELTA.format(
                     changes=f", with these changes ({count} now):{changes}" if changes
                     else f", with no files added or removed ({count}).")
-        if shell and commands:
+        if shell and commands and brief:
+            tools = " and ".join(t for t, ok in (("git", git_readable(refs["repo"], kind)),
+                                                 ("jj (with --ignore-working-copy)", kind == "jj")) if ok)
+            out += prompts.HISTORY_BRIEF.format(tools=tools, base=ids["base"], head=ids["head"])
+        elif shell and commands:
             out += prompts.SNAPSHOT_HISTORY.format(commands=commands.format(**ids))
         return out
 
@@ -2138,15 +2152,29 @@ def shown_path(path: str) -> str:
 
 # A bare model-side refusal ("I cannot assist with that request"), told apart from malformed
 # output in the repair event and notices so a recurring one is easy to spot (#154).  Its text
-# is the peer's, so it is never quoted in a system notice.
-_REFUSAL = re.compile(r"\bI(?:['’]m| am)?\s+(?:sorry,?\s+(?:but\s+)?I\s+)?(?:cannot|can['’]?t|can not|won['’]t|"
-                      r"will not|(?:am\s+|['’]m\s+)?(?:unable|not able) to|must decline to)\s+(?:assist|help|comply)", re.I)
+# is the peer's, so it is never quoted in a system notice.  Only a standalone one counts
+# (#156): the reply opens with the refusal (after an optional apology) and at most a polite
+# closing sentence follows, so prose such as "I can't help but notice ..." or a quoted refusal,
+# or a refusal followed by a finding, doesn't.
+_REFUSAL = re.compile(r"(?:(?:I['’]m|I am)\s+sorry|sorry|apologies|unfortunately)?[,.!]?\s*(?:but\s+)?"
+                      r"I(?:['’]m|\s+am)?\s+(?:cannot|can['’]?t|can\s+not|won['’]t|will\s+not|unable\s+to|"
+                      r"not\s+able\s+to|must\s+decline\s+to)\s+(?:assist|help|comply)\b(?!\s+but\b)", re.I)
+
+
+_CLOSER = re.compile(r"(?:if|let me know|is there|please|feel free|i(?:['’]d| would) be happy|i can|happy to)\b", re.I)
 
 
 def is_refusal(text: str | None) -> bool:
-    """Whether ``text`` is a bare refusal: short, with no JSON object, saying it can't help."""
+    """Whether ``text`` is a bare refusal: short, with no JSON object, and nothing but a
+    refusal sentence (and at most a polite closer such as "Let me know if ...")."""
     t = " ".join((text or "").split())
-    return bool(t) and len(t) <= 400 and "{" not in t and bool(_REFUSAL.search(t))
+    if not t or len(t) > 300 or "{" in t or not _REFUSAL.match(t):
+        return False
+    rest = [s for s in re.split(r"(?<=[.!?])\s+", t) if s][1:]
+    if rest and re.fullmatch(r"(?:I['’]m|I am)\s+sorry[.!]?|sorry[.!]?|apologies[.!]?|unfortunately[.!]?",
+                             t[:len(t) - len(" ".join(rest))].strip(), re.I):
+        rest = rest[1:]  # "Sorry. I can't help with that.": the apology was its own sentence
+    return len(rest) <= 1 and all(_CLOSER.match(s) for s in rest)
 
 
 def repair_reason(raw: object, problem: str | None, text: str | None = None) -> str:
@@ -2245,6 +2273,24 @@ def earlier_findings_note(reviewer: str, mine: dict | None, prior: dict[str, dic
                                            findings=prompts.wrap_peer(reviewer, "\n".join(rows)))
 
 
+# How much of each open finding a confirmation pass's lead quotes (#159).
+CONFIRM_LINE = 160
+
+
+def confirm_lead(reviewer: str, prev: str, prior: dict[str, dict]) -> str:
+    """The lead of a resumed follow-up that has blocking findings to settle (#159): each by
+    id, with one line of its text (the session has the rest)."""
+    rows = []
+    for fid, f in prior.items():
+        loc = f"{f.get('file')}:{f['line']}" if f.get("line") else str(f.get("file"))
+        comment = " ".join(str(f.get("comment") or "").split())
+        first = re.split(r"(?<=[.!?])\s", comment, maxsplit=1)[0]
+        if len(first) > CONFIRM_LINE:
+            first = first[:CONFIRM_LINE].rstrip() + "…"
+        rows.append(f"- {fid} [{f.get('severity')}] {loc}: {first}")
+    return prompts.CONFIRM_LEAD.format(prev=prev, findings=prompts.wrap_peer(reviewer, "\n".join(rows)))
+
+
 def verdict_format(prior: dict[str, dict]) -> str:
     """How the verdict ends (#93), with complete follow-up examples when it has earlier
     blocking findings to settle (#126): "earlier" entries and a finding reused by "id"."""
@@ -2258,10 +2304,9 @@ def verdict_format(prior: dict[str, dict]) -> str:
              "findings": [{"id": first, "file": "src/app.py", "line": 12, "severity": "high",
                            "comment": "What is still wrong."},
                           {"file": "src/app.py", "line": 30, "severity": "low", "comment": "A new, non-blocking note."}]}
-    done = {"verdict": "approve", "summary": "One paragraph.",
-            "earlier": [{"id": i, "status": "fixed", "note": "How it was fixed."} for i in ids], "findings": []}
+    # One example (#159): the approving one only repeated it with every id fixed.
     return prompts.VERDICT_FORMAT + prompts.VERDICT_FOLLOWUP.format(
-        ids=", ".join(ids), example=first, still=json.dumps(still), done=json.dumps(done))
+        ids=", ".join(ids), example=first, still=json.dumps(still))
 
 
 def settle_earlier(v: dict | None, prior: dict[str, dict], reusable: set[str] = frozenset()) -> dict | None:

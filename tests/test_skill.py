@@ -32,6 +32,13 @@ def test_frontmatter_names_the_skill_and_says_when_to_load_it():
     assert len(desc) <= 1024
     for trigger in ("start_discussion", "request_review", "debrief", "peer_data"):
         assert trigger in desc
+    # Codex shows descriptions with its higher-priority instructions, so the description itself
+    # keeps headless peers out (#156).
+    assert "Not for a headless agent-bus peer" in desc
+    # An unquoted YAML value: ": " or " #" in it would make the frontmatter invalid YAML.
+    for line in skill_text().split("\n---\n", 1)[0].splitlines()[1:]:
+        value = line.split(": ", 1)[1]
+        assert ": " not in value and " #" not in value and not value.startswith(("'", '"')), line
 
 
 def test_skill_mentions_every_mcp_tool(env):
