@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Iterator
 
+from . import __version__
 from . import config as cfg
 from . import evidence as ev
 from . import autoresume, procinfo, prompts, provenance, quota, snapshot, unvotable, usages
@@ -326,8 +327,8 @@ class Worker:
             return f"request the debrief of {self.thread_id} again"
         return f"run `agent-bus resume {self.thread_id}`"
 
-    def event(self, kind: str, text: str = "", agent: str | None = None) -> None:
-        self.bus.add_event(self.thread_id, kind, text, agent=agent, job_id=self.job["id"])
+    def event(self, kind: str, text: str = "", agent: str | None = None, purpose: str | None = None) -> None:
+        self.bus.add_event(self.thread_id, kind, text, agent=agent, job_id=self.job["id"], purpose=purpose)
 
     @contextmanager
     def fenced(self) -> Iterator[None]:
@@ -439,8 +440,15 @@ class Worker:
             return t["repo"], [str(scratch)]
         return str(scratch), []
 
+    def ran_before(self, agent: str, label: str) -> bool:
+        """Whether ``agent`` already started a pass or retry turn labelled ``label`` (``round 1``)
+        on this discussion: one whose round is being run again, so this one retries it."""
+        return any(e["kind"] == "turn_start" and e.get("purpose") in ("pass", "retry")
+                   and (e["text"] == label or e["text"].startswith(label + " "))
+                   for e in self.bus.events(self.thread_id, agent=agent))
+
     def turn(self, agent: str, prompt: str, resume: bool = True, fresh_prompt: str | None = None,
-             resume_only: bool = False, read_dirs: list[str] | None = None) -> TurnResult:
+             resume_only: bool = False, read_dirs: list[str] | None = None, purpose: str = "pass") -> TurnResult:
         """Run one headless turn, resuming the peer's conversation when possible.
 
         If the resume fails, the turn is retried in a fresh session with
@@ -448,7 +456,10 @@ class Worker:
         same prompt when the caller passes none.  ``resume_only`` (a debrief, #91): never
         a fresh session; with no stored session, or a resume that fails, the turn fails.
         ``read_dirs``: more directories the peer may read (a review's snapshot, #111), after
-        the scratch directory.
+        the scratch directory.  ``purpose`` (#161): why the turn runs, recorded on its
+        turn_start event: "pass" (a review pass or discussion round), "repair" (asking again
+        for a usable reply), "retry" (a pass or round run again: a review's retry, or one whose
+        earlier turn gave nothing) or "debrief".
         """
         self.check()
         self.config.require_available(agent, "peer")
@@ -482,17 +493,24 @@ class Worker:
         # turn on a several-reviewer thread is its pass 1, whatever round the thread is in (#117).
         # A repair or retry turn belongs to the pass that has no verdict yet.
         if self.debriefing:
-            label = "debrief"
+            label, purpose = "debrief", "debrief"
         elif t["kind"] == "review":
             done = self.bus._one("SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND sender=?"
                                  " AND kind='review_verdict'", self.thread_id, agent)["n"]
             label = f"pass {done + 1}"
         else:
             label = f"round {t['round']}"
+        if purpose == "pass" and t["kind"] != "review" and self.ran_before(agent, label):
+            # This round already started a turn of this peer: say, a resumed blind round 1.  (A
+            # review's retry comes from its job's mode: a pass on a new head with no verdict
+            # yet has the same label, codex-8.)
+            purpose = "retry"
+        if purpose in ("repair", "retry"):
+            label += f" {purpose}"
         self.event("turn_start", label + (" (resumed)" if resume_id else "") + shown
                    + f" · {version} · recipe {ad.agent}/{ad.recipe}"
                    + (" · near its usage limit: " + "; ".join(map(quota.describe_window, near)) if near else ""),
-                   agent)
+                   agent, purpose=purpose)
         emit = lambda kind, text: self.event(kind, text, agent)  # noqa: E731
         tag = self.job["id"]
         row = self.begin_usage(ad, model, resume_id)
@@ -987,7 +1005,7 @@ class Worker:
             # The repair turn resumes the same session; a fresh fallback gets only the
             # blind-safe prompt it already had, never the others' proposals.
             repair = prompts.REPAIR_BLIND if blind else prompts.REPAIR
-            res2 = self.turn(agent, repair, fresh_prompt=(fresh_prompt or prompt) + "\n\n" + repair)
+            res2 = self.turn(agent, repair, fresh_prompt=(fresh_prompt or prompt) + "\n\n" + repair, purpose="repair")
             if res2.quota or res2.format_changed or res2.config_error:
                 return  # out of usage or format drift mid-repair: post nothing from either attempt
             if res2.incomplete:
@@ -1349,7 +1367,8 @@ class Worker:
                     f"requested from {reviewer} at head {refs['head_commit_id'][:12]}.{fallback}", quiet=True)
         read_dirs = [snap.path] if snap.path else []
         self.turn_fresh = None
-        res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh, read_dirs=read_dirs)
+        res = self.turn(reviewer, prompt, resume=resume, fresh_prompt=fresh, read_dirs=read_dirs,
+                        purpose="retry" if mode == "retry" else "pass")
         if res.quota or res.format_changed or res.config_error:
             # Head, reviewer and session stay pinned for `agent-bus resume` after the reset
             # (or once the adapter handles the new format).  A reset can resume it by itself.
@@ -1375,7 +1394,7 @@ class Worker:
                    "verdict object described above (and its body block, if you use one)." if problem else
                    "Reply again with only the JSON verdict object described above (and its body block, if "
                    "you use one).")
-            res2 = self.turn(reviewer, ask, fresh_prompt=fresh + "\n\n" + ask, read_dirs=read_dirs)
+            res2 = self.turn(reviewer, ask, fresh_prompt=fresh + "\n\n" + ask, read_dirs=read_dirs, purpose="repair")
             if res2.quota or res2.format_changed or res2.config_error:
                 if res2.quota:
                     self.park_on_quota(reviewer)
@@ -2313,11 +2332,20 @@ def confirm_lead(reviewer: str, prev: str, prior: dict[str, dict]) -> str:
     return prompts.CONFIRM_LEAD.format(prev=prev, findings=prompts.wrap_peer(reviewer, "\n".join(rows)))
 
 
+def build_label() -> str:
+    """This build, for the verdict format label (#161): its version, and the Nix store item
+    it runs from when it is one (a dev build has the last release's version)."""
+    parts = (cfg._LAUNCHED_FROM or "").split("/")
+    store = parts[3] if len(parts) > 4 and parts[1:3] == ["nix", "store"] else None
+    return __version__ + (f", {store}" if store else "")
+
+
 def verdict_format(prior: dict[str, dict], review_only: bool = False) -> str:
     """How the verdict ends (#93), with complete follow-up examples when it has earlier
     blocking findings to settle (#126): "earlier" entries and a finding reused by "id".  A
     review-only review adds how to write findings its author can read on GitHub (#151)."""
-    tail = prompts.REVIEW_ONLY if review_only else ""
+    tail = (prompts.REVIEW_ONLY if review_only else "") + "\n" + prompts.FORMAT_LABEL.format(
+        version=prompts.VERDICT_FORMAT_VERSION, build=build_label())
     if not prior:
         return prompts.VERDICT_FORMAT + tail
     ids = list(prior)

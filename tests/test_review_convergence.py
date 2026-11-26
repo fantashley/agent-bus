@@ -204,7 +204,7 @@ def test_inconsistent_verdict_gets_one_repair_turn(env, no_spawn, monkeypatch):
     fixed = '{"verdict": "approve", "summary": "s", "findings": [{"file": "f", "severity": "low", "comment": "nit"}]}'
     asks = []
 
-    def turn(self, agent, prompt, resume=True, fresh_prompt=None, read_dirs=None):
+    def turn(self, agent, prompt, resume=True, fresh_prompt=None, read_dirs=None, purpose="pass"):
         asks.append(prompt)
         return TurnResult(ok=True, text=low if len(asks) == 1 else fixed, external_id="s1")
     monkeypatch.setattr(Worker, "turn", turn)

@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -192,6 +193,12 @@ def peer_status(bus: Bus, thread: str, peer: str) -> tuple[str, str | None, str]
     return "idle", None, f"{peer}: waiting"
 
 
+def _escaped(text: str) -> str:
+    """Event text as one printable line (#161): line breaks and other control characters
+    (a tool's error output, terminal escapes) escaped, so each event stays one line."""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", lambda m: m.group().encode("unicode_escape").decode(), text)
+
+
 def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
     color = rex.stdout_is_tty() and not args.no_color
     # OSC 7501 status is a Rex feature: only emit it inside Rex.
@@ -230,12 +237,12 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
             if args.peer or args.events or only:
                 for e in bus.events(args.thread, after_id=last_ev, agent=args.peer):
                     last_ev = e["id"]
-                    if e["kind"] in (("tool", "turn_start", "turn_end", "error", "format", "relaunch",
+                    if e["kind"] in (("tool", "tool_failed", "turn_start", "turn_end", "error", "format", "relaunch",
                                       "api_retry", "repair") if only else
-                                     ("text", "tool", "thinking", "turn_start", "turn_end", "error", "format",
-                                      "relaunch", "api_retry", "repair")):
+                                     ("text", "tool", "tool_failed", "thinking", "turn_start", "turn_end", "error",
+                                      "format", "relaunch", "api_retry", "repair")):
                         who = e["agent"] or "worker"
-                        print(_color(SYSTEM, f"  · {who} {e['kind']}: {e['text']}", color), flush=True)
+                        print(_color(SYSTEM, f"  · {who} {e['kind']}: {_escaped(e['text'] or '')}", color), flush=True)
             st = peer_status(bus, args.thread, args.peer) if args.peer else thread_status(bus, args.thread)
             if notify and not args.peer:
                 for w in notices.new(hooks.mail_waiting(bus, args.thread)):

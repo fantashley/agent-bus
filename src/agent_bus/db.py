@@ -199,9 +199,10 @@ CREATE TABLE IF NOT EXISTS events (
     thread_id TEXT NOT NULL,
     job_id TEXT,
     agent TEXT,
-    kind TEXT NOT NULL,                 -- turn_start | turn_end | text | tool | error
+    kind TEXT NOT NULL,                 -- turn_start | turn_end | text | tool | tool_failed | error ...
     text TEXT,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    purpose TEXT                        -- a turn_start's: pass | repair | retry | debrief (#161)
 );
 CREATE INDEX IF NOT EXISTS events_thread ON events(thread_id, id);
 CREATE TABLE IF NOT EXISTS human_actions (  -- what the human's CLI did, and from which process (#108)
@@ -358,7 +359,8 @@ class Bus:
         jcols = {r["name"] for r in self._all("PRAGMA table_info(jobs)")}
         jobs_sql = self._one("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'")["sql"]
         ucols = {r["name"] for r in self._all("PRAGMA table_info(turn_usage)")}
-        return (any(c not in scols for c, _ in self.SESSION_COLUMNS) or "blind" not in tcols or "launches" not in jcols
+        ecols = {r["name"] for r in self._all("PRAGMA table_info(events)")}
+        return ("purpose" not in ecols or any(c not in scols for c, _ in self.SESSION_COLUMNS) or "blind" not in tcols or "launches" not in jcols
                 or "dedupe_key TEXT UNIQUE" in jobs_sql or not self._has_table("cli_version_timeouts")
                 or "input_split" not in ucols or "split_total" not in ucols)
 
@@ -400,6 +402,8 @@ class Bus:
                 self.conn.execute("ALTER TABLE turn_usage ADD COLUMN input_split INTEGER NOT NULL DEFAULT 0")
             if "split_total" not in ucols:
                 self.conn.execute("ALTER TABLE turn_usage ADD COLUMN split_total TEXT")
+            if "purpose" not in {r["name"] for r in self._all("PRAGMA table_info(events)")}:
+                self.conn.execute("ALTER TABLE events ADD COLUMN purpose TEXT")  # #161; old rows NULL
             if not self._has_table("cli_version_timeouts"):
                 # Older versions cached a timed-out `--version` probe as "unknown" for good,
                 # indistinguishable from other unknowns: drop them all, in the same
@@ -1354,10 +1358,10 @@ class Bus:
         self.conn.execute("DELETE FROM cursors WHERE subscriber=? AND thread_id=?", (f"peer:{agent}", thread_id))
 
     def add_event(self, thread_id: str, kind: str, text: str = "", agent: str | None = None,
-                  job_id: str | None = None) -> None:
+                  job_id: str | None = None, purpose: str | None = None) -> None:
         self.conn.execute(
-            "INSERT INTO events (thread_id, job_id, agent, kind, text, created_at) VALUES (?,?,?,?,?,?)",
-            (thread_id, job_id, agent, kind, text[:2000], _now()))
+            "INSERT INTO events (thread_id, job_id, agent, kind, text, created_at, purpose) VALUES (?,?,?,?,?,?,?)",
+            (thread_id, job_id, agent, kind, text[:2000], _now(), purpose))
 
     def events(self, thread_id: str, after_id: int = 0, agent: str | None = None,
                job_id: str | None = None) -> list[dict]:

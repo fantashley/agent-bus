@@ -35,7 +35,13 @@ def make_build(root: Path, name: str, log: Path, extra_tool: bool = False, broke
         script += "import time\ntime.sleep(60)\n"
     script += ("from agent_bus import mcp_server\n_build = mcp_server.build\n"
                "def build(*a, **k):\n    server = _build(*a, **k)\n"
-               f"    @server.tool()\n    def which_build() -> str:\n        return {name!r}\n")
+               f"    @server.tool()\n    def which_build() -> str:\n        return {name!r}\n"
+               # A call the test holds in flight until it creates ``path`` (#171): no server-side
+               # timeout to race, unlike a wait (async, so the server answers other calls).
+               "    @server.tool()\n    async def hold(path: str) -> str:\n"
+               "        import asyncio, os, time\n        end = time.monotonic() + 300\n"
+               "        while not os.path.exists(path) and time.monotonic() < end:\n"
+               "            await asyncio.sleep(0.02)\n        return 'released'\n")
     if extra_tool:
         script += "    @server.tool()\n    def extra() -> str:\n        return 'extra'\n"
     script += "    return server\nmcp_server.build = build\n"
@@ -194,19 +200,24 @@ def test_next_idle_call_runs_the_installed_build(env, installs):
 
 
 def test_no_swap_while_a_call_is_in_flight(env, installs):
-    """A call that arrives while a wait runs goes to the current build; the next idle one
+    """A call that arrives while another runs goes to the current build; the next idle one
     moves."""
     client, _ = installs["connect"]()
     me = client.call("whoami")
-    tid = client.call("send", to="codex", body="hi")["thread"]["id"]
-    client.call("wait", thread=tid, timeout_s=1)  # nothing left unread: the next wait blocks
-    waiting = client.request("tools/call", {"name": "wait", "arguments": {"thread": tid, "timeout_s": 15}})
+    gate = installs["tmp"] / "release"
+    # A call held in flight until the test releases it (#171): no timing to race.
+    waiting = client.request("tools/call", {"name": "hold", "arguments": {"path": str(gate)}})
+    # The shim reads the client's lines in order, so once this answers it has taken the held
+    # call in flight (#171): switching before then let a slow shim see it as an idle call
+    # made after the switch, and move (correctly) onto the new build.
+    assert client.call("which_build") == "old"
     installs["switch"](make_build(installs["tmp"], "new", installs["log"]))
     during = client.call("whoami")
     assert during["session_id"] == me["session_id"]
     assert "moves onto the installed build by itself" in during["stale_build"]["hint"]
     assert [b[0] for b in installs["started"]()] == ["old"]
-    assert client.result(waiting)["status"] == "timeout"  # the wait ran to its end on the old build
+    gate.touch()
+    assert client.result(waiting) == "released"  # it ran to its end on the old build
     assert client.call("which_build") == "new"
     client.close()
 
@@ -515,11 +526,13 @@ def test_the_shim_log_says_why_it_did_not_move(env, installs):
     msgs = recorded("claude-code-2.1.332.jsonl")
     client = Client([str(installs["link"]), "mcp", "--agent", "claude"], dict(os.environ))
     last = replay_until_last_call(client, msgs)
-    tid = call_like(client, last, 901, "send", to="codex", body="hi")["result"]["structuredContent"]["thread"]["id"]
-    call_like(client, last, 902, "wait", thread=tid, timeout_s=1)
+    gate = installs["tmp"] / "release"
     waiting = json.loads(json.dumps(last))
-    waiting["id"], waiting["params"]["name"], waiting["params"]["arguments"] = 903, "wait", {"thread": tid, "timeout_s": 50}
+    # Held in flight until the test releases it (#171).
+    waiting["id"], waiting["params"]["name"], waiting["params"]["arguments"] = 903, "hold", {"path": str(gate)}
     client.send(waiting)
+    # Lines are read in order: once this answers, the held call is in flight (#171).
+    assert call_like(client, last, 9030, "which_build")["result"]["content"][0]["text"] == "old"
     installs["switch"](make_build(installs["tmp"], "new", installs["log"]))
     for rid in (904, 905):
         during = call_like(client, last, rid, "whoami")["result"]["structuredContent"]
@@ -527,9 +540,10 @@ def test_the_shim_log_says_why_it_did_not_move(env, installs):
     path = cfg.shim_log_path(during["session_id"])
     assert str(path) in during["stale_build"]["hint"]
     skips = [line for line in path.read_text().splitlines() if "not moving" in line]
-    assert len(skips) == 1 and "903 (tools/call wait)" in skips[0] and "listen" not in skips[0]
-    # A cancelled wait settles at once (no timing to race on a loaded machine): the next call moves.
-    client.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 903}})
+    assert len(skips) == 1 and "903 (tools/call hold)" in skips[0] and "listen" not in skips[0]
+    # Once the held call has its reply, the next call moves.
+    gate.touch()
+    assert client.response(903, timeout=60)["result"]["content"][0]["text"] == "released"
     assert call_like(client, last, 906, "which_build")["result"]["content"][0]["text"] == "new"
     client.close()
 

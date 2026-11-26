@@ -97,6 +97,7 @@ class StreamState:
     stray: int = 0  # non-JSON stdout lines (diagnostics), counted only
     pending: dict = field(default_factory=dict)  # step index -> tool name, for tool steps with no end state
     failed_tools: set = field(default_factory=set)  # names of tool steps that ended in an error
+    tool_names: dict = field(default_factory=dict)  # tool call id -> tool name, for its tool_failed event (#161)
     denied: list = field(default_factory=list)  # actions the CLI reported denying (sanitised labels)
     api_error: str | None = None  # Claude: the last API error's own type ("model_not_found", ...)
     api_status: int | None = None  # and its HTTP status, if it gave one
@@ -665,6 +666,15 @@ def _short(text: str, n: int = 240) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+def _tool_text(content) -> str:
+    """A Claude tool_result's content as text: a string, or its text blocks joined."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str))
+    return ""
+
+
 def _drop_codex_feature(args: list[str], feature: str) -> list[str]:
     """Remove ``--enable <feature>`` / ``--enable=<feature>`` from a codex argv slice."""
     out: list[str] = []
@@ -910,6 +920,17 @@ class ClaudeAdapter(Adapter):
                     hint = (inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("query")
                             or inp.get("url") or "")
                     emit("tool", _short(f"{block.get('name')} {hint}".strip()))
+                    if isinstance(block.get("id"), str):
+                        st.tool_names[block["id"]] = _safe_name(block.get("name"))
+        elif typ == "user":
+            # A tool's result comes back as the user's turn; is_error marks a failed call (a
+            # command that exited non-zero, a denied or invalid call), so `tail --events-only`
+            # tells it apart from one that worked (#161).
+            content = (obj.get("message") or {}).get("content")
+            for block in content if isinstance(content, list) else []:
+                if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error") is True:
+                    name = st.tool_names.get(block.get("tool_use_id"), "tool")
+                    emit("tool_failed", _short(f"{name}: {_tool_text(block.get('content'))}", 200))
         elif typ == "system" and obj.get("subtype") == "api_retry":
             # The CLI retrying a failed API call itself: worth seeing when a turn hangs (a
             # region that doesn't resolve retries 10 times).  Its own fields only, checked.
@@ -1265,12 +1286,23 @@ class CodexAdapter(Adapter):
                 emit("text", _short(item["text"]))
             elif itype == "command_execution" and typ == "item.started":
                 emit("tool", _short(f"shell {item.get('command', '')}"))
+            elif itype == "command_execution" and typ == "item.completed" and (
+                    item.get("status") in ("failed", "declined")
+                    or (isinstance(item.get("exit_code"), int) and item["exit_code"] != 0)):
+                # A failed command (non-zero exit, or one the sandbox declined), so it doesn't
+                # read like one that worked (#161).
+                code = item.get("exit_code")
+                emit("tool_failed", _short(f"shell {f'exit {code}' if isinstance(code, int) else item.get('status')}: "
+                                           f"{item.get('command', '')}", 200))
+            elif itype in ("mcp_tool_call", "file_change", "collab_tool_call") and typ == "item.completed" and \
+                    item.get("status") in ("failed", "declined"):
+                emit("tool_failed", _short(f"{itype} {item.get('tool') or ''} {item.get('status')}".replace("  ", " "), 200))
             elif itype == "web_search" and typ == "item.completed":
                 # The started item has an empty query (codex 0.171.0); the completed one says
                 # what was searched or opened.
                 action = item.get("action") if isinstance(item.get("action"), dict) else {}
                 emit("tool", _short(f"web_search {item.get('query') or action.get('url') or ''}".strip()))
-            elif itype in ("mcp_tool_call", "file_change") and typ == "item.started":
+            elif itype in ("mcp_tool_call", "file_change", "collab_tool_call") and typ == "item.started":
                 emit("tool", _short(f"{itype} {item.get('query') or item.get('tool') or ''}"))
         elif typ == "turn.completed":
             st.usage = codex_usage(obj.get("usage"))
@@ -1657,6 +1689,10 @@ class AntigravityAdapter(Adapter):
                     prev = st.pending.pop(idx, None)
                     if state == "ERROR":
                         st.failed_tools.add(_safe_name(name or prev or "tool"))
+                        err = info.get("error") if isinstance(info.get("error"), dict) else {}
+                        why = err.get("message") or err.get("type")
+                        emit("tool_failed", _short(f"{_safe_name(name or prev or 'tool')}"
+                                                   + (f": {why}" if isinstance(why, str) else ""), 200))
             if kind == "agent_response":
                 if su.get("text_delta"):
                     st.text_parts.append(su["text_delta"])
@@ -2057,6 +2093,13 @@ class CopilotAdapter(Adapter):
             args = data.get("arguments") if isinstance(data.get("arguments"), dict) else {}
             hint = next((args[k] for k in ("path", "pattern", "query", "url") if isinstance(args.get(k), str)), "")
             emit("tool", _short(f"{_safe_name(data.get('toolName'))} {hint}".strip()))
+            if isinstance(data.get("toolCallId"), str):
+                st.tool_names[data["toolCallId"]] = _safe_name(data.get("toolName"))
+        elif typ == "tool.execution_complete" and data.get("success") is False:
+            err = data.get("error")
+            why = err.get("message") if isinstance(err, dict) else err
+            name = st.tool_names.get(data.get("toolCallId"), "tool")
+            emit("tool_failed", _short(name + (f": {why}" if isinstance(why, str) else ""), 200))
         elif typ == "session.usage_checkpoint":
             st.usage = _copilot_usage(data)
         elif typ == "session.error":
