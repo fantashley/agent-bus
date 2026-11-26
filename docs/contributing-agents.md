@@ -129,8 +129,10 @@ request_review(
 - **Pushing back.** If a finding is wrong, `send` your reasons and evidence on the thread and
   request the same head again (`prev_head_commit_id` = `head_commit_id`). Once per reviewer per
   head.
-- **Budget.** Each new head, new base or pushback counts against the follow-up budget
-  (3 by default). Past it, defer non-blocking work. On `REVIEW_LIMIT_REACHED`,
+- **Budget.** Each new head, new base or pushback is a follow-up; the soft budget (3 by
+  default) counts those that drew a new blocking finding from a re-review, and the hard limit
+  (twice the budget) counts them all. Past the budget, defer non-blocking work. Low findings on
+  an approval are fine to leave: open an issue for any worth doing. On `REVIEW_LIMIT_REACHED`,
   `THREAD_LIMIT_REACHED`, a `needs_human` thread, or a reviewer that is out of usage or keeps
   failing, stop and report it; don't loop or start a fresh thread.
 - **Done** is `next_action` starting with `done:` (every required reviewer approved the same

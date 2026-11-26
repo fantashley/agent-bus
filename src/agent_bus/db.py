@@ -1620,17 +1620,27 @@ def format_dissent(d: dict) -> str:
 
 def review_progress(t: dict) -> dict:
     """How far a review has gone (#71): reviewer passes so far, the author's follow-up
-    requests against the soft budget, and whether it is parked for the human because it
-    ran past twice that.  Reviews report this instead of a discussion's ``max_rounds``."""
+    requests, and whether it is parked for the human because it ran past its limit.  Reviews
+    report this instead of a discussion's ``max_rounds``.
+
+    The soft budget counts only the follow-ups that drew a new blocking finding from a
+    reviewer's re-review (#140): one whose passes only confirmed fixes (or found an earlier
+    finding still blocking) is free.  Its warning also comes one follow-up before the hard
+    limit, which still counts every follow-up, so a review never parks unannounced."""
     refs = t["refs"] or {}
     budget = int(refs.get("followup_budget") or DEFAULT_FOLLOWUP_BUDGET)
     used = int(refs.get("follow_ups") or 0)
+    # A review started before #140 has no record of which follow-ups drew new blockers (None,
+    # unknown): its budget keeps counting every follow-up, as it did when it started.
+    counted = refs.get("new_blocker_follow_ups")
+    blocking = None if counted is None else len(set(counted))
     # A review-only review (#148) follows a colleague's pushes for as long as the pull request
     # lives, so it has no hard limit (None): only the soft budget's warning applies.
     limit = None if refs.get("review_only") else int(refs.get("followup_limit") or 2 * budget)
-    return {"passes": t["round"], "follow_ups": used, "followup_budget": budget,
-            "followup_limit": limit,
-            "budget_warning": used >= budget,
+    return {"passes": t["round"], "follow_ups": used, "new_blocker_follow_ups": blocking,
+            "followup_budget": budget, "followup_limit": limit,
+            "budget_warning": (used if blocking is None else blocking) >= budget
+                              or (limit is not None and used >= limit - 1),
             "waiting_for_human": bool(refs.get("budget_parked")) and t["status"] == "needs_human"}
 
 
@@ -1642,9 +1652,14 @@ def over_followup_limit(p: dict) -> bool:
 
 
 def format_progress(t: dict) -> str:
-    """``pass 5, follow-ups 2/3`` (plus a budget warning, or that it waits for the human)."""
+    """``pass 5, follow-ups 3, new blockers 1/3`` (plus a budget warning, or that it waits for
+    the human): the soft budget counts the follow-ups that drew new blocking findings (#140)."""
     p = review_progress(t)
-    out = f"pass {p['passes']}, follow-ups {p['follow_ups']}/{p['followup_budget']}"
+    if p["new_blocker_follow_ups"] is None:  # started before #140: every follow-up counts
+        out = f"pass {p['passes']}, follow-ups {p['follow_ups']}/{p['followup_budget']}"
+    else:
+        out = (f"pass {p['passes']}, follow-ups {p['follow_ups']}, "
+               f"new blockers {p['new_blocker_follow_ups']}/{p['followup_budget']}")
     if p["waiting_for_human"]:
         return out + ", waiting for human"
     return out + (", budget warning" if p["budget_warning"] else "")

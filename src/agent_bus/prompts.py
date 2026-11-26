@@ -306,9 +306,9 @@ as it was."""
 
 # Once the author has used the soft follow-up budget (#71).
 BUDGET_SPENT = """
-This review has run long: the author has made {follow_ups} follow-up requests (soft budget
-{budget}). Only clear, concrete blockers as defined above should hold up approval; note
-anything else as low, for a follow-up issue."""
+This review has run long: the author has made {counts}.
+Only clear, concrete blockers as defined above should hold up approval; note anything else as
+low, for a follow-up issue."""
 
 REVIEW_FOLLOWUP = """\
 The change you reviewed earlier in this conversation has a new head: {head}

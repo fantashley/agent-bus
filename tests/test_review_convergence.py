@@ -232,9 +232,9 @@ def test_review_progress_shows_passes_not_max_rounds(env, no_spawn, capsys):
     claude.request_review(None, str(repo), base, h2, prev_head_commit_id=h1, reviewers=BOTH)
     assert cli.main(["history", tid]) == 0
     out = capsys.readouterr().out
-    assert "review pass 2, follow-ups 1/3:" in out and "r2/" not in out
+    assert "review pass 2, follow-ups 1, new blockers 0/3:" in out and "r2/" not in out
     assert cli.main(["threads"]) == 0
-    assert "pass2,fu1/3" in capsys.readouterr().out
+    assert "pass2,fu1,nb0/3" in capsys.readouterr().out
 
 
 def test_hard_stop_holds_even_if_the_worker_died_before_parking(env, no_spawn):
@@ -397,9 +397,10 @@ def test_two_reviewer_follow_ups_count_through_new_heads_and_a_pushback(env, no_
     assert new_head("four\n", approve="antigravity")["thread"]["follow_ups"] == 3
     t = bus.thread(tid)
     assert t["round"] == 5 and thread_summary(t)["follow_ups"] == 3
-    assert thread_summary(t)["budget_warning"] and t["status"] == "open"
-    notice = claude.inbox(thread=tid)["messages"][-1]["body"]
-    assert notice.startswith("codex requested changes") and "run long: 3 follow-up requests" in notice
+    # Only codex's re-reviews drew new blockers (#140): antigravity's first look at head two
+    # and its confirming approval don't count against the soft budget.
+    assert thread_summary(t)["new_blocker_follow_ups"] == 2
+    assert not thread_summary(t)["budget_warning"] and t["status"] == "open"
 
     # A pushback counts too.
     claude.send("PUSHBACK: intended", thread=tid)
@@ -407,6 +408,11 @@ def test_two_reviewer_follow_ups_count_through_new_heads_and_a_pushback(env, no_
                                 reviewers=BOTH, thread=tid)
     assert res["thread"]["follow_ups"] == 4 and bus.jobs(tid)[-1]["params"]["mode"] == "pushback"
     run_job(bus, tid)
+    t = bus.thread(tid)
+    assert thread_summary(t)["new_blocker_follow_ups"] == 3 and thread_summary(t)["budget_warning"]
+    notice = claude.inbox(thread=tid)["messages"][-1]["body"]
+    assert notice.startswith("codex requested changes")
+    assert "run long: 4 follow-up requests, 3 of them drawing new blocking findings" in notice
     assert f"Review pushback requested from codex at head {heads[-1][:12]}." in status_bodies(bus, tid)
     assert bus.review_standings(tid)["approved"] == ["antigravity"]
 
@@ -451,3 +457,68 @@ def test_single_reviewer_follow_ups_count_to_the_default_limit(env, no_spawn):
     with pytest.raises(BusError) as e:
         claude.request_review("codex", str(repo), base, commit("seven\n"), prev_head_commit_id=prev)
     assert e.value.code == "REVIEW_LIMIT_REACHED" and "to allow more follow-ups" in str(e.value)
+
+
+def test_follow_ups_that_only_confirm_fixes_are_free_until_the_limit_nears(env, no_spawn, monkeypatch):
+    """#140: the soft budget counts only the follow-ups whose re-review raised a new blocking
+    finding. One that finds an earlier finding still blocking (or only confirms fixes) is
+    free, but the warning still comes one follow-up before the hard limit."""
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    prev = commit("one\n")
+    tid = claude.request_review("codex", str(repo), base, prev)["thread"]["id"]
+    run_job(bus, tid)  # codex-1, a new high finding on the first pass: not a follow-up
+    monkeypatch.setenv("FAKE_REPLY_CODEX", json.dumps({
+        "verdict": "request_changes", "summary": "not yet",
+        "findings": [{"id": "codex-1", "file": "a.txt", "line": 1, "severity": "high", "comment": "typo"}],
+        "earlier": [{"id": "codex-1", "status": "still_blocking", "note": "still there"}]}))
+    for n in range(1, 6):
+        h = commit(f"{n}\n")
+        claude.request_review("codex", str(repo), base, h, prev_head_commit_id=prev)
+        prev = h
+        run_job(bus, tid)
+        p = thread_summary(bus.thread(tid))
+        assert (p["follow_ups"], p["new_blocker_follow_ups"]) == (n, 0)
+        assert p["budget_warning"] == (n == 5)  # one follow-up before the limit of 6
+        notice = claude.inbox(thread=tid)["messages"][-1]["body"]
+        assert ("run long" in notice) == (n == 5)
+    # The reviewer's note too: the fifth request already stands one before the limit.
+    assert "run long" in calls(env)[-1]["prompt"] and "run long" not in calls(env)[-2]["prompt"]
+    assert "0 of them drawing new blocking findings (soft budget 3; after 6 in all it waits" in notice
+
+    # A re-review that raises a blocking finding with a new id counts, once per follow-up.
+    monkeypatch.delenv("FAKE_REPLY_CODEX")
+    h = commit("6\n")
+    claude.request_review("codex", str(repo), base, h, prev_head_commit_id=prev)
+    run_job(bus, tid)
+    t = bus.thread(tid)
+    assert t["refs"]["new_blocker_follow_ups"] == [6] and bus.last_verdict(tid, "codex")["data"]["findings"]
+    assert t["status"] == "needs_human"  # the hard limit still counts every follow-up
+
+
+def test_a_review_started_before_the_new_count_keeps_counting_every_follow_up(env, no_spawn):
+    """#140: a review whose refs have no record of new-blocker follow-ups (it started on an
+    older build) keeps its old budget count, also across a single reviewer's follow-up."""
+    from agent_bus.db import review_progress
+    bus, repo = env["bus"], env["repo"]
+    base, commit = git_repo(repo)
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    h1 = commit("one\n")
+    tid = claude.request_review("codex", str(repo), base, h1)["thread"]["id"]
+    assert bus.thread(tid)["refs"]["new_blocker_follow_ups"] == []
+    run_job(bus, tid)
+    refs = bus.thread(tid)["refs"]
+    refs.pop("new_blocker_follow_ups")
+    bus.set_thread(tid, refs=json.dumps({**refs, "follow_ups": 2}))
+    h2 = commit("two\n")
+    claude.request_review("codex", str(repo), base, h2, prev_head_commit_id=h1)
+    t = bus.thread(tid)
+    assert "new_blocker_follow_ups" not in t["refs"]
+    # Unknown, not a measured count: the budget still counts every follow-up.
+    assert review_progress(t)["new_blocker_follow_ups"] is None and review_progress(t)["budget_warning"]
+    run_job(bus, tid)  # a re-review with a new blocker: still no partial record
+    t = bus.thread(tid)
+    assert "new_blocker_follow_ups" not in t["refs"] and review_progress(t)["new_blocker_follow_ups"] is None
+    notice = claude.inbox(thread=tid)["messages"][-1]["body"]
+    assert "run long: 3 follow-up requests (soft budget 3;" in notice and "drawing" not in notice

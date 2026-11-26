@@ -719,6 +719,10 @@ class Service:
                     for k in ("followup_budget", "followup_limit"):
                         if old.get(k):
                             refs[k] = old[k]
+                    if "new_blocker_follow_ups" in old:  # absent: a review started before #140
+                        refs["new_blocker_follow_ups"] = old["new_blocker_follow_ups"]
+                    else:
+                        refs.pop("new_blocker_follow_ups", None)
                     refs["follow_ups"] = int(old.get("follow_ups") or 0) + 1
                     kept = (old.get("peer_settings") or {}).get(reviewer, {})
                     # The follow-up runs with the thread's settings plus any new ones.
@@ -853,7 +857,7 @@ class Service:
         """A new review's follow-up count and budget (#71): a warning once the author has made
         ``review_followup_budget`` follow-up requests, the human after twice as many."""
         b = self.config.review_followup_budget
-        return {"follow_ups": 0, "followup_budget": b, "followup_limit": 2 * b}
+        return {"follow_ups": 0, "followup_budget": b, "followup_limit": 2 * b, "new_blocker_follow_ups": []}
 
     def _over_budget(self, t: dict, resuming: bool = False) -> bool:
         """Whether a review is held for the human by its follow-up limit (#71): parked for

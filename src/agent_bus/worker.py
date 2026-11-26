@@ -1129,6 +1129,7 @@ class Worker:
             if state not in ("approved", "changes_requested"):  # no verdict on this head yet
                 if self.review_round(mode) is None:
                     return  # parked as needs_human (or failed) with a notice
+                refs = self.thread()["refs"]  # the pass may have counted a new blocker (#140)
                 state = self.bus.review_standings(self.thread_id)["reviewers"][reviewer]["state"]
             mode = "first"
             if state == "approved":
@@ -1398,6 +1399,9 @@ class Worker:
                 self.safe_post(SYSTEM, f"{reviewer} {why}. Run `agent-bus resume` to retry.",
                                kind="status", recipient=t["initiator"])
             return None
+        # A re-review's blocking finding with no earlier id is new (#140): the follow-up that
+        # drew it counts against the soft budget; one that only confirmed fixes doesn't.
+        new_blocker = mine is not None and any(f["id"] not in prior and blocks(f) for f in verdict["findings"])
         number_findings(reviewer, verdict["findings"], earlier)
         lines = [f"Verdict: {verdict['verdict']}", "", verdict["summary"]]
         if verdict["earlier"]:
@@ -1420,12 +1424,20 @@ class Worker:
         # The session that gave the verdict, so a later pass resumes it only if it is still
         # the saved one (see interdiff_from).  That turn's own id: a turn that failed without
         # reporting one leaves an older session saved, which never saw this pass.
-        self.post(reviewer, "\n".join(lines).strip(), kind="review_verdict", session_id=f"job:{self.job['id']}",
-                  recipient=t["initiator"],
-                  data={"verdict": verdict["verdict"], "findings": verdict["findings"], "earlier": verdict["earlier"],
-                        "head_commit_id": refs["head_commit_id"], "base_commit_id": refs["base_commit_id"],
-                        "revision": refs.get("revision", 0), "request_id": t["id"],
-                        "session": gave.external_id})
+        with self.fenced():  # the verdict and its budget charge (#140) commit together
+            self.bus.post(self.thread_id, reviewer, "\n".join(lines).strip(), kind="review_verdict",
+                          session_id=f"job:{self.job['id']}", recipient=t["initiator"],
+                          data={"verdict": verdict["verdict"], "findings": verdict["findings"],
+                                "earlier": verdict["earlier"], "head_commit_id": refs["head_commit_id"],
+                                "base_commit_id": refs["base_commit_id"], "revision": refs.get("revision", 0),
+                                "request_id": t["id"], "session": gave.external_id})
+            if new_blocker:
+                now = self.bus.thread(self.thread_id)["refs"] or {}
+                used = int(now.get("follow_ups") or 0)
+                counted = now.get("new_blocker_follow_ups")  # None: started before #140, counts them all
+                if used and counted is not None and used not in counted:
+                    self.bus.set_thread(self.thread_id,
+                                        refs=json.dumps({**now, "new_blocker_follow_ups": [*counted, used]}))
         return verdict
 
     def interdiff_from(self, refs: dict, reviewer: str, mine: dict | None) -> str | None:
@@ -2361,7 +2373,18 @@ def budget_note(t: dict) -> str:
     p = review_progress(t)
     if not p["budget_warning"]:
         return ""
-    return prompts.BUDGET_SPENT.format(follow_ups=p["follow_ups"], budget=p["followup_budget"])
+    return prompts.BUDGET_SPENT.format(counts=budget_counts(p))
+
+
+def budget_counts(p: dict) -> str:
+    """How far a review's follow-ups have gone, for the "run long" notes (#71, #140)."""
+    out = f"{p['follow_ups']} follow-up requests"
+    if p["new_blocker_follow_ups"] is not None:
+        out += f", {p['new_blocker_follow_ups']} of them drawing new blocking findings"
+    out += f" (soft budget {p['followup_budget']}"
+    if p["followup_limit"] is not None:
+        out += f"; after {p['followup_limit']} in all it waits for the human user"
+    return out + ")"
 
 
 def budget_warning(t: dict) -> str:
@@ -2369,13 +2392,11 @@ def budget_warning(t: dict) -> str:
     p = review_progress(t)
     if not p["budget_warning"]:
         return ""
+    ran = f"\nThis review has run long: {budget_counts(p)}."
     if p["followup_limit"] is None:  # review-only (#148): no hard limit
-        return (f"\nThis review has run long: {p['follow_ups']} follow-up requests, soft budget "
-                f"{p['followup_budget']}. It is review-only, so it never parks for the human user; "
-                "consider finishing it with finish_review once the remaining findings are minor.")
-    return (f"\nThis review has run long: {p['follow_ups']} follow-up requests, soft budget "
-            f"{p['followup_budget']}. Consider deferring non-blocking findings to a follow-up issue, or "
-            f"asking the human user; after {p['followup_limit']} it waits for them.")
+        return (f"{ran} It is review-only, so it never parks for the human user; consider finishing it "
+                "with finish_review once the remaining findings are minor.")
+    return f"{ran} Consider deferring non-blocking findings to a follow-up issue, or asking the human user."
 
 
 def drift_reason(error: str) -> str:
