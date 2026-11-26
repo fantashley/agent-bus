@@ -6,7 +6,7 @@ import pytest
 
 from agent_bus import cli, evidence as ev, mcp_server
 from agent_bus.db import HUMAN, BusError
-from agent_bus.service import Service, review_next_action
+from agent_bus.service import Service, finished_line, review_next_action
 from agent_bus.worker import (Worker, normalize_verdict, prior_blocking, settle_earlier, settlement_problem,
                               verdict_problem)
 from test_review_rounds import git_repo, run_job
@@ -330,9 +330,13 @@ def test_finish_keeps_blockers_left_unsettled_at_an_earlier_head(env, no_spawn, 
     assert st["changes_requested"] == ["codex"] and st["reviewers"]["antigravity"]["state"] == "stale"
     f = claude.finish_review(tid, "enough")["thread"]["finished"]
     assert f["open_findings"] == ["codex-1"]
-    assert f["earlier_open_findings"] == {"antigravity-1": {"head_commit_id": h1, "base_commit_id": base}}
-    assert (f"unsettled from an earlier revision: antigravity-1 (head {h1[:12]} on base {base[:12]})"
+    assert f["earlier_unsettled"] == 1 and "earlier_open_findings" not in f  # a count, not every id (#154)
+    assert ("blocking findings left open: codex-1; 1 blocking finding unsettled from an earlier revision"
             in claude.thread_state(tid)["next_action"])
+    # A record from before the count still reads.
+    old = {"by": "claude", "head_commit_id": h2, "open_findings": [],
+           "earlier_open_findings": {"a-1": {}, "a-2": {}}}
+    assert "2 blocking findings unsettled from an earlier revision" in finished_line(old)
 
 
 def test_a_human_finish_is_recorded_on_either_path_and_flagged_when_unsure(env, no_spawn, monkeypatch):

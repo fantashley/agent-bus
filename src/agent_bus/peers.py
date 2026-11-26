@@ -1395,14 +1395,26 @@ def _agy_workspace_check(dirs: list[str]) -> None:
             '"enabled": false on each hook and "disabled": true on each MCP server.')
 
 
-# agy's read_file returns at most 46,080 bytes per call (live, agy 1.5.13, #126): a part file
-# kept under it is read whole in one call, so the model needn't guess slices.
-AGY_READ_CAP = 45_000
+# agy's read_file returns at most 800 lines or 46,080 bytes per call (live, agy 1.5.13, #126,
+# #152): a part file kept well under both is read whole in one call, so the model needn't
+# guess slices; a part of 810 lines needed a second, sliced read.
+AGY_READ_CAP = 44_000
+AGY_READ_LINES = 750
 
 
-def _cut(text: str, limit: int) -> tuple[str, str]:
-    """``text`` split into a head of at most ``limit`` UTF-8 bytes and the rest: at the last
-    line break that fits, or mid-line (on a character boundary) for one very long line."""
+def _cut(text: str, limit: int, lines: int | None = None) -> tuple[str, str]:
+    """``text`` split into a head of at most ``limit`` UTF-8 bytes (and, given ``lines``, at
+    most that many lines) and the rest: at the last line break that fits, or mid-line (on a
+    character boundary) for one very long line."""
+    if lines is not None:
+        end = -1
+        for _ in range(max(lines, 1)):
+            end = text.find("\n", end + 1)
+            if end < 0:
+                break
+        if end >= 0 and end + 1 < len(text):
+            head, tail = _cut(text[:end + 1], limit)
+            return head, tail + text[end + 1:]
     size = lambda k: len(text[:k].encode("utf-8", "surrogateescape"))  # noqa: E731
     if size(len(text)) <= limit:
         return text, ""
@@ -1420,7 +1432,8 @@ def _cut(text: str, limit: int) -> tuple[str, str]:
 def _agy_spill(guide: str, body: str, directory: str) -> str:
     """The --print value for a prompt too long for one argv entry (#126): the guide and as
     much of the prompt as fits, as part 1, and the rest in part files under ``directory``,
-    each under AGY_READ_CAP and named in order, so the reviewer reads each one whole.  The
+    each under AGY_READ_CAP bytes and AGY_READ_LINES lines and named in order, so the reviewer
+    reads each one whole (#152).  The
     sizes count the real notices and paths (codex-6); the number of parts is settled by
     trying again when a guess was wrong (its digits change the paths' length)."""
     def size(text: str) -> int:
@@ -1447,7 +1460,8 @@ def _agy_spill(guide: str, body: str, directory: str) -> str:
             nxt = paths[i - 1] if i - 1 < len(paths) else paths[-1]
             more = f"\n[end of part {i} of {n}: continue with part {i + 1}, {nxt}]\n"
             last = f"\n[end of part {i} of {n}: the whole prompt has been read]\n"
-            text, rest = _cut(rest, AGY_READ_CAP - size(head) - max(size(more), size(last)))
+            # The marker lines: the head's one, and the end marker's blank line and its own.
+            text, rest = _cut(rest, AGY_READ_CAP - size(head) - max(size(more), size(last)), AGY_READ_LINES - 3)
             parts.append((head, text, last if not rest else more))
             i += 1
         if len(parts) + 1 == n:
@@ -1479,7 +1493,9 @@ class AntigravityAdapter(Adapter):
     # 12: no --mode plan: with --disable-slash-commands agy ignores it, and says so on stderr
     # (live probe, agy 1.5.13, 2026-11-25: the same declared tools, prompt size and refused
     # write either way, and search_web runs without approval).
-    recipe = "12"
+    # 13: part files are also kept under read_file's line cap (#152), and the shared headless
+    # rules say the agent-bus skills don't apply to a peer (#154).
+    recipe = "13"
     # agy 1.5.13 declares search_web (Google-grounded search, run server side) but no page
     # fetch.  `search_web(*)` and `read_url(*)` deny rules are ignored, but a custom
     # agent's `tools` list removes it (live probes, 2026-11-23): see peer_agent.

@@ -444,10 +444,31 @@ def test_agy_reply_after_a_denial_is_a_normal_turn(env, monkeypatch):
     assert '"action"' in res.text  # it answered from context after the denial
 
 
+def test_agy_spill_splits_a_long_diff_under_read_files_line_cap(env, no_spawn):
+    # A diff of short lines is far under the byte cap per 800 lines (#152): the parts are cut by
+    # line count too, so each one is read whole in one read_file call, as part 1 says.
+    ad = adapter("antigravity", cfg.Config.load())
+    scratch = env["tmp"] / "scratch"
+    scratch.mkdir()
+    diff = "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1,0 +1,6000 @@\n"
+    diff += "".join(f"+x{i} = {i}\n" for i in range(6_000))  # ~60 KB over the argv limit with the rest
+    big = "Review this change.\n\n" + "a" * 60_000 + "\n" + diff
+    inline = ad.invocation(big, None, str(env["repo"]), [str(scratch)]).argv[-1]
+    written = sorted(scratch.glob("prompt-*-part*-of-*.md"), key=lambda p: int(p.name.split("-part")[1].split("-")[0]))
+    assert len(written) >= 2 and f"in {len(written) + 1} parts" in inline
+    assert "small enough to read whole in one read_file call" in inline
+    for p in written:
+        assert len(p.read_text().splitlines()) <= peers.AGY_READ_LINES and len(p.read_bytes()) <= peers.AGY_READ_CAP
+    n = len(written) + 1
+    first = inline.split(f"[part 1 of {n}]\n", 1)[1].rsplit(f"\n[end of part 1 of {n}", 1)[0]
+    rest = [p.read_text().split("\n", 1)[1].rsplit("\n[end of part", 1)[0] for p in written]
+    assert first + "".join(rest) == big
+
+
 def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     from agent_bus.prompts import AGY_HEADLESS
     ad = adapter("antigravity", cfg.Config.load())
-    assert ad.recipe == "12" and "run_command" in AGY_HEADLESS and "search_web" in AGY_HEADLESS
+    assert ad.recipe == "13" and "run_command" in AGY_HEADLESS and "search_web" in AGY_HEADLESS
     assert "do not use search_web" not in AGY_HEADLESS.lower()  # no contradiction with the preamble
     for resume_id in (None, "conv-1"):
         argv = ad.invocation("PROMPT-BODY", resume_id, str(env["repo"]), []).argv
@@ -466,6 +487,7 @@ def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     n = len(written) + 1
     assert n > 2 and f"in {n} parts" in inline and str(written[0]) in inline
     assert all(len(p.read_bytes()) <= peers.AGY_READ_CAP < 46_080 for p in written)
+    assert all(len(p.read_text().splitlines()) <= peers.AGY_READ_LINES < 800 for p in written)
     # The parts, stripped of their markers, are the prompt exactly, in order.
     first = inline.split(f"[part 1 of {n}]\n", 1)[1].rsplit(f"\n[end of part 1 of {n}", 1)[0]
     rest = []
@@ -499,7 +521,7 @@ def test_agy_headless_guidance_on_every_turn(env, no_spawn, monkeypatch):
     assert not any(AGY_HEADLESS.strip() in c["prompt"] for c in calls(env, "codex"))
     starts = [e["text"] for e in env["bus"]._all(
         "SELECT * FROM events WHERE thread_id=? AND kind='turn_start' AND agent='antigravity'", tid)]
-    assert starts and all("recipe antigravity/12" in s for s in starts)
+    assert starts and all("recipe antigravity/13" in s for s in starts)
 
 
 def test_incomplete_agy_discussion_turn_is_reported_without_a_drift_notice(env, no_spawn, monkeypatch):

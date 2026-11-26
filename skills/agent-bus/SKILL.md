@@ -200,8 +200,8 @@ To relay a GitHub pull request's review, use the `agent-bus-pr-review` skill.
 
 **Finishing without every approval.** `finish_review(thread, reason)` ends a review you started
 (review-only or not) once no pass is running: the thread is `resolved` with a `finished` record
-(who, the reason, the head, the blocking finding ids left open and any reviewer that hadn't
-reviewed that head), shown by `threads`, `history` and `wait`. It takes no more follow-ups (a
+(who, the reason, the head, the blocking finding ids left open at it, a count of those left
+unsettled at an earlier head, and any reviewer that hadn't reviewed that head), shown by `threads`, `history` and `wait`. It takes no more follow-ups (a
 new head needs a new review), and you can debrief it. The human user can do the same with
 `agent-bus finish <thread> --reason ...`.
 

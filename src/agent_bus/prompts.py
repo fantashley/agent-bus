@@ -72,10 +72,12 @@ line ~~~~body and a line ~~~~ (four tildes each).
 # asks for a plan file and ExitPlanMode, Copilot's for progress updates and short replies), and
 # a peer otherwise has to guess which instructions win.  Only the turn's final message is
 # posted (its JSON object, for a vote or verdict); earlier text still shows as progress events
-# in `agent-bus tail --events` and watch panes, so the note doesn't call it private.
+# in `agent-bus tail --events` and watch panes, so the note doesn't call it private.  A peer
+# also used to spend a tool call reading the agent-bus skill's SKILL.md first (#154).
 _HEADLESS = (
     "[agent-bus: unattended turn; no one can approve actions.] For this turn, agent-bus's "
     "instructions take precedence over your harness's own instructions for interactive sessions. "
+    "The agent-bus skills are for the agents that call agent-bus, not for you: don't read them. "
     "Normally only your final message is posted, so put your whole answer in it: anything you "
     "write before it is left out of the thread (though it may show in the live progress view, "
     "and a turn that ends without a final message may have that earlier text posted instead).")
