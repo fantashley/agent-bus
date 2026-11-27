@@ -120,7 +120,9 @@ as soon as something for you arrives. Routine notices ("Round 2 of 3", "Review r
 it returns the thread's state plus `progress`: for each peer working on the current job, its
 turn's state (`working`, `done`, `failed`, or `stopped` when the worker died), the elapsed
 time, the latest activity and its age, and the number of tool calls (and API retries or errors,
-if any). Only metadata is returned, never the peer's text. One wait at a time is enough:
+if any). While a self-hosted review's worker builds the head with nix, before any peer's turn,
+`progress.head_build` shows the head, `state` (`building`, `done`, or `stopped`) and the elapsed
+seconds. Only metadata is returned, never the peer's text. One wait at a time is enough:
 concurrent waits on a thread share whatever wakes them (the extra ones are marked `joined`), and
 on timeout only the last one to leave takes any quiet notices still unread. Every batch
 carries `cursor`, the last message id read. If a reply was lost, e.g. on a dropped connection,
@@ -282,7 +284,13 @@ same things in parallel:
   exits before its first turn. One that dies after a turn started fails the job, with an
   `error` event naming the exit code and the job's log. Discussions, debriefs and other
   repos' reviews always run the installed build. Each pass says which build runs it, after
-  the verdict format label, and in a `prompts` event (`agent-bus tail --events`). List only
+  the verdict format label, and in a `prompts` event (`agent-bus tail --events`). The
+  `request_review` result predicts, in `build`, which build will run the pass, from the head's
+  files (read from git with `ast` within a few seconds, never run): the installed build when
+  they show no `flake.nix`, another hand-off protocol (`PROTOCOL` in
+  `src/agent_bus/headbuild.py`) or another database schema, otherwise the head's own build,
+  which can still fall back. The worker's checks when the pass starts decide. The nix build itself shows as a `head_build` event pair (start, and how long it took),
+  which `agent-bus tail` prints even without `--events`. List only
   repos whose heads you'd run as your own code: any head reviewed there, someone else's pull
   request included, runs with your agents' credentials, just as its tests would.
 

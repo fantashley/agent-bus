@@ -140,6 +140,122 @@ def check(snap) -> None:
                        "never migrated by a head")
 
 
+# ------------------------------------------------------------ predicted at request time
+
+
+SELF_PATH = "src/agent_bus/headbuild.py"
+PREDICTED = ("flake.nix", SELF_PATH, DB_PATH)
+PREDICT_TIMEOUT_S = 5  # in all: the prediction is optional, and request_review waits on it
+
+
+def protocol_of(source: str) -> int | None:
+    """The hand-off protocol a head's ``headbuild.py`` ``source`` defines: its one top-level
+    binding of ``PROTOCOL``, a plain ``PROTOCOL = <int>``, read with ``ast`` (never run).
+    None if there's no such literal, or anything else at the top level binds it too."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    found = []
+    for node in tree.body:
+        targets = (node.targets if isinstance(node, ast.Assign) else
+                   [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else [])
+        if any(isinstance(n, ast.Name) and n.id == "PROTOCOL" for t in targets for n in ast.walk(t)):
+            found.append(node)
+    if len(found) != 1 or not isinstance(found[0], ast.Assign) or len(found[0].targets) != 1 \
+            or not isinstance(found[0].targets[0], ast.Name):
+        return None
+    value = found[0].value
+    return value.value if isinstance(value, ast.Constant) and type(value.value) is int else None
+
+
+def _head_files(repo: str, head: str) -> dict[str, str | None] | None:
+    """What git says about ``PREDICTED`` at ``head``, each path on its own: None for one the
+    commit doesn't have, its text for headbuild.py and db.py ("" for flake.nix, never read),
+    and no entry for one it can't tell about (not fetched in a partial clone, not a regular
+    file, over MAX_BYTES).  None if the commit's tree can't be read.  All of it within
+    PREDICT_TIMEOUT_S, with no lazy fetching."""
+    deadline = time.monotonic() + PREDICT_TIMEOUT_S
+
+    def run(argv: list[str], env: dict | None = None, stdin: bytes | None = None) -> bytes | None:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        try:
+            proc = subprocess.run(argv, cwd=repo, env=env, input=stdin, capture_output=True, timeout=left)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return proc.stdout if proc.returncode == 0 else None
+
+    # snapshot._git_env's choice, under this deadline: its `jj git root` may take a minute.
+    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1")
+    if not (os.path.exists(os.path.join(repo, ".git")) or cfg.vcs(repo) == "git"):
+        if cfg.vcs(repo) != "jj":
+            return None
+        root = run(["jj", "git", "root", "--ignore-working-copy"])
+        if not root or not root.strip():
+            return None
+        env["GIT_DIR"] = root.decode("utf-8", "replace").strip()
+    git = lambda *argv, stdin=None: run(["git", "--no-replace-objects", *argv], env, stdin)  # noqa: E731
+
+    # Membership from the commit's trees (antigravity-1): in a partial clone a blob can be
+    # missing locally although the commit has it, which only means "can't tell".
+    out = git("ls-tree", "-r", "-z", "--full-tree", f"{head}^{{tree}}", "--", *PREDICTED)
+    if out is None:
+        return None
+    entries: dict[str, tuple[str, str]] = {}
+    for rec in out.split(b"\0"):
+        meta, _, path = rec.decode("utf-8", "replace").partition("\t")
+        parts = meta.split()
+        if len(parts) == 3:
+            entries[path] = (parts[0], parts[2])
+    files: dict[str, str | None] = {p: None for p in PREDICTED if p not in entries}
+    if "flake.nix" in entries:
+        files["flake.nix"] = ""
+    for path in (SELF_PATH, DB_PATH):
+        if path not in entries or entries[path][0] not in ("100644", "100755"):
+            continue
+        oid = entries[path][1]
+        rec = git("cat-file", "--batch-check=%(objecttype) %(objectsize)", stdin=f"{oid}\n".encode())
+        parts = rec.decode().split() if rec is not None else []
+        if len(parts) != 2 or parts[0] != "blob" or not parts[1].isdigit() or int(parts[1]) > MAX_BYTES:
+            continue  # not fetched here (missing), or too big to read
+        data = git("cat-file", "blob", oid)
+        if data is not None:
+            files[path] = data.decode("utf-8", "replace")
+    return files
+
+
+def predict(repo: str, head: str) -> str | None:
+    """Why the head's own build won't run a review of ``head`` in ``repo``, as far as its
+    files at that commit tell (#188): no flake.nix, another hand-off protocol, or another
+    database schema.  The files are read from git and parsed with ``ast``, never run.  None
+    when nothing rules the head's build out (or git can't say, or a file can't be parsed):
+    its build and checks can still fail.  Never raises."""
+    try:
+        files = _head_files(repo, head)
+        if files is None:
+            return None
+        if "flake.nix" in files and files["flake.nix"] is None:
+            return "it has no flake.nix"
+        if files.get(SELF_PATH) is not None:
+            theirs = protocol_of(files[SELF_PATH])
+            if theirs is not None and theirs != PROTOCOL:
+                return f"its {SELF_PATH} sets hand-off protocol {theirs}, the installed build's is {PROTOCOL}"
+        if DB_PATH not in files:
+            return None
+        if files[DB_PATH] is None:
+            return f"it has no {DB_PATH}"
+        try:
+            if schema_fingerprint(files[DB_PATH]) != installed_fingerprint():
+                return "it changes the database schema or its migrations"
+        except Unusable as e:
+            return str(e)
+        return None
+    except Exception:  # noqa: BLE001 - optional: a parser or formatting limit only means "can't tell"
+        return None
+
+
 # ------------------------------------------------------------ building it
 
 
@@ -186,7 +302,8 @@ def build(snap, head: str, timeout: float, cancelled: Callable[[], bool],
     """The head's build (its store path), from the cache or built now within ``timeout``
     seconds, and a shared hold on its cache entry: no prune removes it (its GC root) until
     the caller closes that descriptor.  One build per head at a time; ``building()`` is
-    called before a new one starts.  Raises Unusable (also when ``cancelled()``)."""
+    called once when the head isn't in the cache yet, before waiting for another build of
+    it or starting one.  Raises Unusable (also when ``cancelled()``)."""
     nix = find_nix()
     if not nix:
         raise Unusable("nix is not on PATH")
@@ -194,13 +311,17 @@ def build(snap, head: str, timeout: float, cancelled: Callable[[], bool],
     top.mkdir(parents=True, exist_ok=True, mode=0o700)
     link = top / head
     deadline = time.monotonic() + timeout
+    said = not _ready(link)
+    if said:
+        building()  # before the lock: another worker's build of it may take minutes (#188)
     fd = _lock(top / f".{head}.lock", fcntl.LOCK_EX, timeout, cancelled, "another build of it")
     try:
         out = _ready(link)
         if out:
             os.utime(link, follow_symlinks=False)
         else:
-            building()
+            if not said:
+                building()  # pruned while this waited for the lock
             # Straight to the cache entry, never renamed: nix's own GC root points at this path.
             nix_build(nix, snap.path, link, deadline - time.monotonic(), cancelled)
             out = _ready(link)

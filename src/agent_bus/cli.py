@@ -238,14 +238,15 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
                     print(format_action(m, color), flush=True)
                 elif not args.peer or m["sender"] in (args.peer, HUMAN, SYSTEM):
                     print(format_message(m, color), flush=True)
-            if args.peer or args.events or only:
-                for e in bus.events(args.thread, after_id=last_ev, agent=args.peer):
-                    last_ev = e["id"]
-                    # Every kind, so a new one is never hidden (#179); --events-only drops
-                    # only the peers' own words.
-                    if not (only and e["kind"] in PEER_OUTPUT):
-                        who = e["agent"] or "worker"
-                        print(_color(SYSTEM, f"  · {who} {e['kind']}: {_escaped(e['text'] or '')}", color), flush=True)
+            every = args.peer or args.events or only
+            for e in bus.events(args.thread, after_id=last_ev, agent=args.peer):
+                last_ev = e["id"]
+                # Every kind, so a new one is never hidden (#179); --events-only drops only
+                # the peers' own words.  Without --events, only the head's nix build (#188),
+                # which runs before any peer's turn.
+                if (every or e["kind"] == "head_build") and not (only and e["kind"] in PEER_OUTPUT):
+                    who = e["agent"] or "worker"
+                    print(_color(SYSTEM, f"  · {who} {e['kind']}: {_escaped(e['text'] or '')}", color), flush=True)
             st = peer_status(bus, args.thread, args.peer) if args.peer else thread_status(bus, args.thread)
             if notify and not args.peer:
                 for w in notices.new(hooks.mail_waiting(bus, args.thread)):
