@@ -214,6 +214,7 @@ DEFAULTS = {
     "max_diff_bytes": 200_000,
     "max_snapshot_bytes": 256 * 1024 * 1024,
     "review_followup_budget": 3,
+    "self_hosted_prompts": [],
     "peers": {},
     "participants": {},
     "agents": None,
@@ -272,6 +273,9 @@ class Config:
     # Author follow-up requests on a review thread before agent-bus warns that the review is
     # running long (#71); a review still blocked after twice as many waits for the human.
     review_followup_budget: int = 3
+    # Repos whose reviews take their prompt text from the head under review (#138): a path,
+    # covering the repos under it too.  Off by default.
+    self_hosted_prompts: list = field(default_factory=list)
     # Per-agent overrides: {"claude": {"command": "/path/claude", "args": [...]}}
     peers: dict = field(default_factory=dict)
     # Named participants (#43): {"codex-mini": {"harness": "codex", "model": "...", ...}}.
@@ -305,6 +309,9 @@ class Config:
         if isinstance(b, bool) or not isinstance(b, int) or b < 1:
             raise ValueError("review_followup_budget must be a whole number, 1 or more")
         conf._repo_entries()  # reject a malformed repos entry when loading
+        if not isinstance(conf.self_hosted_prompts, list) or not all(
+                isinstance(p, str) and p for p in conf.self_hosted_prompts):
+            raise ValueError("self_hosted_prompts must be a list of repo paths (non-empty strings)")
         if not isinstance(conf.peers, dict):
             raise ValueError("config `peers` must be an object keyed by harness")
         for agent, entry in conf.peers.items():  # reject a bad model/effort when loading
@@ -564,13 +571,7 @@ class Config:
 
     def _covering(self, repo: str | os.PathLike) -> list[dict]:
         """The ``repos`` entries that ``repo`` is, or is inside."""
-        real = os.path.realpath(os.path.expanduser(str(repo)))
-        out = []
-        for entry in self._repo_entries():
-            root = os.path.realpath(os.path.expanduser(entry["path"]))
-            if real == root or real.startswith(root.rstrip(os.sep) + os.sep):
-                out.append(entry)
-        return out
+        return [entry for entry in self._repo_entries() if _within(repo, entry["path"])]
 
     def repo_allowed(self, repo: str | os.PathLike) -> bool:
         return bool(self._covering(repo))
@@ -580,9 +581,21 @@ class Config:
         an entry can only turn it off, so the most restrictive one wins (issue #54)."""
         return all(e.get("web_search", True) for e in self._covering(repo))
 
+    def head_prompts(self, repo: str | os.PathLike) -> bool:
+        """Whether a review in ``repo`` takes its prompt text from the head (#138): ``repo``
+        is, or is inside, a ``self_hosted_prompts`` path."""
+        return any(_within(repo, root) for root in self.self_hosted_prompts)
+
     def web_search_off_repos(self) -> list[str]:
         """The allow-listed paths whose peers may not search the web, as configured."""
         return [e["path"] for e in self._repo_entries() if e.get("web_search") is False]
+
+
+def _within(path: str | os.PathLike, root: str) -> bool:
+    """Whether ``path`` is ``root`` or inside it, after ~ and symlinks."""
+    real = os.path.realpath(os.path.expanduser(str(path)))
+    top = os.path.realpath(os.path.expanduser(root))
+    return real == top or real.startswith(top.rstrip(os.sep) + os.sep)
 
 
 def _is_bare_git(d: Path) -> bool:

@@ -243,6 +243,24 @@ same things in parallel:
   states the turn's time limit, and that only the JSON verdict is posted. It names the verdict
   format's version and the running build (`Verdict format v1 … agent-bus 0.3.0, <store item>`),
   so a reviewer of a change to the format can tell which one the running worker expects.
+- **Reviewing agent-bus itself with the head's prompts** (opt-in). Reviewers normally get the
+  installed build's prompts, so a change to a review prompt can only be judged from its diff.
+  List a repo in `self_hosted_prompts` in `config.json` (off by default; a listed directory
+  also covers the repos under it, e.g. a directory of jj workspaces):
+  `"self_hosted_prompts": ["~/src/agent-bus", "~/src/agent-bus-ws"]`. A review pass there
+  takes the review prompt text (the review templates, rules, follow-up framing and reading
+  notes) from the head's `src/agent_bus/prompts.py` in its read-only snapshot. The head's
+  code never runs: the file is parsed with Python's `ast`, and only top-level string literals
+  (and `+` of literals and names defined earlier) are read. Everything else stays installed:
+  the worker, the adapters and their preambles, the verdict format the worker parses, and the
+  database. If any of those constants can't be read that way (missing, not a literal, bound
+  twice, empty, a template taking other `{fields}` (or the same ones a different number of times) than the installed
+  worker fills, a top-level statement other than imports, assignments and definitions, over 256 KiB, no
+  snapshot), the pass uses the installed prompts. Either way, after the verdict format label
+  the prompt says which prompts it uses (and why it fell back), and `agent-bus tail --events`
+  shows a `prompts` event. A repo that isn't listed sees no change. List only repos whose
+  heads you'd trust to write your reviewers' instructions: any head reviewed there, someone
+  else's pull request included, can change what the reviewers are told.
 - A verdict counts only for the base and head it was given on. **Any new head (or a new base)
   makes every earlier approval stale**, so the review is complete (the thread resolves) once
   every required reviewer has approved the same base..head. Re-reviews are follow-ups, so
