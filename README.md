@@ -122,7 +122,8 @@ turn's state (`working`, `done`, `failed`, or `stopped` when the worker died), t
 time, the latest activity and its age, and the number of tool calls (and API retries or errors,
 if any). While a self-hosted review's worker builds the head with nix, before any peer's turn,
 `progress.head_build` shows the head, `state` (`building`, `done`, or `stopped`) and the elapsed
-seconds. Only metadata is returned, never the peer's text. One wait at a time is enough:
+seconds of the latest build attempt (`stopped` once another worker has taken the job over).
+Only metadata is returned, never the peer's text. One wait at a time is enough:
 concurrent waits on a thread share whatever wakes them (the extra ones are marked `joined`), and
 on timeout only the last one to leave takes any quiet notices still unread. Every batch
 carries `cursor`, the last message id read. If a reply was lost, e.g. on a dropped connection,

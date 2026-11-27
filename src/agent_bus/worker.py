@@ -106,15 +106,29 @@ class MissingRevision(Exception):
         super().__init__(f"{repo} has no commit " + ", ".join(f"{sha} ({label})" for label, sha in missing))
 
     @staticmethod
-    def failed(job: dict | None) -> bool:
-        """Whether ``job`` failed on a missing commit: report_missing's park, by this build or an
-        older one (its error is the message above since #50), the one a repeat of a
-        several-reviewer review's first request may retry (#199)."""
-        return bool(job) and job["status"] == "failed" and bool(
-            _MISSING_ERROR.search(job.get("error") or ""))
+    def failed(job: dict | None, refs: dict) -> bool:
+        """Whether ``job`` failed on a missing commit of the thread pinned at ``refs``:
+        report_missing's park, by this build or an older one (its error is the message above
+        since #50), the one a repeat of a several-reviewer review's first request may retry
+        (#199).  The whole error must match (#204): the thread's repository, then its pinned
+        base or a previous head it was asked to review, and/or its head, in that order."""
+        if not job or job["status"] != "failed" or not refs.get("repo"):
+            return False
+        error, lead = job.get("error") or "", f"{refs['repo']} has no commit "
+        if not error.startswith(lead):
+            return False
+        pinned = {"base": {refs.get("base_commit_id")}, "head": {refs.get("head_commit_id")},
+                  "previous head": {refs.get("prev_head_commit_id"), *(refs.get("heads") or [])}}
+        labels = []
+        for item in error[len(lead):].split(", "):
+            m = _MISSING_ITEM.fullmatch(item)
+            if not m or m[1] not in pinned[m[2]] - {None}:
+                return False
+            labels.append(m[2])
+        return labels in (["base"], ["previous head"], ["head"], ["base", "head"], ["previous head", "head"])
 
 
-_MISSING_ERROR = re.compile(r" has no commit [0-9a-f]+ \((base|head|previous head)\)")
+_MISSING_ITEM = re.compile(r"([0-9a-f]+) \((base|head|previous head)\)")
 
 
 def clause(text: str) -> str:
@@ -1207,11 +1221,9 @@ class Worker:
         refs = t["refs"] or {}
         if not self.config.self_hosted_review(refs["repo"]):
             return None  # not opted in, or to the head's prompt text only (#138)
-        try:
-            self.review_diff(refs, interdiff=False)  # a missing base or head is reported first (#179)
-        except MissingRevision as e:
-            self.report_missing(t, e)
-            raise
+        # A missing base or head (#179), or the first pass's missing previous head (#201), is
+        # reported before any snapshot, build or prompts event.
+        self.review_diffs(t, refs)
         if not self.config.head_builds(refs["repo"]):
             return self.installed_build(refs["head_commit_id"], "head builds are off (self_hosted_build_timeout_s is 0)")
         head = refs["head_commit_id"]
@@ -1220,13 +1232,17 @@ class Worker:
 
         def building() -> None:
             # A head_build event pair (#188): wait's progress shows the build while it runs.
+            # Its phase, head and this worker are the purpose, which progress pairs them by,
+            # and only while this worker holds the job (#198): fenced raises LeaseLost.
             started.append(time.monotonic())
-            self.event("head_build", f"building head {head[:12]} with nix")
+            with self.fenced():
+                self.event("head_build", f"building head {head[:12]} with nix", purpose=f"start {head} {self.owner}")
 
         def built(how: str) -> None:
             if started:
-                self.event("head_build", f"head {head[:12]}'s build {how} after "
-                                         f"{round(time.monotonic() - started[0])} s")
+                with self.fenced():
+                    self.event("head_build", f"head {head[:12]}'s build {how} after "
+                                             f"{round(time.monotonic() - started[0])} s", purpose=f"end {head} {self.owner}")
 
         try:
             headbuild.check(snap)
@@ -1463,6 +1479,19 @@ class Worker:
         prompts are the head's, in a repository that opts in (#138)."""
         t = self.thread()
         refs = t["refs"] or {}
+        full, plan = self.review_diffs(t, refs)
+        snap = self.pin_snapshot(t, refs)
+        with headprompts.using(self.head_prompts(refs, snap)):
+            return self._review_round(mode, snap, full, plan)
+
+    def review_diffs(self, t: dict, refs: dict) -> tuple[tuple[str, str], tuple]:
+        """The current reviewer's pass plan, and the diffs it needs that must exist before
+        anything else runs: the whole change's diff, so a missing base or head is reported
+        before any snapshot is made or prompts event recorded (#179, antigravity-4), and the
+        interdiff from its previous head on the same base, so a missing previous head is too
+        (#183), and before a self-hosted review's setup (#201).  (A rebase-aware interdiff
+        falls back to the full diff instead.)  Reports a missing commit (report_missing) and
+        raises MissingRevision."""
         reviewer = refs["reviewer"]
         followup = bool(refs.get("prev_head_commit_id"))
         mine = self.bus.last_verdict(self.thread_id, reviewer)
@@ -1472,19 +1501,13 @@ class Worker:
         pushback = followup and refs.get("pushback_round") == t["round"]
         inter = None
         try:
-            # The whole change's diff first: a missing base or head is reported before any
-            # snapshot is made or prompts event recorded (#179, antigravity-4).
             full = self.review_diff(refs, interdiff=False)
-            # So is a missing previous head, when this pass sends the interdiff from it on the
-            # same base (#183).  (A rebase-aware interdiff falls back to the full diff instead.)
             if frm is not None and not pushback and mine["data"]["base_commit_id"] == refs["base_commit_id"]:
                 inter = self.review_diff({**refs, "prev_head_commit_id": frm}, interdiff=True)
         except MissingRevision as e:
             self.report_missing(t, e)
             raise
-        snap = self.pin_snapshot(t, refs)
-        with headprompts.using(self.head_prompts(refs, snap)):
-            return self._review_round(mode, snap, full, (mine, frm, pushback, inter))
+        return full, (mine, frm, pushback, inter)
 
     def head_prompts(self, refs: dict, snap: snapshot.Snapshot) -> headprompts.Active | None:
         """The pass's review prompt text from the head (#138): None unless the repo opts in

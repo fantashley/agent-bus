@@ -9,6 +9,8 @@ from agent_bus import config as cfg
 from agent_bus.service import Service
 from agent_bus.worker import Worker
 
+from test_head_prompts import write_config
+
 GIT = shutil.which("git")
 
 
@@ -216,7 +218,8 @@ def test_missing_commit_in_jj_repo_needs_human(env, no_spawn, unchecked_commits)
     assert f"the head commit {MISSING}" in missing_report(env, tid)
 
 
-def test_missing_previous_head_on_followup_needs_human(env, no_spawn, unchecked_commits, no_jj):
+@pytest.mark.parametrize("self_hosted", [False, True])
+def test_missing_previous_head_on_followup_needs_human(env, no_spawn, unchecked_commits, no_jj, self_hosted):
     repo = env["repo"]
     sh = git_repo(repo)
     base = sh("git", "rev-parse", "HEAD")
@@ -235,13 +238,16 @@ def test_missing_previous_head_on_followup_needs_human(env, no_spawn, unchecked_
     head2 = sh("git", "rev-parse", "HEAD")
     sh("git", "reflog", "expire", "--expire=now", "--all")
     sh("git", "gc", "-q", "--prune=now")
-    seen = len([e for e in bus.events(tid) if e["kind"] in ("snapshot", "prompts")])
+    setup = ("snapshot", "prompts", "head_build")
+    seen = len([e for e in bus.events(tid) if e["kind"] in setup])
+    if self_hosted:  # #201: also before the self-hosted review's snapshot and head build
+        write_config(env, self_hosted_reviews=[str(repo)])
     claude.request_review("codex", str(repo), base, head2, prev_head_commit_id=head1)
     Worker(bus, bus.jobs(tid)[-1]["id"]).run()
     body = missing_report(env, tid)
     assert f"the previous head commit {head1}" in body and head2 not in body
     # #183: the interdiff's previous head is checked before this pass makes a snapshot.
-    assert len([e for e in bus.events(tid) if e["kind"] in ("snapshot", "prompts")]) == seen
+    assert len([e for e in bus.events(tid) if e["kind"] in setup]) == seen
     # A follow-up's refs already moved to head2, so only `resume` retries this pass.
     assert "ask the human user to run `agent-bus resume" in body and "request this review again" not in body
     assert "without prev_head_commit_id" in body

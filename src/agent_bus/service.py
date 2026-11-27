@@ -15,8 +15,8 @@ from typing import Any
 from . import config as cfg
 from . import autoresume, evidence as ev, headbuild, provenance, quota
 from . import rex, unvotable, worker
-from .db import (HUMAN, SYSTEM, Bus, BusError, deadline_message, is_quiet, over_followup_limit, overdue,
-                 past_deadline, review_progress, wrap_peer)
+from .db import (HUMAN, SYSTEM, Bus, BusError, deadline_message, head_build_attempt, is_quiet, over_followup_limit,
+                 overdue, past_deadline, review_progress, wrap_peer)
 
 # A pinned commit id: the full 40 hex digits, or a prefix of at least 7 that request_review
 # resolves to one commit in the repo (#73).  Upper case is accepted and lowered.
@@ -352,12 +352,9 @@ class Service:
         # Not the job's error: it can quote what a peer was about to post.
         info: dict[str, Any] = {"status": job["status"], "elapsed_s": round(now - job["created_at"])}
         turns: dict[str, dict] = {}
-        builds: list[dict] = []
-        for e in self.bus.events(thread, job_id=job["id"]):
+        events = self.bus.events(thread, job_id=job["id"])
+        for e in events:
             agent, kind = e["agent"], e["kind"]
-            if kind == "head_build" and not agent:
-                builds.append(e)  # the worker's: a start, then its end (#188)
-                continue
             if not agent:
                 continue
             if kind == "turn_start":
@@ -390,13 +387,15 @@ class Service:
             out.update({k: turn[k] for k in ("failed_tool_calls", "api_retries", "errors") if turn[k]})
             peers[agent] = out
         res: dict[str, Any] = {"job": info, "peers": peers}
-        if builds:
-            # The head's nix build (#188): while it runs, no peer has a turn to show.
-            start, end = builds[0], builds[1] if len(builds) > 1 else None
-            state = "done" if end else "building" if job["status"] in ("queued", "running") else "stopped"
-            head = (self.bus.thread(thread)["refs"] or {}).get("head_commit_id") or ""
-            res["head_build"] = {"head": head[:12], "state": state,
-                                 "elapsed_s": round((end["created_at"] if end else now) - start["created_at"])}
+        build = head_build_attempt(events)
+        if build:
+            # The head's nix build (#188): while it runs, no peer has a turn to show.  An
+            # attempt by a worker that no longer holds the job stopped with it (#198).
+            end = build["end"]
+            state = "done" if end else "building" if job["status"] in ("queued", "running") and \
+                build["owner"] in (None, job.get("lease_owner")) else "stopped"
+            res["head_build"] = {"head": build["head"][:12], "state": state,
+                                 "elapsed_s": round((end or now) - build["start"])}
         return res
 
     def history(self, thread: str, limit: int = 200) -> dict:
@@ -1406,7 +1405,7 @@ class Service:
         if self.bus.review_standings(t["id"])["complete"]:
             return self._finish_complete(t, old["head_commit_id"]), False
         reviewer, why = worker.dead_pass_retry(self.bus, t)
-        if t["status"] == "needs_human" and not worker.MissingRevision.failed(latest):
+        if t["status"] == "needs_human" and not worker.MissingRevision.failed(latest, old):
             # Parked for the human (out of usage, a format change, a config error, an unusable
             # verdict) by a worker that died before ending its job, an older build's included:
             # only a missing commit's park offers the repeat itself.

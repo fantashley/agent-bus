@@ -273,6 +273,8 @@ def test_an_opted_in_review_runs_on_the_heads_build(env, no_spawn, nix, monkeypa
     assert builds[0] == f"building head {h} with nix"
     assert builds[1].startswith(f"head {h}'s build ready after ") and builds[1].endswith(" s")
     assert len(builds) == 2
+    (start, h1, a), (end, h2, b) = [e["purpose"].split(" ") for e in env["bus"].events(tid, kind="head_build")]
+    assert (start, h1, end, h2) == ("start", head, "end", head) and a == b  # #198: one worker's pair
     assert texts[0].startswith(f"head {h}'s own build runs this review job (")
     assert [t.split(" (agent-bus")[0] for t in texts[1:]] == [f"head {h}'s own build runs this pass"] * 2
     prompts_seen = [c["prompt"] for c in calls(env)]
@@ -592,6 +594,55 @@ def test_wait_and_tail_show_the_heads_build(env, no_spawn, capsys):
     assert f"worker head_build: building head {h[:12]} with nix" in capsys.readouterr().out
     bus.add_event(tid, "head_build", f"head {h[:12]}'s build ready after 3 s", job_id=jid)
     assert claude.progress(tid)["head_build"]["state"] == "done"
+
+
+def test_head_build_progress_pairs_each_attempt(env, no_spawn, capsys, monkeypatch):
+    """#198: a start opens an attempt and only the same worker's end closes it; an attempt by
+    a worker that no longer holds the job shows as stopped; the head is the event's, not the
+    thread's current one.  Older builds' events (no purpose) pair by their text."""
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    res, h = requested(env)
+    bus, tid, jid = env["bus"], res["thread"]["id"], res["job"]["id"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    other = "f" * 40
+    progress = lambda: claude.progress(tid)["head_build"]  # noqa: E731
+    bus.add_event(tid, "head_build", f"building head {h[:12]} with nix", job_id=jid)  # an older build's
+    assert progress()["state"] == "building" and progress()["head"] == h[:12]
+    assert bus.claim_job(jid, "A", lease_s=60)
+    bus.add_event(tid, "head_build", f"building head {other[:12]} with nix", job_id=jid, purpose=f"start {other} A")
+    assert progress()["state"] == "building" and progress()["head"] == other[:12]
+    # B takes the job over: A's unfinished attempt stopped with it, and A's late end closes nothing.
+    bus.conn.execute("UPDATE jobs SET lease_owner='B' WHERE id=?", (jid,))
+    assert progress()["state"] == "stopped"
+    bus.add_event(tid, "head_build", f"building head {h[:12]} with nix", job_id=jid, purpose=f"start {h} B")
+    bus.add_event(tid, "head_build", f"head {h[:12]}'s build ready after 9 s", job_id=jid, purpose=f"end {h} A")
+    assert progress()["state"] == "building" and progress()["head"] == h[:12]
+    bus.add_event(tid, "head_build", f"head {h[:12]}'s build ready after 1 s", job_id=jid, purpose=f"end {h} B")
+    assert progress()["state"] == "done"
+    # A plain tail reads only head_build events, up to the thread's latest event (#198).
+    seen = []
+    real = Bus.events
+    monkeypatch.setattr(Bus, "events", lambda self, *a, **kw: seen.append(kw) or real(self, *a, **kw))
+    bus.add_event(tid, "tool", "ls", agent="codex", job_id=jid)
+    assert cli.main(["tail", tid, "--once", "--no-color"]) == 0
+    out = capsys.readouterr().out
+    assert [kw.get("kind") for kw in seen] == ["head_build"] and seen[0]["upto_id"] == bus.last_event_id(tid)
+    assert f"worker head_build: building head {other[:12]} with nix" in out and "codex tool" not in out
+
+
+def test_a_worker_that_lost_the_job_records_no_build_event(env, no_spawn, nix, monkeypatch):
+    """#198 (codex-1): head_build events are fenced by the job's lease."""
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    real = headbuild.build
+
+    def taken_over(snap, head, *a, building, **kw):
+        env["bus"].conn.execute("UPDATE jobs SET lease_owner='other'")
+        return real(snap, head, *a, building=building, **kw)
+
+    monkeypatch.setattr(headbuild, "build", taken_over)
+    job, _, _, tid = review(env)
+    assert not [e for e in env["bus"].events(tid) if e["kind"] == "head_build"]
+    assert job["lease_owner"] == "other" and nix["builds"] == 0  # it stopped before building
 
 
 @pytest.mark.parametrize("source, want", [
