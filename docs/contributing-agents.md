@@ -114,8 +114,9 @@ request_review(
 - **`evidence`** holds facts the reviewers can't read themselves: the issue text, command
   output, another repo's code. It is only accepted on the first request.
 - **Waiting.** Make one `wait(thread)` call at a time. A review pass often takes several
-  minutes, so keep waiting while `next_action` starts with `wait:`; on `stop:` or a
-  `needs_human` thread, read the bus's notice and report it. The skill has the full stop
+  minutes, so keep waiting while `next_action` starts with `wait:`. On `retry:` (a reviewer's
+  pass timed out or gave no verdict) make the call it gives, once, and keep waiting; on `stop:`
+  or another `needs_human` thread, read the bus's notice and report it. The skill has the full stop
   conditions. `wait` returns only messages you
   haven't read yet, so don't pass `after_message_id` unless you mean to replay. To see what a
   reviewer is doing, `agent-bus tail <thread> --events --once` (or `--events-only` for the event

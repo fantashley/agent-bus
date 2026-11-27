@@ -33,7 +33,7 @@ and every agent-bus tool refuses you with `PEER_READ_ONLY`.
   working peer's turn state, elapsed time, latest activity, tool calls). Reviews and rounds
   often take several minutes, so call it again **while the thread is `open` and a peer is
   working or due**. Stop waiting once the thread is `resolved`, `needs_human` or `cancelled`
-  (or `waiting_for_human` is true), or a review's `next_action` says `fix:`, `await_head:` or `done:`,
+  (or `waiting_for_human` is true), or a review's `next_action` says `fix:`, `await_head:`, `retry:` or `done:`,
   unless you are waiting for `debrief` replies, which arrive on an already finished thread
   (keep waiting while `progress.job.status` is `queued` or `running`). When you stop, read the latest `system` notice, and if it names a blocker
   (out of usage, a CLI format change, a missing commit, a failed pass), tell the user.
@@ -156,12 +156,19 @@ prev_head_commit_id?, focus?, evidence?, testing?, thread?, model?, effort?, pee
   one reviewer or several, until every required reviewer approves the same head, so stop
   waiting and fix), `await_head: ...` (a review-only review asked for changes: stop waiting, see
   below), `done: ...` (every required reviewer approved the same head, or you finished the
-  review: then it names the blocking findings left open; either way the thread is `resolved`)
-  or `stop: ...` (it waits for the human). With several
+  review: then it names the blocking findings left open; either way the thread is `resolved`),
+  `retry: ...` (see below) or `stop: ...` (it waits for the human). With several
   reviewers an approval hands the head to the next one, so keep waiting while it says `wait`.
   If the thread goes to `needs_human` with no verdict (a reviewer out of usage, a CLI format
   change, a missing commit, an unusable verdict), stop and tell the user what the bus's notice
   says; `agent-bus resume` is theirs to run.
+- **`retry: ...`** means a reviewer's pass timed out, crashed or gave no usable verdict. The
+  thread is `needs_human`, but you may retry that pass yourself once per reviewer per head:
+  make the call `next_action` gives (`request_review` with `reviewer` = the one that failed, even
+  on a review with several reviewers, `thread`, the same repo, base and head, and
+  `prev_head_commit_id` = that head), then `wait` again.
+  It reruns only that reviewer and doesn't count against the follow-up budget. If it fails again,
+  `next_action` says `stop:`: tell the user.
 
 **Severity.** Only `high` and `medium` findings block; `low` never does. Fix the blocking ones;
 low ones are optional (defer them to a follow-up issue if they're real work). An approval can

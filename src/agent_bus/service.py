@@ -126,6 +126,12 @@ def review_next_action(t: dict, st: dict, job: dict | None, last_failed: bool = 
         return f"done: {finished_line(t['refs']['finished'])}"
     if t["status"] == "cancelled":
         return "stop: the review was cancelled"
+    offer = worker.retry_offer(t) if job is None else None
+    if offer:
+        # A pass that gave no usable verdict, with its one initiator retry still unused (#154).
+        return (f"retry: {offer['reviewer']}'s pass at head {head} gave no usable verdict (see the latest system "
+                f"notice). {worker.retry_call(t, offer['reviewer'])}; or tell the human user, who can run "
+                f"`agent-bus resume {tid}`")
     if t["status"] == "needs_human":
         return ("stop: the thread waits for the human user; read the latest system notice and tell them "
                 "what it says (agent-bus resume is theirs to run)")
@@ -609,9 +615,6 @@ class Service:
                 raise ValueError("reviewers must be a non-empty list of agents")
             if len(reviewers) == 1:  # one required reviewer: the plain review
                 reviewer = reviewers[0]
-                if thread is not None:
-                    raise ValueError("`thread` is for reviews by several reviewers; a single reviewer's "
-                                     "review is found by its heads")
                 extra = set(peer_settings or {}) - {reviewer}
                 if extra:
                     raise ValueError(f"peer_settings names {sorted(extra)[0]!r}, which isn't a reviewer here")
@@ -624,10 +627,13 @@ class Service:
                                              evidence, review_only)
         elif peer_settings:
             raise ValueError("peer_settings goes with `reviewers`; use model/effort with a single `reviewer`")
-        if thread is not None:
-            raise ValueError("`thread` goes with `reviewers`; a single reviewer's review is found by its heads")
         if not self.config.is_participant(reviewer) or reviewer == self.agent:
             raise ValueError("reviewer must be one of the other agents")
+        if thread is not None:
+            # With one reviewer, `thread` only names a parked review to retry (#154); a single
+            # reviewer's review is otherwise found by its heads.
+            return self._single_retry(thread, reviewer, repo, base_commit_id, head_commit_id, prev_head_commit_id,
+                                      evidence, review_only)
         override = self.config.check_settings(reviewer, {"model": model, "effort": effort})
         self.config.require_available(reviewer, "reviewer")
         self._check_review_ids(base_commit_id, head_commit_id, prev_head_commit_id, change_id)
@@ -707,6 +713,7 @@ class Service:
                     raise BusError("REVIEW_STALE", f"{t['id']} has moved on to head {str(current)[:12]}; "
                                    "use that as prev_head_commit_id")
                 else:
+                    self._no_same_head_rerun(t, base_commit_id, head_commit_id)
                     self._check_budget_park(t)
                     # The same head again after a request for changes is a pushback (#71).
                     mine = self.bus.last_verdict(t["id"], reviewer)
@@ -734,7 +741,7 @@ class Service:
                     refs["heads"] = [*self._heads(t), head_commit_id]
                     if kept or override:
                         refs["peer_settings"] = {reviewer: {**kept, **override}}
-                    for k in ("auto_resumes", "debrief_after"):  # these still count for this thread
+                    for k in ("auto_resumes", "debrief_after", "retried"):  # these still count for this thread
                         if old.get(k):
                             refs[k] = old[k]
                     autoresume.forget(self.bus, t["id"])  # this pass replaces the parked one
@@ -1224,6 +1231,7 @@ class Service:
         if current != prev:
             raise BusError("REVIEW_STALE", f"{t['id']} has moved on to head {str(current)[:12]}; "
                            "use that as prev_head_commit_id")
+        self._no_same_head_rerun(t, base, head)
         self._check_budget_park(t)
         standing = self.bus.review_standings(t["id"])
         # A new base or head is a new revision: every earlier verdict goes stale, even one
@@ -1248,6 +1256,7 @@ class Service:
                 "revision": revision, "request": request,
                 "heads": heads if head in heads else [*heads, head]}
         refs.pop("peer_settings", None)
+        refs.pop("retryable", None)  # this request's pass replaces the failed one
         if new_revision:
             refs.pop("pushbacks", None)  # one pushback per reviewer per revision
         if merged:
@@ -1286,6 +1295,82 @@ class Service:
         refs["request_job"] = job_row["id"] if job_row else None
         self.bus.set_thread(t["id"], refs=json.dumps(refs))
         return job_row, created
+
+    def _single_retry(self, thread: str, reviewer: str, repo: str, base: str, head: str, prev: str | None,
+                      evidence: list | None, review_only: bool | None) -> dict:
+        """The retry call (#154): ``reviewer`` with ``thread``, which names the parked review,
+        so the retry never lands on another review of the same head, and ``reviewer`` the one
+        whose pass failed, so it never spends another reviewer's offer (on a review with
+        several reviewers too)."""
+        self._check_review_ids(base, head, prev, None)
+        repo_path = self._allowed_repo(repo)
+        base, head, prev = self._resolve_review_ids(repo_path, base, head, prev)
+        self.bus.reap()
+        with self.bus.tx():
+            row = self.bus._one("SELECT id FROM threads WHERE id=?", thread)
+            t = self.bus.thread(thread) if row else {}
+            refs = t.get("refs") or {}
+            if t.get("kind") != "review" or t["initiator"] != self.agent or refs.get("repo") != repo_path \
+                    or reviewer not in (refs.get("reviewers") or [refs.get("reviewer")]) or prev != head:
+                raise ValueError("`thread` goes with `reviewers` (reviews by several reviewers); with one "
+                                 "`reviewer` it only names your review of this repo whose pass by that reviewer "
+                                 "failed, to retry it at the same head (prev_head_commit_id = head_commit_id; see "
+                                 "its next_action)")
+            self._no_followup_evidence(t, evidence)
+            self._same_review_only(t, review_only)
+            active = self.bus._one("SELECT * FROM jobs WHERE thread_id=? AND status IN ('queued','running')", t["id"])
+            retry = self._initiator_retry(t, reviewer, [base, prev, head], active)
+            if retry is None and active is not None:
+                raise BusError("REVIEW_BUSY", f"{t['id']} has a pass running; wait for it")
+            if retry is None:
+                raise BusError("REVIEW_FAILED", f"{t['id']} has no retry to offer for this request: the retry "
+                               "call is the one its next_action gives (the same base and head, and "
+                               "prev_head_commit_id = head), and only while it offers one. "
+                               + ("Ask the human user to run `agent-bus resume " + t["id"] + "`."
+                                  if t["status"] == "needs_human" else "Check its next_action."))
+            job_row, created = retry
+        if created:
+            worker.launch(self.bus, job_row["id"])
+        t = self.bus.thread(t["id"])
+        return {"thread": thread_summary(t), "job": self._job_info(job_row, created),
+                "review": self.bus.review_standings(t["id"]),
+                "next": f"Call wait(\"{t['id']}\") for the verdict, or check inbox later."}
+
+    def _initiator_retry(self, t: dict, reviewer: str, request: list,
+                         active: dict | None) -> tuple[dict, bool] | None:
+        """Rerun a failed pass once (#154): ``request`` names the thread's current base and
+        head with prev_head_commit_id = head, on a thread park_failed_pass left with an unused
+        retry offer for ``reviewer``.  The same pass a human resume would run (mode retry, same
+        round), for that reviewer; it isn't a follow-up, so the budget doesn't count it.  None
+        if this request isn't that retry."""
+        base, prev, head = request
+        old = t["refs"] or {}
+        offer = worker.retry_offer(t)
+        if offer is None or offer["reviewer"] != reviewer or active is not None or prev != head \
+                or (base, head) != (old.get("base_commit_id"), old.get("head_commit_id")):
+            return None
+        self.config.require_available(reviewer, "reviewer")  # before the retry is spent
+        self._quota_check(reviewer, "reviewer", (old.get("peer_settings") or {}).get(reviewer))
+        autoresume.forget(self.bus, t["id"])
+        refs = {k: v for k, v in old.items() if k != "retryable"}
+        refs["retried"] = [*(old.get("retried") or []), offer["key"]]
+        self.bus.set_thread(t["id"], status="open", refs=json.dumps(refs))
+        return self.bus.create_job(t["id"], "review", {"mode": "retry", "round": t["round"]},
+                                   worker.retry_key(t, reviewer))
+
+    def _no_same_head_rerun(self, t: dict, base: str, head: str) -> None:
+        """Refuse any request that would rerun a parked review's current base..head (#154): a
+        plain follow-up, a repeat or a pushback.  Only its offered retry (checked first) or the
+        human user's resume reruns it, so the retry cap and the human-only parks (out of usage,
+        format drift) hold.  An approved review only needs resolving, which the usual path does."""
+        old = t["refs"] or {}
+        if t["status"] != "needs_human" or (base, head) != (old.get("base_commit_id"), old.get("head_commit_id")) \
+                or old.get("budget_parked") or self.bus.review_standings(t["id"])["complete"]:
+            return  # (a budget park is refused next, with REVIEW_LIMIT_REACHED)
+        offer = worker.retry_offer(t)
+        raise BusError("REVIEW_FAILED", f"{t['id']} waits for the human user at head {head[:12]}"
+                       + (f"; {worker.retry_call(t, offer['reviewer'])}" if offer else
+                          f" (see its latest system notice): ask the human user to run `agent-bus resume {t['id']}`"))
 
     def _finish_complete(self, t: dict, head: str) -> None:
         """Resolve a review whose approvals are all in (a worker died before it could), with
@@ -1678,6 +1763,7 @@ class Service:
         parked = self._over_budget(t, resuming=True)
         if t["refs"] is not None or auto_resumes:
             refs = {**(t["refs"] or {}), "auto_resumes": auto_resumes}
+            refs.pop("retryable", None)  # a resume is the retry (#154)
             if parked:
                 # Over its follow-up limit (#71): allow another budget's worth of follow-ups,
                 # then wait for the author's next request (no reviewer reruns on the same head).

@@ -1214,6 +1214,36 @@ class Worker:
                     f"head_commit_id): {who.split(', ')[0]} reconsiders, and approvals stand."
                     + budget_warning(t), recipient=to)
 
+    def park_failed_pass(self, reviewer: str, why: str, retryable: bool = True) -> None:
+        """Park a pass that gave no usable verdict (a timeout, a crash, an unusable reply) for
+        the human user, as before, but offer the initiator one retry of it per reviewer per
+        base..head (#154): ``retryable`` in the refs, read by review_next_action and
+        request_review.  The park, the offer, the job's end and the notice commit together, so
+        a ``wait`` woken by the notice sees no job running and the offer in place."""
+        try:
+            with self.fenced():
+                if not self.bus.transition(self.thread_id, "needs_human"):
+                    return
+                t = self.bus.thread(self.thread_id)
+                refs = t["refs"] or {}
+                key = f"{reviewer}@{revision_key(refs)}"
+                used = key in (refs.get("retried") or [])
+                # Room for the retry's verdict, or only a resume (which raises the cap) helps.
+                offer = retryable and not used and not t.get("limit_reached")
+                if offer:
+                    self.bus.set_thread(self.thread_id, refs=json.dumps(
+                        {**refs, "retryable": {"reviewer": reviewer, "key": key, "round": t["round"]}}))
+                how = (retry_call(t, reviewer) + "; or ask the human user to run `agent-bus resume "
+                       f"{self.thread_id}`" if offer else
+                       "Run `agent-bus resume` to retry" + (" (the requester's one retry at this head is used)"
+                                                           if used else ""))
+                self.bus.post(self.thread_id, SYSTEM, f"{reviewer} {why}. {how}.", kind="status",
+                              recipient=t["initiator"])
+                self.bus.finish_job(self.job["id"], "done", self.owner)
+        except BusError as e:  # the post rejected (say THREAD_LIMIT_REACHED): park without it
+            self.event("error", f"post rejected: {e.code}: {e.message}")
+            self.finish_thread("needs_human")
+
     def park_over_budget(self, t: dict, what: str) -> bool:
         """Park a review that still asks for changes after its follow-up limit for the human
         user (#71), with the open findings.  True if parked (or no longer open)."""
@@ -1452,13 +1482,12 @@ class Worker:
         elif problem:
             verdict = None  # an inconsistent verdict with no repair turn: not usable
         if verdict is None or problem:
-            if self.finish_thread("needs_human"):
-                why = (f"gave an inconsistent verdict ({problem})" if problem else
-                       "did not return a usable verdict: its reply was a refusal, with no JSON verdict"
-                       if not gave.error and is_refusal(gave.text) else  # one turn's result (#156)
-                       f"did not return a usable verdict: {clause(gave.error or 'no valid JSON verdict')}")
-                self.safe_post(SYSTEM, f"{reviewer} {why}. Run `agent-bus resume` to retry.",
-                               kind="status", recipient=t["initiator"])
+            why = (f"gave an inconsistent verdict ({problem})" if problem else
+                   "did not return a usable verdict: its reply was a refusal, with no JSON verdict"
+                   if not gave.error and is_refusal(gave.text) else  # one turn's result (#156)
+                   f"did not return a usable verdict: {clause(gave.error or 'no valid JSON verdict')}")
+            # A refusal to run it at all (PEER_SETUP, #100) would only be refused again.
+            self.park_failed_pass(reviewer, why, retryable=not gave.refused)
             return None
         # A re-review's blocking finding with no earlier id is new (#140): the follow-up that
         # drew it counts against the soft budget; one that only confirmed fixes doesn't.
@@ -2572,6 +2601,40 @@ def severity_tag(severity: str, pre_existing: bool = False) -> str:
     if severity in BLOCKING:
         return f"{severity}, blocking"
     return f"{severity}, non-blocking" if severity == "low" else severity
+
+
+def revision_key(refs: dict) -> str:
+    """The base..head a review pass ran on: what an initiator's retry is counted against (#154)."""
+    return f"{refs.get('base_commit_id')}..{refs.get('head_commit_id')}"
+
+
+def retry_offer(t: dict) -> dict | None:
+    """The retry of a failed pass the initiator may still request (#154): the thread parked
+    by park_failed_pass with an unused offer for its current reviewer, base..head and round."""
+    refs = t.get("refs") or {}
+    offer = refs.get("retryable")
+    if t.get("status") != "needs_human" or not isinstance(offer, dict) or refs.get("finished") \
+            or t.get("limit_reached"):  # no room left for the retry's verdict: only a resume helps
+        return None
+    reviewer = refs.get("reviewer")
+    if (offer.get("reviewer"), offer.get("key"), offer.get("round")) != \
+            (reviewer, f"{reviewer}@{revision_key(refs)}", t.get("round")) or offer["key"] in (refs.get("retried") or []):
+        return None
+    return offer
+
+
+def retry_key(t: dict, reviewer: str | None) -> str:
+    """The job key of ``reviewer``'s one retry at the thread's current base..head (#154)."""
+    return f"review:{t['id']}:retry:{reviewer}@{revision_key(t.get('refs') or {})}"
+
+
+def retry_call(t: dict, reviewer: str) -> str:
+    """How the initiator retries ``reviewer``'s failed pass once (#154)."""
+    refs = t.get("refs") or {}
+    head = refs.get("head_commit_id")
+    return (f"To retry {reviewer}'s pass once, call request_review with reviewer=\"{reviewer}\" (only that "
+            f"reviewer), thread=\"{t['id']}\", repo=\"{refs.get('repo')}\", base_commit_id={refs.get('base_commit_id')}, "
+            f"head_commit_id={head} and prev_head_commit_id={head}")
 
 
 def budget_note(t: dict) -> str:

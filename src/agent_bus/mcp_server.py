@@ -207,7 +207,7 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         {"status": "timeout"} with the thread's state and `progress`: per peer working on
         it, the turn's state, elapsed time, latest activity and tool calls. On a review thread
         every result also has `review` (approved / changes_requested / pending per reviewer at
-        the current head) and `next_action` (wait, fix, await_head, done or stop). Call again to
+        the current head) and `next_action` (wait, fix, await_head, retry, done or stop). Call again to
         keep waiting; one wait at a time is enough (concurrent waits on a thread share what
         wakes them). after_message_id replays everything after that message, e.g. a reply lost
         when the connection dropped.
@@ -300,6 +300,10 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         Per-reviewer model/effort go in peer_settings, e.g. {"codex": {"effort": "high"}}. If
         several of your reviews could match a follow-up, it fails with REVIEW_AMBIGUOUS: pass
         `thread` to name the one to continue.
+
+        A pass that timed out or gave no usable verdict parks the review for the human user;
+        when `next_action` says retry:, make the call it gives (the failed `reviewer` alone,
+        with `thread`, and the same head as prev_head_commit_id) to rerun it once.
 
         Only high and medium findings block approval. To push back on a finding rather than
         change the code, `send` your evidence on the thread, then request the same head again
