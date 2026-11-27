@@ -83,7 +83,9 @@ def test_signature_edit_and_deletion_of_the_helper(tmp_path):
     start = text.index("        def listing(")
     end = text.index('            return "\\n".join(lines)\n', start) + len('            return "\\n".join(lines)\n')
     repo, head, diff = change(tmp_path, {PATH: sig}, {PATH: text[:start] + text[end:]})
-    assert kinds(repo, head, diff) == {"render": "enclosing"}
+    # The helper's own calls are gone (#196): where those functions are still used is searched too.
+    assert kinds(repo, head, diff) == {"render": "enclosing", "_clean": "removed", "_defuse": "removed",
+                                       "mark": "removed", "fromkeys": "removed"}
 
 
 MODULE = '''\

@@ -857,7 +857,8 @@ class Worker:
             self._discussion_files = (prompts.DISCUSSION_FILES.format(
                 n=len(snap.files), rev=snap.head[:12], repo=t["repo"],
                 # A file can't close the list early (codex-1).
-                files=snapshot.listing(snap).replace("[/repository file list]", "[/ repository file list]"))
+                files=(text := snapshot.listing(snap).replace("[/repository file list]", "[/ repository file list]")),
+                escaped=escaped_note(text))
                 if snap is not None and snap.files else "")
         return self._discussion_files
 
@@ -1649,6 +1650,8 @@ class Worker:
                                 prior) if prior else ""
             # The copy's path goes up by the findings, where a reviewer starts reading (#186).
             where = prompts.SNAPSHOT_BRIEF.format(path=snap.path, head=snap.head) if snap.path else ""
+            if copy_gone(mine, refs):
+                where += prompts.SNAPSHOT_GONE
             prompt = prompts.REVIEW_FOLLOWUP.format(
                 head=refs["head_commit_id"], prev=refs["prev_head_commit_id"], replies=replies, lead=lead,
                 where=where, rebase=rebase_note,
@@ -2003,7 +2006,8 @@ class Worker:
             delta = (snapshot.delta(refs["repo"], since, snap, self.listed_baseline(refs["reviewer"]) == since)
                      if since else None)
             if delta is None:
-                out += prompts.SNAPSHOT_LIST.format(n=len(snap.files), files=snapshot.listing(snap))
+                files = snapshot.listing(snap)
+                out += prompts.SNAPSHOT_LIST.format(n=len(snap.files), files=files) + escaped_note(files)
             else:
                 added, removed = delta
                 changes = "".join(f"\n{what} since head {since[:12]}:\n" + "\n".join(paths)
@@ -2011,7 +2015,7 @@ class Worker:
                 count = f"{len(snap.files)} file{'s' if len(snap.files) != 1 else ''}"
                 out += prompts.SNAPSHOT_DELTA.format(
                     changes=f", with these changes ({count} now):{changes}" if changes
-                    else f", with no files added or removed ({count}).")
+                    else f", with no files added or removed ({count}).") + escaped_note(changes)
         if shell and commands and brief:
             tools = " and ".join(t for t, ok in (("git", git_readable(refs["repo"], kind)),
                                                  ("jj (with --ignore-working-copy)", kind == "jj")) if ok)
@@ -2692,11 +2696,9 @@ EARLIER_TEXT_CAP = 12_000
 EARLIER_MIN_TEXT = 300
 
 
-def earlier_findings_note(reviewer: str, mine: dict | None, prior: dict[str, dict]) -> str:
-    """The follow-up prompt's list of earlier blocking findings to settle, by id (#101),
-    each with its full text within EARLIER_TEXT_CAP (#126)."""
-    if not prior:
-        return ""
+def finding_rows(prior: dict[str, dict]) -> str:
+    """The earlier blocking findings to settle, one row each: id, severity, ``path:line`` and
+    the full text within EARLIER_TEXT_CAP (#126; the confirmation lead too since #196)."""
     comments = {fid: " ".join(str(f.get("comment") or "").split()) for fid, f in prior.items()}
     least = min(EARLIER_MIN_TEXT, EARLIER_TEXT_CAP // len(prior))
     # What each finding is sure of: its first ``least`` characters, or all of a shorter one.
@@ -2714,26 +2716,37 @@ def earlier_findings_note(reviewer: str, mine: dict | None, prior: dict[str, dic
         else:
             budget -= len(comment)
         rows.append(f"- {fid} [{f.get('severity')}] {loc}: {comment}")
+    return "\n".join(rows)
+
+
+def earlier_findings_note(reviewer: str, mine: dict | None, prior: dict[str, dict]) -> str:
+    """The follow-up prompt's list of earlier blocking findings to settle, by id (#101),
+    each with its full text within EARLIER_TEXT_CAP (#126)."""
+    if not prior:
+        return ""
     return prompts.EARLIER_FINDINGS.format(head=mine["data"].get("head_commit_id"), example=next(iter(prior)),
-                                           findings=prompts.wrap_peer(reviewer, "\n".join(rows)))
-
-
-# How much of each open finding a confirmation pass's lead quotes (#159).
-CONFIRM_LINE = 160
+                                           findings=prompts.wrap_peer(reviewer, finding_rows(prior)))
 
 
 def confirm_lead(reviewer: str, prev: str, prior: dict[str, dict]) -> str:
     """The lead of a resumed follow-up that has blocking findings to settle (#159): each by
-    id, with one line of its text (the session has the rest)."""
-    rows = []
-    for fid, f in prior.items():
-        loc = f"{f.get('file')}:{f['line']}" if f.get("line") else str(f.get("file"))
-        comment = " ".join(str(f.get("comment") or "").split())
-        first = re.split(r"(?<=[.!?])\s", comment, maxsplit=1)[0]
-        if len(first) > CONFIRM_LINE:
-            first = first[:CONFIRM_LINE].rstrip() + "…"
-        rows.append(f"- {fid} [{f.get('severity')}] {loc}: {first}")
-    return prompts.CONFIRM_LEAD.format(prev=prev, findings=prompts.wrap_peer(reviewer, "\n".join(rows)))
+    id, with its ``path:line`` and full text (#196: a reviewer matched one line of it to its
+    earlier verdict only with effort)."""
+    return prompts.CONFIRM_LEAD.format(prev=prev, findings=prompts.wrap_peer(reviewer, finding_rows(prior)))
+
+
+def copy_gone(mine: dict | None, refs: dict) -> bool:
+    """Whether a resumed follow-up says its earlier pass's copy is gone (#196): whether or not
+    this head has one, unless that pass was of this same head (a base-only change, or back to
+    the head it last saw after another reviewer's), whose copy is at that path again (codex-1)."""
+    last = ((mine or {}).get("data") or {}).get("head_commit_id") or refs.get("prev_head_commit_id")
+    return last != refs["head_commit_id"]
+
+
+def escaped_note(listed: str) -> str:
+    """prompts.ESCAPED when a file list (snapshot.escaped names) shows a name escaped (#193):
+    only an escaped name has a backslash, since a backslash in a name is doubled."""
+    return prompts.ESCAPED if "\\" in listed else ""
 
 
 def build_label() -> str:
@@ -2761,9 +2774,12 @@ def verdict_format(prior: dict[str, dict], review_only: bool = False) -> str:
              + [{"id": i, "status": "fixed", "note": "How it was fixed."} for i in ids[1:]],
              # Still blocking: "earlier" alone carries it (#164), so it isn't repeated here.
              "findings": [{"file": "src/app.py", "line": 30, "severity": "low", "comment": "A new, non-blocking note."}]}
+    # A carried-over finding with updated text (#196): in "findings" with its id, and in "earlier".
+    update = {"id": first, "file": "src/app.py", "line": 34, "severity": "medium",
+              "comment": "The updated text."}
     # One example (#159): the approving one only repeated it with every id fixed.
     return prompts.VERDICT_FORMAT + prompts.VERDICT_FOLLOWUP.format(
-        ids=", ".join(ids), example=first, still=json.dumps(still)) + tail
+        ids=", ".join(ids), example=first, still=json.dumps(still), update=json.dumps(update)) + tail
 
 
 def settle_earlier(v: dict | None, prior: dict[str, dict], reusable: set[str] = frozenset()) -> dict | None:

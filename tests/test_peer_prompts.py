@@ -401,7 +401,8 @@ def test_a_confirmation_pass_leads_with_the_open_findings(env, no_spawn, monkeyp
     claude.request_review("codex", str(repo), base, h2, prev_head_commit_id=h1, testing="pytest: 12 passed")
     run_job(bus, tid)
     p = calls(env)[-1]["prompt"]
-    assert "- codex-1 [high] a.txt:1: The lock is released too early.\n" in p and "races with the writer" not in p
+    # With its path:line and full text since #196 (one line was hard to match to the verdict).
+    assert f"- codex-1 [high] a.txt:1: {' '.join(long.split())}\n" in p
     # The copy's path goes with the findings, before the interdiff (#186); the note is labelled
     # with the head it was sent for, and so is the testing note.
     order = ["Your open blocking findings", "confirm or reopen it", "(the verdict format is at the end)",
