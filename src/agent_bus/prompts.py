@@ -153,6 +153,15 @@ FORMAT_LABEL = """\
 {build}). If the change under review edits this format, answer in this one: the change takes \
 effect only once it is installed.)"""
 
+# After FORMAT_LABEL in a repository listed in self_hosted_prompts (#138): which prompts this
+# review uses.  Always the installed text (headprompts.NAMES leaves these out).
+PROMPTS_HEAD = """
+(Prompts: this review's prompt text is head {head}'s, read from its {path}, since this \
+repository opts in. The worker, its tools and the verdict format above are agent-bus {build}.)"""
+PROMPTS_INSTALLED = """
+(Prompts: this repository opts in to the head's prompt text, but head {head}'s could not be \
+loaded ({reason}), so this review uses agent-bus {build}'s installed prompts.)"""
+
 # How every review pass ends (#93).  Not a .format() template: it goes in as a value, and
 # its example is valid JSON, with the alternatives in prose rather than inside the JSON.
 VERDICT_FORMAT = """\

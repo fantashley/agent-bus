@@ -30,7 +30,8 @@ from typing import Iterator
 from . import __version__
 from . import config as cfg
 from . import evidence as ev
-from . import autoresume, procinfo, prompts, provenance, quota, snapshot, unvotable, usages
+from . import autoresume, headprompts, procinfo, provenance, quota, snapshot, unvotable, usages
+from .headprompts import view as prompts  # the head's review prompt text, when opted in (#138)
 from .db import HUMAN, SYSTEM, Bus, BusError, format_dissent, over_followup_limit, review_progress
 from .peers import (ADAPTERS, Adapter, TurnResult, adapter, cli_version, extract_reply, fenced_body,
                     format_usage)
@@ -1237,7 +1238,29 @@ class Worker:
 
     def review_round(self, mode: str) -> dict | None:
         """One reviewer's pass at the thread's pinned head.  Posts the verdict and returns
-        it, or returns None after parking the thread for the human user."""
+        it, or returns None after parking the thread for the human user.  The pass's
+        prompts are the head's, in a repository that opts in (#138)."""
+        t = self.thread()
+        snap = self.pin_snapshot(t, t["refs"] or {})
+        with headprompts.using(self.head_prompts(t["refs"] or {}, snap)):
+            return self._review_round(mode, snap)
+
+    def head_prompts(self, refs: dict, snap: snapshot.Snapshot) -> headprompts.Active | None:
+        """The pass's review prompt text from the head (#138): None unless the repo is listed
+        in self_hosted_prompts; else the head's texts, or none (the installed ones) with why."""
+        if not self.config.head_prompts(refs["repo"]):
+            return None
+        head = refs["head_commit_id"][:12]
+        try:
+            texts = headprompts.load(snap)
+        except headprompts.NotLoadable as e:
+            self.event("prompts", f"installed review prompts: head {head}'s could not be loaded ({e})")
+            return headprompts.Active(note=prompts.PROMPTS_INSTALLED.format(head=head, reason=e, build=build_label()))
+        self.event("prompts", f"review prompts from head {head}'s {headprompts.PATH}")
+        return headprompts.Active(texts, prompts.PROMPTS_HEAD.format(head=head, path=headprompts.PATH,
+                                                                     build=build_label()))
+
+    def _review_round(self, mode: str, snap: snapshot.Snapshot) -> dict | None:
         t = self.thread()
         refs = t["refs"] or {}
         reviewer = refs["reviewer"]
@@ -1292,7 +1315,6 @@ class Worker:
             # reviewer seeing it for the first time: only `agent-bus resume` retries it.
             self.report_missing(t, e, followup or bool(refs.get("revision")) or len(refs.get("heads") or []) > 1)
             raise
-        snap = self.pin_snapshot(t, refs)
         # Large new data files, readable in full in the copy, are summarized (#161).  Only now,
         # so the interdiff checks above compared the diffs as git gave them (codex-3).
         full_diff = self.summarize_data(full_diff, snap)
@@ -2424,7 +2446,7 @@ def verdict_format(prior: dict[str, dict], review_only: bool = False) -> str:
     blocking findings to settle (#126): "earlier" entries and a finding reused by "id".  A
     review-only review adds how to write findings its author can read on GitHub (#151)."""
     tail = (prompts.REVIEW_ONLY if review_only else "") + "\n" + prompts.FORMAT_LABEL.format(
-        version=prompts.VERDICT_FORMAT_VERSION, build=build_label())
+        version=prompts.VERDICT_FORMAT_VERSION, build=build_label()) + headprompts.note()
     if not prior:
         return prompts.VERDICT_FORMAT + tail
     ids = list(prior)
