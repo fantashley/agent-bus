@@ -118,8 +118,8 @@ request_review(
   `needs_human` thread, read the bus's notice and report it. The skill has the full stop
   conditions. `wait` returns only messages you
   haven't read yet, so don't pass `after_message_id` unless you mean to replay. To see what a
-  reviewer is doing, `agent-bus tail <thread> --events --once` (or `--events-only` for just
-  tool calls, turns, errors and retries).
+  reviewer is doing, `agent-bus tail <thread> --events --once` (or `--events-only` for the event
+  lines alone: tool calls, turns, errors, retries and the like, without the peers' text).
 - **Fixing findings.** When `next_action` says `fix:` (the thread stays `open`, with one
   reviewer or several), fix the `high` and `medium` findings (`low` never blocks; defer real
   work to a follow-up issue), re-run the tests and push. Then `send` the thread a short note on

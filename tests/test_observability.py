@@ -196,6 +196,25 @@ def test_events_only_shows_failed_tools(env, capsys):
     assert "  · claude tool_failed: Bash: line one\\nline two \\x1b[31mred\n" in out and "\x1b" not in out
 
 
+def test_tail_shows_every_event_kind(env, capsys):
+    """#179: no hard-coded list of kinds, so `snapshot` and kinds added later are shown;
+    --events-only leaves out only the peers' streamed text and thinking."""
+    bus = env["bus"]
+    tid = Service(bus, "claude", bus.register_session("claude")).send(to="codex", body="hi")["thread"]["id"]
+    bus.add_event(tid, "snapshot", "full snapshot of head abc")
+    bus.add_event(tid, "some_future_kind", "NEW-KIND")
+    bus.add_event(tid, "text", "PEER-TEXT", agent="codex")
+    bus.add_event(tid, "thinking", "PEER-THINKING", agent="codex")
+    assert cli.main(["tail", tid, "--events", "--once", "--no-color", "--no-status"]) == 0
+    out = capsys.readouterr().out
+    assert "worker snapshot: full snapshot of head abc" in out and "worker some_future_kind: NEW-KIND" in out
+    assert "codex text: PEER-TEXT" in out and "codex thinking: PEER-THINKING" in out
+    assert cli.main(["tail", tid, "--events-only", "--once", "--no-color", "--no-status"]) == 0
+    only = capsys.readouterr().out
+    assert "worker snapshot:" in only and "worker some_future_kind: NEW-KIND" in only
+    assert "PEER-TEXT" not in only and "PEER-THINKING" not in only
+
+
 # ------------------------------------------------------------ the verdict format label
 
 
