@@ -264,7 +264,7 @@ same things in parallel:
   there is none and the prompt says files on disk may not match. Codex also gets copyable
   read-only `git` (and `jj`) commands for the pinned commits' history. The prompt
   states the turn's time limit, and that only the JSON verdict is posted. It names the verdict
-  format's version and the running build (`Verdict format v1 … agent-bus 0.3.0, <store item>`),
+  format's version and the running build (`Verdict format v2 … agent-bus 0.3.0, <store item>`),
   so a reviewer of a change to the format can tell which one the running worker expects.
 - **Reviewing agent-bus itself with the head's own build** (opt-in). Reviewers normally get the
   installed build, so a change to a review prompt, the usage search, an adapter or the verdict
@@ -351,11 +351,12 @@ After a reviewer's first verdict, its later passes converge: they settle each ea
 finding (fixed, withdrawn or still blocking), and a new blocking finding must come from behavior
 the latest changes introduced or exposed, unless it is a newly substantiated `high`, and say why
 it wasn't visible on the earlier head. A resumed pass with findings to settle is a lighter
-confirmation pass (#159): its prompt leads with the open finding ids (one line each; the session
-has their full text) and the path of the head's read-only copy, then the interdiff, then your
-notes and `testing`, and it names the read commands from the reviewer's first pass rather than
-listing them again. In every review prompt, each of your notes on the thread is labelled with the
-head of the review pass that followed it, and the `testing` note with its head.
+confirmation pass (#159): its prompt leads with the open findings (each id with its `path:line`
+and full text) and the path of the head's read-only copy (saying the earlier pass's copy is gone),
+then the interdiff, then your notes and `testing`, and it names the read commands from the
+reviewer's first pass rather than listing them again, with how to read the head it last
+reviewed. In every review prompt, each of your notes on the thread is labelled with the head of
+the review pass that followed it, and the `testing` note with its head.
 
 A review counts your follow-up requests (each new base or head, and each pushback; reviewer
 handoffs, retries and repeats are free). The soft budget, `review_followup_budget` in the config
@@ -564,7 +565,8 @@ codex 0.171.0 and 0.172.0, and agy 1.5.13:
   mean replacing the blanket command deny with an allowlist of git and rg flags. Instead,
   agent-bus searches the pinned head for it before a review turn: where the names the diff
   defines or edits are used (with changed class fields, the other definitions of changed
-  methods, and names in backticks in the thread's findings and notes since its last pass),
+  methods, the calls the diff removes, and names in backticks in the thread's findings and notes
+  since its last pass),
   fewest hits first, with a very common name collapsed to one line, each name's hits outside
   test files first, and a name short of room cut to a sample of its hits, or failing that to
   one line of `path:line` numbers. A name with no room left at all still gets that line, in a
@@ -574,8 +576,9 @@ codex 0.171.0 and 0.172.0, and agy 1.5.13:
   written. Among the names the changed lines read and those the thread mentions, ones that look
   like constants or environment variables (`AGENT_BUS_BIN`) and ones the change adds are searched
   and given room first. In a discussion with a `repo`, agy's prompt lists the repository's files
-  at its checked-out commit (capped, like a review's snapshot list). A prompt too long for one
-  argument goes in as far as fits and continues in numbered part files, each small enough for
+  at its checked-out commit (capped, like a review's snapshot list). A file list that shows a name
+  escaped (a control character or non-UTF-8 byte as `\xNN`, a backslash doubled) says so. A
+  prompt too long for one argument goes in as far as fits and continues in numbered part files, each small enough for
   one `read_file` call (agy reads at most 800 lines or 46,080 bytes per call; a part stays under
   750 lines and 44,000 bytes). Turns also
   pass `--disable-slash-commands`, so nothing in the prompt expands as a slash command or skill,

@@ -64,6 +64,9 @@ as definitions only (``def vcs``), in one more git grep: ``name: path:line`` eac
 rest, at most MAX_CALLEES of them in DEF_CHARS, so a helper that is neither in the diff nor
 in the usages is still found without guessing.  #194: a listed name's ``[... N more ...]``
 tail gives line numbers, not just files.
+
+#196: the names the removed lines call and the added lines don't (a deleted call) are searched
+too, so a reviewer sees whether the function still has other callers before calling it unused.
 """
 
 from __future__ import annotations
@@ -100,6 +103,8 @@ MAX_METHODS = 4
 MAX_MENTIONED = 8
 # Names the added lines only read (string keys, then attributes), on top of those.
 MAX_READ = 6
+# Names the removed lines call and the added ones don't (#196): where they are still used.
+MAX_REMOVED = 4
 # A name with more hits than this is too common to list: one line with its busiest files.
 GENERIC_HITS = 100
 # Where the functions the added lines call are defined (#191): at most MAX_CALLEES names with a
@@ -112,7 +117,7 @@ DEF_HITS = 3
 DEF_CHARS = 1_200
 # What a term is, and how much room it gets: the changed definitions (and fields) are always
 # shown, at worst as one line; the rest go, highest hit count first, when space runs out.
-KINDS = {"defined": 0, "field": 0, "enclosing": 1, "override": 1, "read": 2, "mentioned": 2}
+KINDS = {"defined": 0, "field": 0, "enclosing": 1, "override": 1, "removed": 1, "read": 2, "mentioned": 2}
 
 # Python sources read for the scopes of their changed lines (#174): at most this many bytes each,
 # and in all per search (the old sides rebuilt from them count too).
@@ -673,7 +678,7 @@ def symbols(diff: str, limit: int = MAX_SYMBOLS) -> list[str]:
     then the functions or classes the changed lines sit in (their callers see the change):
     the last definition above them in the hunk, or failing that the one git names in the
     hunk header; the names it touches only in test files last."""
-    return [t.pattern for t in terms(diff, limit=limit) if t.kind not in ("override", "read")]
+    return [t.pattern for t in terms(diff, limit=limit) if t.kind not in ("override", "read", "removed")]
 
 
 def mentioned(texts: list[str], exclude: set[str] | frozenset[str] = frozenset(),
@@ -710,7 +715,8 @@ def mentioned(texts: list[str], exclude: set[str] | frozenset[str] = frozenset()
 def terms(diff: str, mention: list[str] | None = None, limit: int = MAX_SYMBOLS,
           scopes: dict[tuple[str, str], PyScopes] | None = None) -> list[Term]:
     """What to search for ``diff``: its names (see symbols, at most ``limit``), the other
-    definitions of its changed methods (at most MAX_METHODS), the names its added lines only
+    definitions of its changed methods (at most MAX_METHODS), the names its removed lines call
+    and its added ones don't (at most MAX_REMOVED, #196), the names its added lines only
     read (at most MAX_READ), and the names in ``mention`` that aren't among them (at most
     MAX_MENTIONED).  Within each group, the names it touches outside test files come first;
     its own names and changed methods touched only in tests are marked ``test`` (#135).
@@ -735,6 +741,10 @@ def terms(diff: str, mention: list[str] | None = None, limit: int = MAX_SYMBOLS,
              if not (n.startswith("__") and n.endswith("__")) and n not in _SKIP and not n.startswith("test")]
     found += meths[:MAX_METHODS]
     have = {t.pattern for t in found} | set(out)
+    # The calls the change deletes (#196): their remaining uses, or that none are left.
+    found += [Term(n, "removed", test=test) for n, test in removed_calls(diff, scopes)
+              if n not in have and _ok(n)][:MAX_REMOVED]
+    have = {t.pattern for t in found} | set(out)
     # By where the change touches them, then constant-like and new names first (#186).
     added = _added(diff)
     found += [Term(n, "read", test=first(n), sharp=_sharp(n, added))
@@ -752,19 +762,20 @@ def _code(text: str, path: str) -> str:
     return _mask(text, path).split("#" if path.endswith(_PY) else "//", 1)[0]
 
 
-def callees(diff: str, scopes: dict[tuple[str, str], PyScopes] | None = None) -> list[str]:
-    """The names ``diff``'s added lines call (``name(``, ``obj.name(``), first called first,
-    but those called only in test files, and then the ones the added lines define, last
-    (#191).  In a Python file parsed at the head (``scopes``, see pinned_python) the calls
-    are its ``ast`` calls on those lines; elsewhere, ``name(`` in the line's code (_code).
-    Left out: prose files, a Python builtin or keyword called bare, a common standard-library
-    module's own functions (``os.replace``), generic words (``get``, ``run``) and dunders."""
+def _calls(diff: str, side: str, scopes: dict[tuple[str, str], PyScopes] | None = None
+           ) -> tuple[dict[str, bool], set[str]]:
+    """The names ``diff``'s added (``side`` "+") or removed ("-") lines call, first called first,
+    each with whether it is called only in test files, and the names those lines define.  In a
+    Python file parsed on that side (``scopes``, see pinned_python) the calls are its ``ast``
+    calls on those lines; elsewhere, ``name(`` in the line's code (_code).  Left out: prose
+    files, a Python builtin or keyword called bare, a common standard-library module's own
+    functions (``os.replace``), generic words (``get``, ``run``) and dunders."""
     seen: dict[str, bool] = {}  # name -> whether it is called only in test files so far
     defined: set[str] = set()
     scopes = scopes or {}
     old = new = ""
     in_hunk = False
-    new_ln = rem_old = rem_new = 0
+    old_ln = new_ln = rem_old = rem_new = 0
 
     def call(name: str, recv: str, py: bool, test: bool) -> None:
         if py and ((not recv and (name in _BUILTINS or name in _KEYWORDS)) or recv in _STDLIB):
@@ -782,29 +793,32 @@ def callees(diff: str, scopes: dict[tuple[str, str], PyScopes] | None = None) ->
         m = _HUNK.match(line)
         if m:
             in_hunk = True
-            new_ln, rem_old, rem_new = int(m.group(3)), int(m.group(2) or 1), int(m.group(4) or 1)
+            old_ln, new_ln = int(m.group(1)), int(m.group(3))
+            rem_old, rem_new = int(m.group(2) or 1), int(m.group(4) or 1)
             continue
         if line == "" and in_hunk and rem_old > 0 and rem_new > 0:
             line = " "  # a blank context line without its space (diff.suppressBlankEmpty)
         if not in_hunk or not line.startswith(("+", "-", " ")):
             continue
-        ln = new_ln
+        ln = new_ln if side == "+" else old_ln
+        old_ln += line[0] != "+"
         new_ln += line[0] != "-"
         rem_old -= line[0] != "+"
         rem_new -= line[0] != "-"
-        if line[0] != "+" or new.endswith(_PROSE):
+        path = new if side == "+" else old
+        if line[0] != side or path.endswith(_PROSE):
             continue
-        py, test = new.endswith(_PY), is_test(new)
-        index = scopes.get(("+", new))
+        py, test = path.endswith(_PY), is_test(path)
+        index = scopes.get((side, path))
         if index is not None:
             defined.update(index.def_lines.get(ln, ()))
             for name, recv in index.calls.get(ln, ()):
                 call(name, recv, py, test)
             continue
-        code = _code(line[1:], new)
+        code = _code(line[1:], path)
         if _COMMENT.match(code):
             continue
-        defined.update(_defs(code, new))
+        defined.update(_defs(code, path))
         for c in _CALL.finditer(code):
             # Only what is just before the name (a long line is scanned once, codex-6).
             before = code[max(0, c.start() - 80):c.start()]
@@ -812,7 +826,26 @@ def callees(diff: str, scopes: dict[tuple[str, str], PyScopes] | None = None) ->
                 continue
             r = _RECEIVER.search(before[:-1]) if before.endswith(".") else None
             call(c.group(1), r.group(1) if r else "." if before.endswith(".") else "", py, test)
+    return seen, defined
+
+
+def callees(diff: str, scopes: dict[tuple[str, str], PyScopes] | None = None) -> list[str]:
+    """The names ``diff``'s added lines call (``name(``, ``obj.name(``), first called first,
+    but those called only in test files, and then the ones the added lines define, last
+    (#191).  See _calls for how calls are found and what is left out."""
+    seen, defined = _calls(diff, "+", scopes)
     return sorted(seen, key=lambda n: (n in defined, seen[n]))
+
+
+def removed_calls(diff: str, scopes: dict[tuple[str, str], PyScopes] | None = None) -> list[tuple[str, bool]]:
+    """The names ``diff``'s removed lines call that its added lines don't (#196: a reviewer
+    checks whether a deleted call's function is still used elsewhere), first called first,
+    with whether each is called only in test files; those called only there last.  Not the
+    names the removed lines define (a deleted function's own helpers, or itself: that one is
+    searched as a changed definition)."""
+    gone, defined = _calls(diff, "-", scopes)
+    still, _ = _calls(diff, "+", scopes)
+    return sorted(((n, t) for n, t in gone.items() if n not in still and n not in defined), key=lambda i: i[1])
 
 
 @dataclass
@@ -1009,6 +1042,8 @@ def _desc(t: Term) -> str:
         return "named in the thread's findings or notes"
     if t.kind == "read":
         return "a key or attribute the changed lines read: where it is set"
+    if t.kind == "removed":
+        return "a call the change removes: where it is still used"
     return ""
 
 
