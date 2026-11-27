@@ -1178,6 +1178,12 @@ class Bus:
     def jobs(self, thread_id: str) -> list[dict]:
         return [self._job(r) for r in self._all("SELECT * FROM jobs WHERE thread_id=? ORDER BY created_at", thread_id)]
 
+    def has_live_job(self, thread_id: str) -> bool:
+        """Whether a job is queued, or running under a lease that hasn't expired, on the
+        thread: a plain read, without reaping (active_job reaps a dead worker's job)."""
+        return self._one("SELECT 1 AS x FROM jobs WHERE thread_id=? AND (status='queued' OR "
+                         "(status='running' AND lease_expires>=?)) LIMIT 1", thread_id, _now()) is not None
+
     def active_job(self, thread_id: str) -> dict | None:
         self.reap()
         row = self._one("SELECT * FROM jobs WHERE thread_id=? AND status IN ('queued','running')", thread_id)
@@ -1701,23 +1707,28 @@ def new_uuid() -> str:
     return str(uuid.uuid4())
 
 
-def head_build_attempt(events: list[dict]) -> dict | None:
+def head_build_attempt(events: list[dict], holder: str | None = None) -> dict | None:
     """The latest attempt at building the head (#188) among a job's events: {"head",
     "owner", "start", "end"} (end None until it ends), or None.  Paired per attempt (#198):
     a worker's head_build event records its phase, head and lease owner in its purpose
     ("start <head> <owner>", "end <head> <owner>"), so a start opens an attempt and only the
     same worker's end closes it.  An older build's events have no purpose: their text says
-    which is which ("building head <head12> with nix" starts one), with no owner."""
-    attempt = None
+    which is which ("building head <head12> with nix" starts one), with no owner.  Once
+    ``holder``, the job's lease owner, has recorded an attempt, such an ownerless start
+    replaces nothing (#206): it came late from an older worker that has lost the job."""
+    attempt, held = None, False
     for e in events:
         if e["kind"] != "head_build" or e["agent"]:
             continue  # only the worker's own
-        phase, head, owner = ((e.get("purpose") or "").split(" ") + ["", "", ""])[:3]
+        phase, head, owner = ((e.get("purpose") or "").split(" ", 2) + ["", "", ""])[:3]
         if not phase:
             m = re.match(r"(building )?head ([0-9a-f]+)", e["text"] or "")
             phase, head = ("start" if m and m[1] else "end"), (m[2] if m else "")
         if phase == "start":
+            if not owner and held:
+                continue
+            held = held or bool(holder and owner == holder)
             attempt = {"head": head, "owner": owner or None, "start": e["created_at"], "end": None}
-        elif attempt and attempt["end"] is None and (owner or None) == attempt["owner"]:
+        elif phase == "end" and attempt and attempt["end"] is None and (owner or None) == attempt["owner"]:
             attempt["end"] = e["created_at"]
     return attempt

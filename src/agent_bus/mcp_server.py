@@ -183,6 +183,13 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
             res = call(svc.poll, thread)
             if res is not None:
                 return res
+            # Nothing can arrive (#208): what the timeout would give, without sitting it out.
+            # Checked in one write transaction only after a cheap read finds no live job and
+            # a thread that could be settled.
+            if call(svc.may_settle, thread) is True:
+                res = call(svc.settled_wait, thread)
+                if res is not None:
+                    return res
             await asyncio.sleep(1.0)
 
     def poller(thread: str) -> tuple[dict, bool]:
@@ -205,7 +212,9 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
         such as "Round 2 of 3" or "Review requested from ..." don't end the wait by
         themselves; they come with the next message or on timeout. On timeout it returns
         {"status": "timeout"} with the thread's state and `progress`: per peer working on
-        it, the turn's state, elapsed time, latest activity and tool calls. On a review thread
+        it, the turn's state, elapsed time, latest activity and tool calls. When nothing can
+        arrive (no job running or queued, and the thread is closed or a review waits for your
+        next head), it returns that at once instead of sitting out the timeout. On a review thread
         every result also has `review` (approved / changes_requested / pending per reviewer at
         the current head) and `next_action` (wait, fix, await_head, retry, done or stop). Call again to
         keep waiting; one wait at a time is enough (concurrent waits on a thread share what

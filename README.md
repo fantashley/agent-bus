@@ -116,7 +116,9 @@ or may not be able to read; `evidence` carries the content itself.
 
 `wait(thread)` blocks for up to 55 s (clients' tool-call timeouts don't allow more). It returns
 as soon as something for you arrives. Routine notices ("Round 2 of 3", "Review requested from
-…") don't end it on their own; they come back with the next message or on timeout. On timeout
+…") don't end it on their own; they come back with the next message or on timeout. When nothing
+can arrive (no job queued or running, a debrief's included, and the thread is closed or a review
+waits for the author's next head), it returns what the timeout would, at once. On timeout
 it returns the thread's state plus `progress`: for each peer working on the current job, its
 turn's state (`working`, `done`, `failed`, or `stopped` when the worker died), the elapsed
 time, the latest activity and its age, and the number of tool calls (and API retries or errors,
