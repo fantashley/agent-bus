@@ -190,15 +190,26 @@ def test_a_build_that_runs_too_long_is_stopped(tmp_path):
         headbuild.nix_build(str(failing), str(tmp_path), tmp_path / "out", 30, lambda: False)
 
 
+def test_only_the_packages_out_output_is_built(tmp_path):
+    """codex-11 (#185): one out-link, the cache entry, whatever outputs the package installs."""
+    args = tmp_path / "args"
+    nix = tmp_path / "nix"
+    nix.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {args}\n")
+    nix.chmod(0o755)
+    headbuild.nix_build(str(nix), "/snap", tmp_path / "out", 30, lambda: False)
+    assert args.read_text().splitlines() == ["build", "--no-write-lock-file", "--no-update-lock-file",
+                                             "--out-link", str(tmp_path / "out"), "path:/snap#default^out"]
+
+
 def test_the_probe_refuses_an_old_or_other_build(tmp_path):
     headbuild.probe(str(fake_build(tmp_path / "new")))
     old = fake_build(tmp_path / "old", "#!/bin/sh\necho \"agent-bus: invalid choice: '$1'\" >&2\nexit 2\n")
     with pytest.raises(headbuild.Unusable, match="doesn't speak the hand-off protocol.*invalid choice"):
         headbuild.probe(str(old))
-    other = fake_build(tmp_path / "other", "#!/bin/sh\necho '{\"protocol\": 2}'\n")
-    with pytest.raises(headbuild.Unusable, match="speaks hand-off protocol 2, not 1"):
+    other = fake_build(tmp_path / "other", "#!/bin/sh\necho '{\"protocol\": 1}'\n")  # before #185
+    with pytest.raises(headbuild.Unusable, match="speaks hand-off protocol 1, not 2"):
         headbuild.probe(str(other))
-    failed = fake_build(tmp_path / "failed", "#!/bin/sh\necho '{\"protocol\": 1}'\nexit 1\n")  # codex-6
+    failed = fake_build(tmp_path / "failed", "#!/bin/sh\necho '{\"protocol\": 2}'\nexit 1\n")  # codex-6
     with pytest.raises(headbuild.Unusable, match="doesn't speak the hand-off protocol"):
         headbuild.probe(str(failed))
 
@@ -291,7 +302,7 @@ def test_a_failed_build_falls_back_with_its_reason(env, no_spawn, nix):
 def test_a_head_worker_that_dies_before_any_turn_falls_back(env, no_spawn, nix, tmp_path):
     write_config(env, self_hosted_reviews=[str(env["repo"])])
     nix["out"] = fake_build(tmp_path / "broken", "#!/bin/sh\n[ \"$1\" = self-host-info ] && "
-                            "echo '{\"protocol\": 1}' && exit 0\necho 'ImportError: no module' >&2\nexit 3\n")
+                            "echo '{\"protocol\": 2}' && exit 0\necho 'ImportError: no module' >&2\nexit 3\n")
     job, events, head, _ = review(env)
     assert job["status"] == "done"
     assert "its worker exited (code 3) before any turn: ImportError: no module" in events[2][1]
@@ -303,7 +314,7 @@ def test_a_head_worker_that_dies_mid_job_fails_it(env, no_spawn, nix, tmp_path):
     turn = ("from agent_bus.db import Bus; import sys; j=sys.argv[1]; b=Bus(); "
             "b.add_event(b.job(j)['thread_id'], 'turn_start', 'codex', job_id=j)")
     nix["out"] = fake_build(tmp_path / "crash", f"#!/bin/sh\n[ \"$1\" = self-host-info ] && "
-                            f"echo '{{\"protocol\": 1}}' && exit 0\nPYTHONPATH={SRC} {sys.executable} -c \"{turn}\" "
+                            f"echo '{{\"protocol\": 2}}' && exit 0\nPYTHONPATH={SRC} {sys.executable} -c \"{turn}\" "
                             f"\"$2\"\necho 'Segmentation fault' >&2\nexit 139\n")
     job, events, head, _ = review(env)
     assert job["status"] == "failed" and calls(env) == []
@@ -336,9 +347,10 @@ def test_a_head_worker_that_posts_then_dies_fails_the_job(env, no_spawn, nix, tm
     """codex-10: the head's worker's own posts (a review-request notice) mean it started."""
     write_config(env, self_hosted_reviews=[str(env["repo"])])
     post = ("from agent_bus.db import Bus; import sys; j=sys.argv[1]; b=Bus(); "
-            "b.post(b.job(j)['thread_id'], 'system', 'Review requested from codex', kind='status')")
+            "b.post(b.job(j)['thread_id'], 'system', 'Review requested from codex', kind='status', "
+            "session_id='job:'+j)")
     nix["out"] = fake_build(tmp_path / "posted", f"#!/bin/sh\n[ \"$1\" = self-host-info ] && "
-                            f"echo '{{\"protocol\": 1}}' && exit 0\nPYTHONPATH={SRC} {sys.executable} -c \"{post}\" "
+                            f"echo '{{\"protocol\": 2}}' && exit 0\nPYTHONPATH={SRC} {sys.executable} -c \"{post}\" "
                             f"\"$2\"\nexit 1\n")
     job, events, head, _ = review(env)
     assert job["status"] == "failed" and calls(env) == []
@@ -381,11 +393,52 @@ def test_an_author_note_during_a_startup_crash_still_falls_back(env, no_spawn, n
     note = ("from agent_bus.db import Bus; import sys; j=sys.argv[1]; b=Bus(); "
             "b.post(b.job(j)['thread_id'], 'claude', 'a note from the author')")
     nix["out"] = fake_build(tmp_path / "broken", f"#!/bin/sh\n[ \"$1\" = self-host-info ] && "
-                            f"echo '{{\"protocol\": 1}}' && exit 0\nPYTHONPATH={SRC} {sys.executable} -c \"{note}\" "
+                            f"echo '{{\"protocol\": 2}}' && exit 0\nPYTHONPATH={SRC} {sys.executable} -c \"{note}\" "
                             f"\"$2\"\nexit 1\n")
     job, events, head, _ = review(env)
     assert job["status"] == "done" and len(calls(env)) == 1
     assert "its worker exited (code 1) before any turn" in events[2][1]
+
+
+@pytest.mark.parametrize("sender, session", [("codex", "a-codex-session"), ("system", None)])
+def test_anyone_elses_note_during_a_startup_crash_still_falls_back(env, no_spawn, nix, tmp_path, sender, session):
+    """codex-12 (#185): a note from another participant (or a notice the job didn't post)
+    isn't the head's worker's progress: only a message attributed to the job is."""
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    note = ("from agent_bus.db import Bus; import sys; j=sys.argv[1]; b=Bus(); "
+            f"b.post(b.job(j)['thread_id'], {sender!r}, 'a note', session_id={session!r})")
+    nix["out"] = fake_build(tmp_path / "broken", f"#!/bin/sh\n[ \"$1\" = self-host-info ] && "
+                            f"echo '{{\"protocol\": 2}}' && exit 0\nPYTHONPATH={SRC} {sys.executable} -c \"{note}\" "
+                            f"\"$2\"\nexit 1\n")
+    job, events, head, _ = review(env)
+    assert job["status"] == "done" and len(calls(env)) == 1
+    assert "its worker exited (code 1) before any turn" in events[2][1]
+
+
+def test_a_worker_from_before_job_attribution_is_never_handed_the_job(env, no_spawn, nix, tmp_path):
+    """codex-1 (#185): a protocol 1 head posted its notices unattributed, so a crash after one
+    would read as a startup crash and the installed build would run the job again: such a
+    head is refused before the hand-off."""
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    ran = tmp_path / "ran"
+    nix["out"] = fake_build(tmp_path / "legacy", "#!/bin/sh\n[ \"$1\" = self-host-info ] && "
+                            f"echo '{{\"protocol\": 1}}' && exit 0\ntouch {ran}\nexit 1\n")
+    job, events, head, _ = review(env)
+    assert job["status"] == "done" and len(calls(env)) == 1 and not ran.exists()
+    assert "it speaks hand-off protocol 1, not 2" in events[1][1]
+
+
+def test_a_workers_posts_carry_its_job(env, no_spawn, nix, monkeypatch):
+    """codex-12 (#185): every message a review job's worker posts (notices and verdicts)
+    says which job posted it."""
+    monkeypatch.setenv("FAKE_APPROVE", "codex,antigravity")
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    job, _, _, tid = review(env, reviewers=("codex", "antigravity"))
+    bus = env["bus"]
+    mine = [m for m in bus.history(tid)["messages"] if m["session_id"] == f"job:{job['id']}"]
+    assert {m["kind"] for m in mine} >= {"review_verdict", "status"}
+    others = [m for m in bus.history(tid)["messages"] if m["session_id"] != f"job:{job['id']}"]
+    assert all(m["sender"] == "claude" or m["created_at"] < job["created_at"] for m in others), others
 
 
 def test_a_cancelled_job_stops_a_hung_head_worker(env, no_spawn, nix, tmp_path, monkeypatch):
@@ -393,7 +446,7 @@ def test_a_cancelled_job_stops_a_hung_head_worker(env, no_spawn, nix, tmp_path, 
     monkeypatch.setattr(worker, "LEASE_S", 3)  # heartbeat every second
     write_config(env, self_hosted_reviews=[str(env["repo"])])
     nix["out"] = fake_build(tmp_path / "hung", "#!/bin/sh\n[ \"$1\" = self-host-info ] && "
-                            "echo '{\"protocol\": 1}' && exit 0\nexec sleep 300\n")
+                            "echo '{\"protocol\": 2}' && exit 0\nexec sleep 300\n")
     bus = env["bus"]
     base, head = agent_bus_repo(env["repo"], changed())
     claude = Service(bus, "claude", bus.register_session("claude"))
