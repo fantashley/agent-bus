@@ -27,11 +27,13 @@ def test_language_keywords_are_not_searched_as_mentioned_names():
     # Debrief of #189: a backticked `break` was searched (44 hits).
     assert usages.mentioned(["`break` here, `continue` there, `await x`, `lambda`, `drop_usage()`"]) == ["drop_usage"]
     # codex-1: only a bare keyword; other names, a qualified one and the diff's own are kept.
-    assert usages.mentioned(["`static.ensure()`, `router.switch()`, `switch`, `break`"]) == ["static.ensure", "switch"]
+    # #194: and a keyword as a dotted mention's last part, which _KEYWORDS must not cover.
+    assert (usages.mentioned(["`static.ensure()`, `router.switch()`, `switch`, `break`, `obj.from`"])
+            == ["static.ensure", "switch", "from"])
     diff = ("diff --git a/src/r.py b/src/r.py\n--- a/src/r.py\n+++ b/src/r.py\n@@ -1,0 +1,3 @@\n"
-            "+class Router:\n+    static: int = 0\n+    def switch(self): return options[\"from_key\"]\n")
+            "+class Router:\n+    static: int = 0\n+    def switch(self): return options[\"from\"]\n")
     found = {t.pattern for t in usages.terms(diff)}
-    assert {"switch", "static"} <= found
+    assert {"switch", "static", "from"} <= found  # a key read that is a keyword too (#194)
 
 
 def test_a_backslash_in_a_file_name_is_told_apart_from_an_escaped_line_feed():

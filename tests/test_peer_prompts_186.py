@@ -111,7 +111,8 @@ def test_a_left_out_name_lists_line_numbers_within_its_cap():
     hits = [(f"src/f{i % 3}.py", i, "x") for i in range(90)] + [("tests/t.py", 5, "x")]
     line = usages._lines_at(hits, lambda p: p)
     assert line.startswith("src/f0.py:0,3,6,") and len(line) <= usages.COMPACT
-    assert line.endswith(" more]") and "tests/t.py" not in line  # outside tests first
+    # Outside tests first; since #194 every file's first line before more lines of one.
+    assert line.endswith("; tests/t.py:5 [+40 more]") and "src/f1.py:1," in line and "src/f2.py:2," in line
 
 
 def _m(i, sender, body, kind="message"):

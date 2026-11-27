@@ -74,7 +74,7 @@ def test_render_caps_hits_per_name_and_in_all():
     u = usages.Usages(names=["alpha", "beta", "gamma"], hits={
         "alpha": [(f"f{i}.py", i, "alpha " + "x" * 300) for i in range(12)], "beta": [], "gamma": [("g.py", 1, "gamma")]})
     text = usages.render(u, per_symbol=3)
-    assert text.count("alpha x") == 3 and "[... 9 more in f3.py, f4.py" in text and "and 3 more]" in text
+    assert text.count("alpha x") == 3 and "[... 9 more at f3.py:3; f4.py:4;" in text and "f11.py:11]" in text
     assert "beta: no uses at head" in text and " [...]" in text
     # Fewest hits first (#122): beta (0), gamma (1), then alpha (12).
     assert text.index("beta:") < text.index("gamma (") < text.index("alpha (")
@@ -142,17 +142,17 @@ def test_a_name_short_of_room_shows_a_sample_of_its_hits_outside_tests_first():
     u = usages.Usages(names=list(hits), hits=hits, terms={"follow_ups": T("follow_ups", "read"), "settle": T("settle")})
     full = usages.render(u)
     assert full.index("src/worker.py:900") < full.index("tests/test_0.py")  # outside tests first
-    tight = usages.render(u, limit=420)
+    tight = usages.render(u, limit=520)  # the tail gives line numbers since #194
     assert "not listed, for space" not in tight and "not shown" not in tight
     sample = tight[tight.index("follow_ups ("):]
     assert sample.count("\n  ") == usages.SAMPLE + 1  # three hits and where the other 18 are
-    assert "  src/worker.py:900: refs['follow_ups'] = used" in sample and "[... 18 more in tests/test_0.py" in sample
+    assert "  src/worker.py:900: refs['follow_ups'] = used" in sample and "[... 18 more at tests/test_0.py:" in sample
 
 
 def test_overflow_files_are_marked_when_not_in_the_copy():
     hits = [("src/a.py", i, "alpha") for i in range(9)] + [("docs/b.md", 1, "alpha"), ("src/c.py", 2, "alpha")]
     text = usages.render(usages.Usages(names=["alpha"], hits={"alpha": hits}), readable={"src/a.py", "src/c.py"})
-    assert "[... 3 more in src/a.py, docs/b.md (not in the copy), src/c.py]" in text
+    assert "[... 3 more at src/a.py:8; docs/b.md (not in the copy):1; src/c.py:2]" in text
 
 
 def test_terms_include_fields_method_overrides_and_mentions():

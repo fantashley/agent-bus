@@ -58,11 +58,18 @@ hunks (old_text), so a removed line is placed in the file it was removed from, w
 commit the diff starts at.  When a side can't be rebuilt or parsed, the lines are matched as
 before.  Elsewhere definitions are matched as before, except that a comment line defines
 nothing, and prose files (``.md``, ``.rst``, ``.txt`` ...) touch no names.
+
+#191: the functions and classes the added lines call (``cfg.vcs(repo)``) are looked up too,
+as definitions only (``def vcs``), in one more git grep: ``name: path:line`` each after the
+rest, at most MAX_CALLEES of them in DEF_CHARS, so a helper that is neither in the diff nor
+in the usages is still found without guessing.  #194: a listed name's ``[... N more ...]``
+tail gives line numbers, not just files.
 """
 
 from __future__ import annotations
 
 import ast
+import builtins
 import keyword
 import re
 import subprocess
@@ -95,6 +102,14 @@ MAX_MENTIONED = 8
 MAX_READ = 6
 # A name with more hits than this is too common to list: one line with its busiest files.
 GENERIC_HITS = 100
+# Where the functions the added lines call are defined (#191): at most MAX_CALLEES names with a
+# definition at head, DEF_HITS definitions each, in DEF_CHARS more characters.  Names are
+# searched as definitions only (``def name``, ``class name`` ...), so a short one is fine; at
+# most MAX_CALLED of the called names go into that one search.
+MAX_CALLEES = 20
+MAX_CALLED = 60
+DEF_HITS = 3
+DEF_CHARS = 1_200
 # What a term is, and how much room it gets: the changed definitions (and fields) are always
 # shown, at worst as one line; the rest go, highest hit count first, when space runs out.
 KINDS = {"defined": 0, "field": 0, "enclosing": 1, "override": 1, "read": 2, "mentioned": 2}
@@ -159,6 +174,10 @@ _STDLIB = frozenset({"os", "sys", "re", "json", "time", "fcntl", "errno", "signa
                      "struct", "threading", "logging", "datetime", "pathlib", "textwrap", "string", "random",
                      "uuid", "base64", "select", "termios", "contextlib", "dataclasses", "argparse", "sqlite3",
                      "urllib", "posixpath", "builtins", "operator", "asyncio"})
+_BUILTINS = frozenset(dir(builtins))
+_PY_DEF = re.compile(r"\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)")
+# A definition keyword just before a name (``def name(`` defines it rather than calling it).
+_DEF_BEFORE = re.compile(r"\b(?:def|class|fn|func|function|macro_rules!)\s+$")
 # A bare name just before an attribute (``fcntl``.LOCK_SH, not ``self.queue``.x).
 _RECEIVER = re.compile(r"(?<![\w.])([A-Za-z_][A-Za-z0-9_]*)$")
 
@@ -253,11 +272,16 @@ class PyScopes:
     ``class`` and ``type`` lines of the definitions outside any function (line -> name,
     whether it is a method), what each line sits in (``at[line]``: the outermost function,
     with whether it is a method, or failing that the innermost class), class-level annotated
-    names (line -> (name, class) ...) and module-level constants (line -> names)."""
+    names (line -> (name, class) ...) and module-level constants (line -> names).  For #191:
+    the calls on each line (line -> (name, receiver): "" for a bare call, the name before
+    the dot, or "." for any other expression), and every ``def`` and ``class`` line, local
+    ones too (line -> names)."""
     defs: dict[int, tuple[tuple[str, bool], ...]]
     at: list[tuple[str, str] | None]  # ("method", name), ("function", name), ("class", name); [0] unused
     fields: dict[int, tuple[tuple[str, str], ...]]
     consts: dict[int, tuple[str, ...]]
+    calls: dict[int, tuple[tuple[str, str], ...]] = field(default_factory=dict)
+    def_lines: dict[int, tuple[str, ...]] = field(default_factory=dict)
 
     def touch(self, ln: int) -> list[tuple[str, str, str]]:
         """What a change to line ``ln`` touches, as (what, name, class) each: "defined" (a
@@ -321,12 +345,24 @@ def py_scopes(source: str) -> PyScopes | None:
                 for h in [*getattr(n, "handlers", []), *getattr(n, "cases", [])]:
                     walk(h.body, cls)
 
+    calls: dict[int, list[tuple[str, str]]] = {}
+    def_lines: dict[int, list[str]] = {}
     try:
         walk(tree.body, None)
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                def_lines.setdefault(n.lineno, []).append(n.name)
+            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                calls.setdefault(n.func.lineno, []).append((n.func.id, ""))
+            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                # On the line of the attribute's name: where the call's ``name(`` is.
+                recv = n.func.value.id if isinstance(n.func.value, ast.Name) else "."
+                calls.setdefault(n.func.end_lineno or n.func.lineno, []).append((n.func.attr, recv))
     except RecursionError:
         return None
     return PyScopes({k: tuple(v) for k, v in defs.items()}, at, {k: tuple(v) for k, v in fields.items()},
-                    {k: tuple(v) for k, v in consts.items()})
+                    {k: tuple(v) for k, v in consts.items()}, {k: tuple(v) for k, v in calls.items()},
+                    {k: tuple(v) for k, v in def_lines.items()})
 
 
 def _header(line: str, old: str, new: str) -> tuple[str, str, bool]:
@@ -430,6 +466,46 @@ def _cat(repo: str, env: dict, argv: list[str], stdin: bytes) -> bytes | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
+def _read_blobs(repo: str, env: dict, head: str, paths: list[str], budget: int
+                ) -> tuple[dict[str, tuple[str, int]], dict[str, str], int] | None:
+    """``paths``' files at ``head``: ({path: (oid, size)}, {oid: text}, bytes read), or None if
+    git fails.  Sizes are checked first (one call), and only the files that fit are read
+    (another): at most MAX_SOURCE each and ``budget`` in all, a blob two paths share once."""
+    wanted = [p for p in paths if not any(c in p for c in "\n\r\0")]
+    sizes: dict[str, tuple[str, int]] = {}
+    if wanted:
+        out = _cat(repo, env, ["--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+                   "".join(f"{head}:{p}\n" for p in wanted).encode("utf-8", "surrogateescape"))
+        if out is None:
+            return None
+        for p, rec in zip(wanted, out.decode("utf-8", "replace").split("\n")):
+            parts = rec.split()
+            if len(parts) == 3 and parts[1] == "blob" and parts[2].isdigit():
+                sizes[p] = (parts[0], int(parts[2]))
+    used = 0
+    take: dict[str, int] = {}  # oid -> size: a blob two paths share is read once
+    for p in wanted:
+        oid, size = sizes.get(p, ("", MAX_SOURCE + 1))
+        if oid not in take and size <= MAX_SOURCE and used + size <= budget:
+            used += size
+            take[oid] = size
+    blobs: dict[str, str] = {}
+    if take:
+        out = _cat(repo, env, ["--batch"], "".join(f"{oid}\n" for oid in take).encode())
+        if out is None:
+            return None
+        pos = 0
+        for oid, size in take.items():
+            nl = out.find(b"\n", pos)
+            if nl < 0 or out[pos:nl].split()[:1] != [oid.encode()]:
+                break
+            # Lines as the worker's diff has them: decoded as text, with universal newlines.
+            text = out[nl + 1:nl + 1 + size].decode("utf-8", "replace")
+            blobs[oid] = text.replace("\r\n", "\n").replace("\r", "\n")
+            pos = nl + 1 + size + 1
+    return sizes, blobs, used
+
+
 def pinned_python(repo: str, head: str, diff: str, budget: int = MAX_SOURCES) -> dict[tuple[str, str], PyScopes]:
     """The PyScopes of the Python files ``diff`` changes, by (side, path): ("+", its path at
     ``head``) read from git, and ("-", its old path) rebuilt from that and ``diff``'s hunks
@@ -442,39 +518,10 @@ def pinned_python(repo: str, head: str, diff: str, budget: int = MAX_SOURCES) ->
     env = snapshot._git_env(repo)
     if env is None:
         return {}
-    # The head's blobs: sizes first (one call), then the ones that fit (another).
-    wanted = [f for f in files if not f.deleted and not any(c in f.new for c in "\n\r\0")]
-    sizes: dict[str, tuple[str, int]] = {}
-    if wanted:
-        out = _cat(repo, env, ["--batch-check=%(objectname) %(objecttype) %(objectsize)"],
-                   "".join(f"{head}:{f.new}\n" for f in wanted).encode("utf-8", "surrogateescape"))
-        if out is None:
-            return {}
-        for f, rec in zip(wanted, out.decode("utf-8", "replace").split("\n")):
-            parts = rec.split()
-            if len(parts) == 3 and parts[1] == "blob" and parts[2].isdigit():
-                sizes[f.new] = (parts[0], int(parts[2]))
-    used = 0
-    take: dict[str, int] = {}  # oid -> size: a blob two paths share is read once
-    for f in wanted:
-        oid, size = sizes.get(f.new, ("", MAX_SOURCE + 1))
-        if oid not in take and size <= MAX_SOURCE and used + size <= budget:
-            used += size
-            take[oid] = size
-    blobs: dict[str, str] = {}
-    if take:
-        out = _cat(repo, env, ["--batch"], "".join(f"{oid}\n" for oid in take).encode())
-        if out is None:
-            return {}
-        pos = 0
-        for oid, size in take.items():
-            nl = out.find(b"\n", pos)
-            if nl < 0 or out[pos:nl].split()[:1] != [oid.encode()]:
-                break
-            # Lines as the worker's diff has them: decoded as text, with universal newlines.
-            text = out[nl + 1:nl + 1 + size].decode("utf-8", "replace")
-            blobs[oid] = text.replace("\r\n", "\n").replace("\r", "\n")
-            pos = nl + 1 + size + 1
+    read = _read_blobs(repo, env, head, [f.new for f in files if not f.deleted], budget)
+    if read is None:
+        return {}
+    sizes, blobs, used = read
     found: dict[tuple[str, str], PyScopes] = {}
     parsed: dict[str, PyScopes | None] = {}  # by oid: a blob two paths share is parsed once
     for f in files:
@@ -699,6 +746,75 @@ def terms(diff: str, mention: list[str] | None = None, limit: int = MAX_SYMBOLS,
     return found
 
 
+def _code(text: str, path: str) -> str:
+    """One line of ``path`` as code: string literals emptied and a trailing comment cut (``#``
+    in Python, ``//`` elsewhere)."""
+    return _mask(text, path).split("#" if path.endswith(_PY) else "//", 1)[0]
+
+
+def callees(diff: str, scopes: dict[tuple[str, str], PyScopes] | None = None) -> list[str]:
+    """The names ``diff``'s added lines call (``name(``, ``obj.name(``), first called first,
+    but those called only in test files, and then the ones the added lines define, last
+    (#191).  In a Python file parsed at the head (``scopes``, see pinned_python) the calls
+    are its ``ast`` calls on those lines; elsewhere, ``name(`` in the line's code (_code).
+    Left out: prose files, a Python builtin or keyword called bare, a common standard-library
+    module's own functions (``os.replace``), generic words (``get``, ``run``) and dunders."""
+    seen: dict[str, bool] = {}  # name -> whether it is called only in test files so far
+    defined: set[str] = set()
+    scopes = scopes or {}
+    old = new = ""
+    in_hunk = False
+    new_ln = rem_old = rem_new = 0
+
+    def call(name: str, recv: str, py: bool, test: bool) -> None:
+        if py and ((not recv and (name in _BUILTINS or name in _KEYWORDS)) or recv in _STDLIB):
+            return
+        if name in _SKIP or name in _GENERIC or (name.startswith("__") and name.endswith("__")):
+            return
+        seen[name] = seen.get(name, True) and test
+
+    for line in diff.split("\n"):
+        if line.startswith("diff --git ") or (not in_hunk and line.startswith(("+++ ", "--- "))):
+            if line.startswith("diff --git "):
+                in_hunk = False
+            old, new, _ = _header(line, old, new)
+            continue
+        m = _HUNK.match(line)
+        if m:
+            in_hunk = True
+            new_ln, rem_old, rem_new = int(m.group(3)), int(m.group(2) or 1), int(m.group(4) or 1)
+            continue
+        if line == "" and in_hunk and rem_old > 0 and rem_new > 0:
+            line = " "  # a blank context line without its space (diff.suppressBlankEmpty)
+        if not in_hunk or not line.startswith(("+", "-", " ")):
+            continue
+        ln = new_ln
+        new_ln += line[0] != "-"
+        rem_old -= line[0] != "+"
+        rem_new -= line[0] != "-"
+        if line[0] != "+" or new.endswith(_PROSE):
+            continue
+        py, test = new.endswith(_PY), is_test(new)
+        index = scopes.get(("+", new))
+        if index is not None:
+            defined.update(index.def_lines.get(ln, ()))
+            for name, recv in index.calls.get(ln, ()):
+                call(name, recv, py, test)
+            continue
+        code = _code(line[1:], new)
+        if _COMMENT.match(code):
+            continue
+        defined.update(_defs(code, new))
+        for c in _CALL.finditer(code):
+            # Only what is just before the name (a long line is scanned once, codex-6).
+            before = code[max(0, c.start() - 80):c.start()]
+            if _DEF_BEFORE.search(before):
+                continue
+            r = _RECEIVER.search(before[:-1]) if before.endswith(".") else None
+            call(c.group(1), r.group(1) if r else "." if before.endswith(".") else "", py, test)
+    return sorted(seen, key=lambda n: (n in defined, seen[n]))
+
+
 @dataclass
 class Usages:
     names: list[str] = field(default_factory=list)
@@ -711,14 +827,15 @@ class Usages:
     cut: set[str] = field(default_factory=set)
 
 
-def _grep(repo: str, env: dict, head: str, names: list[str]) -> tuple[dict, bool] | None:
-    """One git grep for ``names`` at ``head``: (hits by name, whether its output was cut at
-    MAX_OUTPUT), or None if it failed."""
+def _run_grep(repo: str, env: dict, head: str, flags: list[str], patterns: list[str]
+              ) -> tuple[list[tuple[str, int, str]], bool] | None:
+    """One git grep at ``head`` with ``flags`` for ``patterns``: (its ``(path, line, text)``
+    records, whether its output was cut at MAX_OUTPUT), or None if it failed."""
     # The output shape is fixed whatever the user's git config says: grep.column would add a
     # column field, and textconv filters are external commands.
     argv = ["git", "--no-replace-objects", "-c", "grep.column=false", "-c", "grep.lineNumber=true",
-            "grep", "-n", "-I", "-w", "-F", "-z", "--no-color", "--no-textconv", "--full-name"]
-    for n in names:
+            "grep", "-n", "-I", *flags, "-z", "--no-color", "--no-textconv", "--full-name"]
+    for n in patterns:
         argv += ["-e", n]
     argv += [head, "--"]
     try:
@@ -741,23 +858,83 @@ def _grep(repo: str, env: dict, head: str, names: list[str]) -> tuple[dict, bool
     # git grep exits 1 for no match; a timeout or an error gives no list (a cut one is kept).
     if not truncated and proc.returncode not in (0, 1):
         return None
-    hits: dict[str, list] = {n: [] for n in names}
-    words = {n: re.compile(rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])") for n in names}
     lines = out[:MAX_OUTPUT].split(b"\n")
     if truncated:
         lines = lines[:-1]  # the last one may be cut
     prefix = f"{head}:"
+    records = []
     for rec in lines:
         parts = rec.split(b"\0", 2)
         if len(parts) != 3 or not parts[1].isdigit():
             continue
         path = parts[0].decode("utf-8", "backslashreplace")
         path = path[len(prefix):] if path.startswith(prefix) else path.split(":", 1)[-1]
-        text = parts[2].decode("utf-8", "replace")
+        records.append((path, int(parts[1]), parts[2].decode("utf-8", "replace")))
+    return records, truncated
+
+
+def _grep(repo: str, env: dict, head: str, names: list[str]) -> tuple[dict, bool] | None:
+    """One git grep for ``names`` at ``head``: (hits by name, whether its output was cut at
+    MAX_OUTPUT), or None if it failed."""
+    run = _run_grep(repo, env, head, ["-w", "-F"], names)
+    if run is None:
+        return None
+    hits: dict[str, list] = {n: [] for n in names}
+    words = {n: re.compile(rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])") for n in names}
+    for path, ln, text in run[0]:
         for n, rx in words.items():
             if rx.search(text):
-                hits[n].append((path, int(parts[1]), text))
-    return hits, truncated
+                hits[n].append((path, ln, text))
+    return hits, run[1]
+
+
+def definitions(repo: str, head: str, names: list[str]) -> tuple[dict[str, list[tuple[str, int]]], bool]:
+    """Where ``names`` (see callees) are defined at ``head`` (#191): ({name: [(path, line)
+    ...]}, outside test files first, for the first MAX_CALLEES of them that have one; whether
+    the search's output was cut, so some may be missing).  One git grep for a definition
+    keyword before any of them, and each line it finds checked: in a Python file, against
+    the file parsed at the head (a ``def`` or ``class`` there, not text in a string), or if
+    it can't be read or parsed, a ``def`` or ``class`` starting the line; elsewhere as _defs
+    reads the line's code (_code).  Prose and diff files define nothing.  Empty if git
+    can't search."""
+    names = names[:MAX_CALLED]
+    env = snapshot._git_env(repo) if names else None
+    if env is None:
+        return {}, False
+    keyword_ = r"(def|class|fn|func|function|struct|enum|interface|trait|type|macro_rules!)"
+    rx = (rf"(^|[^A-Za-z0-9_]){keyword_}[[:space:]]+(\([^)]*\)[[:space:]]*)?"
+          rf"({'|'.join(re.escape(n) for n in names)})([^A-Za-z0-9_]|$)")
+    run = _run_grep(repo, env, head, ["-E"], [rx])
+    if run is None:
+        return {}, False
+    records = [r for r in run[0] if not r[0].endswith(_PROSE + (".diff", ".patch"))]
+    # The Python files' definition lines, from the files parsed at the head (codex-3).
+    pys = list(dict.fromkeys(p for p, _, _ in records if p.endswith(_PY)))
+    sizes, blobs, _ = (_read_blobs(repo, env, head, pys, MAX_SOURCES) if pys else None) or ({}, {}, 0)
+    by_oid: dict[str, PyScopes | None] = {}  # a blob two paths share is parsed once (codex-7)
+    parsed: dict[str, dict[int, tuple[str, ...]]] = {}
+    for p in pys:
+        oid = sizes.get(p, ("", 0))[0]
+        if oid not in blobs:
+            continue
+        if oid not in by_oid:
+            by_oid[oid] = py_scopes(blobs[oid])
+        if by_oid[oid] is not None:
+            parsed[p] = by_oid[oid].def_lines
+    wanted = set(names)
+    found: dict[str, list[tuple[str, int]]] = {}
+    for path, ln, text in sorted(records, key=lambda r: is_test(r[0])):
+        if path in parsed:
+            defined = parsed[path].get(ln, ())
+        elif path.endswith(_PY):
+            m = _PY_DEF.match(text)
+            defined = (m.group(1),) if m else ()
+        else:
+            defined = _defs(_code(text, path), path)
+        for n in dict.fromkeys(defined):
+            if n in wanted:
+                found.setdefault(n, []).append((path, ln))
+    return {n: found[n] for n in [n for n in names if n in found][:MAX_CALLEES]}, run[1]
 
 
 def search(repo: str, head: str, names: list[str]) -> Usages | None:
@@ -836,7 +1013,8 @@ def _desc(t: Term) -> str:
 
 
 def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
-           readable: frozenset[str] | set[str] | None = None) -> str:
+           readable: frozenset[str] | set[str] | None = None,
+           defs: dict[str, list[tuple[str, int]]] | None = None, defs_cut: bool = False) -> str:
     """The hits, grouped by name, fewest hits first (names touched only in tests last), and
     capped: at most ``per_symbol`` lines each, hits outside test files first (then a count
     and the files of the rest), and ``limit`` characters in all; a name with no room for that
@@ -849,7 +1027,9 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
     description, in LEFT_CHARS more; only the names with no room for that either are just named.
     ``readable``: the files the reviewer can read at the head (a sparse snapshot's); a hit
     or a listed file elsewhere is marked.  When git grep's output was cut, counts are lower
-    bounds and no hit means none found before the cut, not none at all."""
+    bounds and no hit means none found before the cut, not none at all.
+    ``defs``: where the functions the changed lines call are defined (see definitions), one
+    line each after the rest, in DEF_CHARS (#191); ``defs_cut``: that search's output was cut."""
     def mark(p: str) -> str:
         return _defuse(p) + (" (not in the copy)" if readable is not None and p not in readable else "")
 
@@ -883,9 +1063,8 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
                 out_of_copy = " (not in the copy)" if readable is not None and p not in readable else ""
                 lines.append(f"  {_defuse(p)}:{ln}{out_of_copy}: {_clean(text)}")
             if len(hits) > k:
-                rest = list(dict.fromkeys(p for p, _, _ in hits[k:]))
-                shown = ", ".join(mark(p) for p in rest[:6]) + (f" and {len(rest) - 6} more" if len(rest) > 6 else "")
-                lines.append(f"  [... {len(hits) - k} more in {shown}]")
+                # Where the rest are by line, not just by file (#194): a reviewer with no search reads by those.
+                lines.append(f"  [... {len(hits) - k} more at {_lines_at(hits[k:], mark)}]")
             return "\n".join(lines)
         full[n] = listing(per_symbol)
         # Failing room for that, a sample of the hits rather than none (#156).
@@ -939,32 +1118,63 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
         out += shown
     if left:
         out.append(f"[... {_plural(len(left), 'more name')} not shown: {', '.join(left)}]")
+    out += _render_defs(defs or {}, mark, defs_cut)
     return f"{OPEN}\n" + "\n".join(out) + f"\n{CLOSE}"
+
+
+def _render_defs(defs: dict[str, list[tuple[str, int]]], mark, cut: bool = False) -> list[str]:
+    """The lines for ``defs`` (see render): ``name: path:line`` each, at most DEF_HITS of its
+    definitions, and at most MAX_CALLEES names in DEF_CHARS; a name that doesn't fit is left
+    out (a shorter one after it may still fit), and how many were is said.  ``cut``: the
+    search was cut short, which is said even when it found nothing (codex-4)."""
+    lines, used, left = [], 0, 0
+    for n, where in list(defs.items())[:MAX_CALLEES]:
+        line = (f"  {n}: " + ", ".join(f"{mark(p)}:{ln}" for p, ln in where[:DEF_HITS])
+                + (f" [+{len(where) - DEF_HITS} more]" if len(where) > DEF_HITS else ""))
+        if used + len(line) + 1 > DEF_CHARS:
+            left += 1
+            continue
+        lines.append(line)
+        used += len(line) + 1
+    left += max(0, len(defs) - MAX_CALLEES)
+    if not lines and not cut:
+        return []
+    return (["Where what the changed lines call is defined:", *lines]
+            + ([f"[... {_plural(left, 'more name')} not shown]"] if left else [])
+            + (["[the definition search's output was cut short: some definitions may be missing]"] if cut else []))
 
 
 def _lines_at(hits: list[tuple[str, int, str]], mark, limit: int = COMPACT, busiest: bool = False) -> str:
     """Where ``hits`` are, in about ``limit`` characters (#186): outside test files first, as
     ``path:line,line; path:line``, then how many more there are; with ``busiest``, the files
-    with the most hits first within that (#190).  A file whose first line doesn't fit is
-    skipped, not the rest (codex-4).  ``mark`` shows a path."""
+    with the most hits first within that (#190).  Every file's first line is placed before
+    any more lines of one (#194), then the extra lines outside tests before those in them; a
+    file whose first line doesn't fit is skipped, not the rest (codex-4).  ``mark`` shows a path."""
     by: dict[str, list[int]] = {}
     for p, ln, _ in sorted(hits, key=lambda h: is_test(h[0])):
         by.setdefault(p, []).append(ln)
     if busiest:
         by = dict(sorted(by.items(), key=lambda kv: (is_test(kv[0]), -len(kv[1]))))
     room = limit - len(" [+99999 more]")  # what is left out is counted after
-    out, done = "", 0
-    for p, lns in by.items():
-        first = f"{'; ' if out else ''}{mark(p)}:{lns[0]}"
-        if len(out) + len(first) > room:
-            continue
-        out += first
-        done += 1
-        for ln in lns[1:]:
-            if len(out) + len(f",{ln}") > room:
-                break
-            out += f",{ln}"
-            done += 1
+    # Every file's first line before more lines of any one (codex-5 of #194), so a file with
+    # many hits can't crowd out the files after it, test files included; the files outside
+    # tests first each time.
+    take: dict[str, int] = {}
+    used = 0
+    for p in by:
+        first = len(f"{'; ' if take else ''}{mark(p)}:{by[p][0]}")
+        if used + first <= room:
+            take[p] = 1
+            used += first
+    for tier in (False, True):
+        for p in (p for p in by if p in take and is_test(p) == tier):
+            for ln in by[p][1:]:
+                if used + len(f",{ln}") > room:
+                    break
+                take[p] += 1
+                used += len(f",{ln}")
+    out = "; ".join(f"{mark(p)}:" + ",".join(str(ln) for ln in by[p][:take[p]]) for p in by if p in take)
+    done = sum(take.values())
     if not out and by:
         # No path fits the room: the shortest one's first line anyway, over it (antigravity-2).
         p = min(by, key=lambda p: len(mark(p)))
@@ -979,12 +1189,18 @@ def note(repo: str, head: str, diff: str, readable: frozenset[str] | set[str] | 
     mentioned()); ("", False, False) when there is nothing to search or git can't."""
     # The Python files' scopes, from the full diff (a capped one keeps it as ``raw``), whose
     # hunks rebuild the old sides; the names come from the diff the reviewer sees.
-    found = terms(diff, mention, scopes=pinned_python(repo, head, getattr(diff, "raw", None) or diff))
-    if not found:
+    scopes = pinned_python(repo, head, getattr(diff, "raw", None) or diff)
+    found = terms(diff, mention, scopes=scopes)
+    called = callees(diff, scopes)
+    if not found and not called:
         return "", False, False
     u = search(repo, head, [t.pattern for t in found])
     if u is None:
         return "", False, False
     u.terms = {t.pattern: t for t in found}
-    outside = readable is not None and any(p not in readable for hs in u.hits.values() for p, _, _ in hs)
-    return render(u, readable=readable), u.truncated, outside
+    defs, defs_cut = definitions(repo, head, called)
+    if not u.names and not defs and not defs_cut:
+        return "", False, False
+    shown = [p for hs in u.hits.values() for p, _, _ in hs] + [p for ws in defs.values() for p, _ in ws[:DEF_HITS]]
+    outside = readable is not None and any(p not in readable for p in shown)
+    return render(u, readable=readable, defs=defs, defs_cut=defs_cut), u.truncated, outside
