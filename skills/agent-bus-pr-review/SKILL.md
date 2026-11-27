@@ -88,7 +88,9 @@ URL, and pass it to every `gh` command below as written, so nothing goes to anot
 6. **Wait**: loop `wait(thread)` while `next_action` starts with `wait:`. On a review-only
    review every reviewer gives a verdict on each head. Stop on `await_head:` (someone asked
    for changes), `done:` (every reviewer approved) or `stop:` (tell the user what the notice
-   says; a reviewer whose turn failed or timed out needs the user's `agent-bus resume`).
+   says). On `retry:` (a reviewer's turn failed or timed out) make the `request_review` call it
+   gives, once, and keep waiting; a second failure says `stop:` and needs the user's
+   `agent-bus resume`.
 
 ## 2. Draft
 

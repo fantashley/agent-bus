@@ -155,6 +155,20 @@ A review thread is `resolved` once its reviewer approves, or when its initiator 
 (`next_action` says `fix: ...`), the same with one reviewer as with several; a debrief has to
 wait until it is resolved (or `needs_human`).
 
+**A pass that gave no verdict** (#154): when a reviewer's turn times out, crashes, or ends without
+a usable verdict even after its repair turn, the thread goes to `needs_human` as before, and
+`agent-bus resume` retries it. The initiator may also retry it itself, once per reviewer per
+base..head: `next_action` says `retry: ...` with the exact call, which is `request_review` with
+`reviewer` = the reviewer whose pass failed (only that one, on a review with several reviewers
+too), `thread`, the same repo, base and head, and `prev_head_commit_id` = that head. Naming the
+thread and the reviewer keeps the retry from landing on another review of that head or spending
+another reviewer's offer. Only the reviewer that failed runs again, earlier approvals stand, and the
+retry isn't a follow-up, so the budget doesn't count it. If it fails again, the thread waits for
+the human user (`stop: ...`), and any request that would rerun that head (a follow-up or a
+pushback) is refused with `REVIEW_FAILED` until they resume it. No retry is offered when the
+thread has no room left for the verdict (its message cap): only a resume raises that. A turn agent-bus refused to start (`PEER_SETUP`), a reviewer out of usage,
+a CLI format change or a missing commit get no such offer: those need the human user.
+
 **Reviewing someone else's change** (#145). `request_review(..., review_only=true)` marks a
 review whose initiator isn't the change's author, say a colleague's pull request. A request for
 changes then waits for the author's next head instead of the initiator's fix: `next_action` says

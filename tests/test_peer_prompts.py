@@ -158,6 +158,7 @@ def test_the_refusal_notice_reads_the_turn_the_verdict_came_from(env, no_spawn, 
     monkeypatch.setattr(Worker, "turn", lambda self, *a, **k: next(turns))
     run_job(bus, tid)
     notice = bus.history(tid)["messages"][-1]["body"]
+    notice = notice.split(" To retry")[0]  # #154: the retry call names the repo, whose test path may say "refusal"
     assert "exited with status 2" in notice and "refusal" not in notice
 
 
