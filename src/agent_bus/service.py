@@ -1189,7 +1189,7 @@ class Service:
     def _fresh_reviews(self, order: list[str], repo_path: str, request: list, settings: dict,
                        focus: str | None, goal: str, change_id: str | None,
                        testing: str | None = None, evidence: list | None = None,
-                       review_only: bool | None = None) -> tuple[dict, dict, bool]:
+                       review_only: bool | None = None) -> tuple[dict, dict | None, bool]:
         """Start a several-reviewer thread, or return the one this exact request started while
         it is still pinned to this diff (retrying its pass if that failed)."""
         base, prev, head = request
@@ -1204,17 +1204,14 @@ class Service:
             latest = self._revision_job(t)
             if latest and latest["status"] in ("queued", "running", "done"):
                 return t, latest, False  # idempotent, including a pass `agent-bus resume` restarted
-            # Its pass failed or was cancelled: requesting it again retries it on the same thread.
+            # Its pass failed or was cancelled (its worker died): requesting it again retries it
+            # on the same thread, once per reviewer per base..head, the same retry as #154's
+            # (#199).  Every refusal comes before the retry is spent.
             if self.bus.active_job(t["id"]):  # a debrief (#91): its job would stand in for the retry
                 raise BusError("REVIEW_BUSY", f"{t['id']} has a debrief running; request this review again "
                                "once it has finished")
-            reviewer = t["refs"]["reviewer"]
-            self._quota_check(reviewer, "reviewer", ((t["refs"].get("peer_settings") or {}).get(reviewer)))
-            autoresume.forget(self.bus, t["id"])  # this retry replaces any planned one
-            self.bus.set_thread(t["id"], status="open")
-            job_row, created = self.bus.create_job(t["id"], "review", {"mode": "retry"},
-                                                   f"reviews:{t['id']}:retry:{time.time():.6f}")
-            return t, job_row, created
+            return (t, *self._dead_pass_retry(t, latest))
+
         first = order[0]
         self._quota_check(first, "reviewer", settings.get(first))
         refs: dict[str, Any] = {"reviewers": order, "reviewer": first, "repo": repo_path, "change_id": change_id,
@@ -1393,6 +1390,36 @@ class Service:
         autoresume.forget(self.bus, t["id"])
         refs = {k: v for k, v in old.items() if k != "retryable"}
         refs["retried"] = [*(old.get("retried") or []), offer["key"]]
+        self.bus.set_thread(t["id"], status="open", refs=json.dumps(refs))
+        return self.bus.create_job(t["id"], "review", {"mode": "retry", "round": t["round"]},
+                                   worker.retry_key(t, reviewer))
+
+    def _dead_pass_retry(self, t: dict, latest: dict | None) -> tuple[dict | None, bool]:
+        """Retry the failed or cancelled pass of a several-reviewer review's first request
+        (#199), charged to the reviewer it reruns at ``refs["retried"]``, like
+        _initiator_retry.  A worker that died after posting a verdict reruns only what was
+        left: a thread with every approval in is resolved, and one with an approval hands the
+        head on, so the reviewer due next is the one charged.  Refused, with nothing spent,
+        once that reviewer's retry is used, with no room left for its verdict, with the
+        reviewer out of usage, or on a thread parked for the human user."""
+        old = t["refs"] or {}
+        if self.bus.review_standings(t["id"])["complete"]:
+            return self._finish_complete(t, old["head_commit_id"]), False
+        reviewer, why = worker.dead_pass_retry(self.bus, t)
+        if t["status"] == "needs_human" and not worker.MissingRevision.failed(latest):
+            # Parked for the human (out of usage, a format change, a config error, an unusable
+            # verdict) by a worker that died before ending its job, an older build's included:
+            # only a missing commit's park offers the repeat itself.
+            why = "it waits for the human user (see its latest system notice)"
+        if why:
+            raise BusError("REVIEW_FAILED", f"the pass for this request on {t['id']} "
+                           f"{latest['status'] if latest else 'did not run'} "
+                           f"({(latest or {}).get('error') or 'see the thread'}) and {why}; ask the human user "
+                           f"to run `agent-bus resume {t['id']}` to retry it")
+        self._quota_check(reviewer, "reviewer", (old.get("peer_settings") or {}).get(reviewer))
+        autoresume.forget(self.bus, t["id"])  # this retry replaces any planned one
+        refs = {k: v for k, v in old.items() if k != "retryable"}
+        refs["retried"] = [*(old.get("retried") or []), f"{reviewer}@{worker.revision_key(old)}"]
         self.bus.set_thread(t["id"], status="open", refs=json.dumps(refs))
         return self.bus.create_job(t["id"], "review", {"mode": "retry", "round": t["round"]},
                                    worker.retry_key(t, reviewer))
