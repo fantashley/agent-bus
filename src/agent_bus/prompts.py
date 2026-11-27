@@ -162,6 +162,17 @@ PROMPTS_INSTALLED = """
 (Prompts: this repository opts in to the head's prompt text, but head {head}'s could not be \
 loaded ({reason}), so this review uses agent-bus {build}'s installed prompts.)"""
 
+# In a repository listed in self_hosted_reviews (#181): the head's own build runs the review
+# job, so the format above is the head's (in place of FORMAT_LABEL)...
+FORMAT_LABEL_HEAD = """\
+(Verdict format v{version}, as the agent-bus worker running this review parses it: head {head}'s \
+own build (agent-bus {build}), since this repository opts in to self-hosted reviews. Its prompts, \
+tools and verdict parsing are the head's.)"""
+# ...or, after FORMAT_LABEL and before the prompts line, why the installed build runs it.
+BUILD_INSTALLED = """
+(Build: this repository opts in to self-hosted reviews, but head {head}'s own build isn't running \
+this review: {reason}. The installed agent-bus {build} runs it.)"""
+
 # How every review pass ends (#93).  Not a .format() template: it goes in as a value, and
 # its example is valid JSON, with the alternatives in prose rather than inside the JSON.
 VERDICT_FORMAT = """\

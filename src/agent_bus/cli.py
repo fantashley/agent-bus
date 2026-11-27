@@ -509,13 +509,13 @@ common tasks:
                                    dismiss threads you no longer need
 
 Commands for wiring up clients (mcp, hook, setup-codex, setup-copilot, run-job,
-auto-resume, stream, rex-check) are left out of this list: see "Wiring up
-clients" in the README.
+self-host-info, auto-resume, stream, rex-check) are left out of this list: see
+"Wiring up clients" in the README.
 """
 
 # The CLI's internal entry points, started by client configs, hooks and the worker.  A
 # headless peer may still reach them: `mcp` refuses its calls itself, `hook` stays quiet.
-INTERNAL = ("mcp", "hook", "run-job")
+INTERNAL = ("mcp", "hook", "run-job", "self-host-info")
 # Commands that act as the human user: posting with trust "human", or changing a thread
 # or an agent's state on their behalf (also `agents --clear-quota`, see acts_as_human).
 HUMAN_ONLY = ("ask", "reply", "resume", "cancel", "debrief", "finish")
@@ -691,6 +691,9 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("run-job", description="Run a queued job (started by the MCP server or CLI).")
     s.add_argument("job")
 
+    sub.add_parser("self-host-info", description="Print the review hand-off protocol this build speaks (#181), "
+                                                 "for the installed worker that runs it as a head's build.")
+
     s = sub.add_parser("auto-resume", description="Resume threads parked by a usage limit that has reset. "
                                                   "Runs by itself; this shows what's planned.")
     s.add_argument("--wait", action="store_true", help="(used internally) keep sweeping until none is planned")
@@ -781,6 +784,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "run-job":
         from . import worker
         return worker.main(args.job)
+    if args.cmd == "self-host-info":  # no database, no config: see headbuild
+        from . import headbuild
+        print(headbuild.info())
+        return 0
 
     bus = Bus()
     if acts_as_human(args):
