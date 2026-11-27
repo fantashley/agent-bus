@@ -149,11 +149,13 @@ def test_a_file_name_cannot_break_out_of_the_discussion_file_list(env, no_spawn)
 
 
 def test_left_out_names_skip_a_long_line_for_shorter_ones_after_it():
-    # codex-4: one line over what is left of LEFT_CHARS no longer hides the rest.
+    # codex-4: one line over what is left of LEFT_CHARS no longer hides the rest.  big_one is
+    # sharp, so it is ranked first and the shorter names come after it (#190, codex-7).
     T = usages.Term
     hits = {"big_one": [(f"src/{'d' * 60}/f{i}.py", i, "x") for i in range(40)],
             "small_one": [("src/s.py", 3, "x")], "small_two": [("src/t.py", 4, "x")]}
-    u = usages.Usages(names=list(hits), hits=hits, terms={n: T(n, "mentioned") for n in hits})
+    u = usages.Usages(names=list(hits), hits=hits,
+                      terms={n: T(n, "mentioned", sharp=n == "big_one") for n in hits})
     old = usages.LEFT_CHARS
     try:
         usages.LEFT_CHARS = 120
@@ -162,6 +164,7 @@ def test_left_out_names_skip_a_long_line_for_shorter_ones_after_it():
         usages.LEFT_CHARS = old
     assert "small_one (1 hit in 1 file): at src/s.py:3" in text and "small_two (1 hit in 1 file): at src/t.py:4" in text
     assert "[... 1 more name not shown: big_one]" in text
+    assert text.index("small_one (") > 0 and "big_one" not in text.split("[...")[0]
     # Within a name, a path too long for the room is skipped, not every path after it.
     line = usages._lines_at([("src/" + "p" * 300 + ".py", 1, "x"), ("src/q.py", 2, "x")], lambda p: p)
     assert line == "src/q.py:2 [+1 more]"

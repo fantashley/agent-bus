@@ -63,6 +63,7 @@ nothing, and prose files (``.md``, ``.rst``, ``.txt`` ...) touch no names.
 from __future__ import annotations
 
 import ast
+import keyword
 import re
 import subprocess
 import threading
@@ -134,6 +135,9 @@ _CALL = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 _SKIP = frozenset({"self", "cls", "this", "main", "init", "None", "True", "False", "test", "tests", "setup",
                    "teardown", "if", "for", "while", "return", "print", "len", "str", "int", "dict", "list",
                    "set", "type", "args", "kwargs", "data", "name", "value", "values", "result", "text"})
+# Python's keywords (#190): a bare backticked `break` in a finding names no symbol.  Only for a
+# mentioned name on its own; a qualified one, and the diff's names, are kept (codex-1).
+_KEYWORDS = frozenset(keyword.kwlist)
 
 # Words too generic to search for when an added line only reads them, or a note mentions them
 # (#161): they would use up a cap on hits that say nothing about the change.  A definition by
@@ -634,6 +638,8 @@ def mentioned(texts: list[str], exclude: set[str] | frozenset[str] = frozenset()
     for text in texts:
         for m in _TICKED.finditer(text or ""):
             parts = m.group(1).split(".")
+            if len(parts) == 1 and parts[0] in _KEYWORDS:
+                continue
             if len(parts) > 1 and parts[-1].lower() in _EXT:
                 continue
             if len(parts) > 1 and parts[0] in _STDLIB:
@@ -889,7 +895,7 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
             where[n] = ("most in " + ", ".join(f"{mark(p)} ({files[p]})" for p in busiest)
                         + (f" and {len(files) - 6} more files" if len(files) > 6 else "")
                         # and a few lines to start reading at (codex-3)
-                        + "; first at " + _lines_at(hits, mark, SAMPLE_CHARS))
+                        + "; first at " + _lines_at(hits, mark, SAMPLE_CHARS, busiest=True))
             short[n] = full[n] = sample[n] = f"{head}: too common to list; {where[n]}"
         else:
             # Its line numbers, not just its files (#186): what a reviewer with no search reads by.
@@ -936,13 +942,16 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
     return f"{OPEN}\n" + "\n".join(out) + f"\n{CLOSE}"
 
 
-def _lines_at(hits: list[tuple[str, int, str]], mark, limit: int = COMPACT) -> str:
+def _lines_at(hits: list[tuple[str, int, str]], mark, limit: int = COMPACT, busiest: bool = False) -> str:
     """Where ``hits`` are, in about ``limit`` characters (#186): outside test files first, as
-    ``path:line,line; path:line``, then how many more there are.  A file whose first line
-    doesn't fit is skipped, not the rest (codex-4).  ``mark`` shows a path."""
+    ``path:line,line; path:line``, then how many more there are; with ``busiest``, the files
+    with the most hits first within that (#190).  A file whose first line doesn't fit is
+    skipped, not the rest (codex-4).  ``mark`` shows a path."""
     by: dict[str, list[int]] = {}
     for p, ln, _ in sorted(hits, key=lambda h: is_test(h[0])):
         by.setdefault(p, []).append(ln)
+    if busiest:
+        by = dict(sorted(by.items(), key=lambda kv: (is_test(kv[0]), -len(kv[1]))))
     room = limit - len(" [+99999 more]")  # what is left out is counted after
     out, done = "", 0
     for p, lns in by.items():

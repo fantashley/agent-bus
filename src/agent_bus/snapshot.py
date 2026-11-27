@@ -171,9 +171,12 @@ def tracked(repo: str) -> Snapshot | None:
     env = _git_env(repo)
     if env is None:
         return None
-    head = _git(repo, env, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
-    rev = head.decode().strip() if head else ""
-    if cfg.vcs(repo) == "jj":
+    # Lazy fetching is off for this optional list (codex-2), for every git call (#190).
+    env = {**env, "GIT_NO_LAZY_FETCH": "1"}
+    if cfg.vcs(repo) != "jj":
+        head = _git(repo, env, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+        rev = head.decode().strip() if head else ""
+    else:
         try:
             out = subprocess.run(["jj", "log", "--ignore-working-copy", "--no-graph", "--color=never", "-r", "@",
                                   "-T", "commit_id"], cwd=repo, capture_output=True, text=True, timeout=60)
@@ -185,8 +188,8 @@ def tracked(repo: str) -> Snapshot | None:
     if not rev:
         return None
     # Names only: ls-tree's -l reads every blob's size, which in a partial clone would fetch
-    # the missing ones; lazy fetching is off too, for this optional list (codex-2).
-    out = _git(repo, {**env, "GIT_NO_LAZY_FETCH": "1"}, "ls-tree", "-r", "-z", "--name-only", "--full-tree",
+    # the missing ones.
+    out = _git(repo, env, "ls-tree", "-r", "-z", "--name-only", "--full-tree",
                f"{rev}^{{tree}}")
     if out is None:
         return None
@@ -583,8 +586,10 @@ MAX_LISTING = 12_000
 
 
 def escaped(path: str) -> str:
-    """``path`` as a prompt lists it: a non-UTF-8 byte and a control character escaped."""
-    path = path.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+    """``path`` as a prompt lists it: a non-UTF-8 byte and a control character escaped (a line
+    feed as backslash-x0a), and a backslash doubled first, so a name with the literal text
+    backslash-x0a is told apart from one with a line feed (#190)."""
+    path = path.replace("\\", "\\\\").encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
     return re.sub(r"[\x00-\x1f\x7f]", lambda m: f"\\x{ord(m.group()):02x}", path)
 
 
