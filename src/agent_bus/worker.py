@@ -30,7 +30,7 @@ from typing import Iterator
 from . import __version__
 from . import config as cfg
 from . import evidence as ev
-from . import autoresume, headprompts, procinfo, provenance, quota, snapshot, unvotable, usages
+from . import autoresume, headbuild, headprompts, procinfo, provenance, quota, snapshot, unvotable, usages
 from .headprompts import view as prompts  # the head's review prompt text, when opted in (#138)
 from .db import HUMAN, SYSTEM, Bus, BusError, format_dissent, over_followup_limit, review_progress
 from .peers import (ADAPTERS, Adapter, TurnResult, adapter, cli_version, extract_reply, fenced_body,
@@ -212,12 +212,20 @@ def is_ancestor(repo: str, tools: list[str], base: str, head: str) -> bool | Non
 
 
 class Worker:
-    def __init__(self, bus: Bus, job_id: str, config: cfg.Config | None = None):
+    def __init__(self, bus: Bus, job_id: str, config: cfg.Config | None = None,
+                 handoff: tuple[str, str] | None = None):
         self.bus = bus
         self.config = config or cfg.Config.load()
         self.job = bus.job(job_id)
         self.thread_id = self.job["thread_id"]
         self.owner = f"{os.uname().nodename}:{os.getpid()}:{secrets.token_hex(2)}"
+        # Run as the head's build (#181): the installed worker that claimed the job handed it
+        # over, with its lease owner and the head this build is.
+        self.head_build: str | None = None
+        if handoff:
+            self.owner, self.head_build = handoff
+        self.build_reason: str | None = None  # why an opted-in review runs the installed build
+        self._build_hold: int | None = None  # on the head's build's cache entry, while it runs
         self._stop = threading.Event()
         self._lost = threading.Event()
         self.quota_noticed: set[str] = set()
@@ -228,7 +236,11 @@ class Worker:
     # ------------------------------------------------------------------ plumbing
 
     def run(self) -> int:
-        if not self.bus.claim_job(self.job["id"], self.owner, LEASE_S):
+        if self.head_build:
+            if not self.bus.owns_job(self.job["id"], self.owner):
+                print(f"job {self.job['id']} is no longer held by the worker that handed it over")
+                return 1
+        elif not self.bus.claim_job(self.job["id"], self.owner, LEASE_S):
             print(f"job {self.job['id']} is not claimable (status {self.bus.job(self.job['id'])['status']})")
             return 1
         try:
@@ -239,6 +251,8 @@ class Worker:
             self._head_holds.clear()
             snapshot.release(self._snap_hold)
             self._snap_hold = None
+            snapshot.release(self._build_hold)
+            self._build_hold = None
             self.sweep_snapshots(self.thread_id)  # after finish_job: this one, if it is done
 
     def sweep_snapshots(self, only: str | None) -> None:
@@ -248,7 +262,10 @@ class Worker:
             print(f"snapshot sweep failed: {e!r}")
 
     def _run(self) -> int:
-        threading.Thread(target=self._heartbeat, daemon=True).start()
+        if not self.head_build:
+            # A head's build's worker leaves the lease to the installed worker that handed it the
+            # job (#181): if that one dies, the lease runs out and this one stops at its next check.
+            threading.Thread(target=self._heartbeat, daemon=True).start()
         # Snapshots of threads that no longer need them, a crashed worker's included (#111):
         # with the lease kept alive, however long that takes.
         self.sweep_snapshots(None)
@@ -260,6 +277,9 @@ class Worker:
             if self.job["kind"] == "discussion":
                 self.run_discussion()
             elif self.job["kind"] == "review":
+                code = self.self_hosted_review()
+                if code is not None:
+                    return code  # the head's build ran the job
                 self.run_review()
             elif self.job["kind"] == "debrief":
                 self.run_debrief()
@@ -273,6 +293,8 @@ class Worker:
         except MissingRevision:
             return 1  # report_missing already failed the job and told the requester
         except Exception as e:  # record, then re-raise for the log
+            if self.head_build:
+                raise  # the installed worker that handed the job over reports it (#181)
             if self.bus.finish_job(self.job["id"], "failed", self.owner, repr(e)):
                 self.bus.add_event(self.thread_id, "error", f"worker failed: {e!r}", job_id=self.job["id"])
             raise
@@ -295,8 +317,11 @@ class Worker:
         # A debrief may run on a cancelled thread (#145): only cancelling its own job stops it.
         if (t["status"] == "cancelled" and not self.debriefing) or j["status"] == "cancelled":
             self._stop.set()
-        elif j["lease_owner"] != self.owner or j["status"] != "running":
-            self._lost.set()  # reaped or taken over
+        elif j["lease_owner"] != self.owner or j["status"] != "running" or (
+                self.head_build and (j["lease_expires"] or 0) < time.time()):
+            # Reaped or taken over; or, for a head's build, the installed worker renewing the
+            # lease for it is gone (#181).
+            self._lost.set()
             self._stop.set()
         return self._stop.is_set()
 
@@ -1121,6 +1146,114 @@ class Worker:
 
     # -------------------------------------------------------------------- review
 
+    def self_hosted_review(self) -> int | None:
+        """Hand this review job to the head's own build, in a repository that opts in (#181).
+        Returns the exit code when that build ran it; None for the installed build to run it,
+        with ``build_reason`` saying why when the head's build was tried."""
+        if self.head_build:
+            return None
+        t = self.thread()
+        refs = t["refs"] or {}
+        if not self.config.self_hosted_review(refs["repo"]):
+            return None  # not opted in, or to the head's prompt text only (#138)
+        try:
+            self.review_diff(refs, interdiff=False)  # a missing base or head is reported first (#179)
+        except MissingRevision as e:
+            self.report_missing(t, e)
+            raise
+        if not self.config.head_builds(refs["repo"]):
+            return self.installed_build(refs["head_commit_id"], "head builds are off (self_hosted_build_timeout_s is 0)")
+        head = refs["head_commit_id"]
+        snap = self.pin_snapshot(t, refs)
+        try:
+            headbuild.check(snap)
+            headbuild.child_env()  # the installed command it needs, before any build
+            limit = min(self.config.self_hosted_build_timeout_s, self.deadline_left())
+            out, self._build_hold = headbuild.build(
+                snap, head, limit, self.cancelled,
+                building=lambda: self.event("prompts", f"building head {head[:12]} with nix"))
+            headbuild.check_package(out)
+            headbuild.probe(out)
+        except (headbuild.Unusable, OSError) as e:
+            self.check()
+            return self.installed_build(head, str(e) if isinstance(e, headbuild.Unusable) else
+                                        f"its build could not be made or found ({e})")
+        self.check()
+        return self.run_head(out, head)
+
+    def installed_build(self, head: str, reason: str) -> None:
+        """Run the job on this, the installed, build: the head's can't (#181)."""
+        self.build_reason = reason
+        self.event("prompts", f"installed build runs this review: head {head[:12]}'s build can't ({reason})")
+
+    def run_head(self, out: str, head: str) -> int | None:
+        """Run the job's worker from the head's build ``out``, under this worker's lease, and
+        wait for it.  Returns its exit code, or None (installed build) if it died before
+        starting any turn."""
+        # Its own snapshot holds: a head that changes how snapshots are locked isn't blocked by ours.
+        for fd in self._head_holds.values():
+            snapshot.release(fd)
+        self._head_holds.clear()
+        snapshot.release(self._snap_hold)
+        self._snap_hold = None
+        evs = self.bus.events(self.thread_id)
+        upto_ev = evs[-1]["id"] if evs else 0
+        msgs = self.bus.history(self.thread_id)["messages"]
+        upto_msg = msgs[-1]["id"] if msgs else 0
+        logs = cfg.state_dir() / "logs"
+        logs.mkdir(parents=True, exist_ok=True, mode=0o700)
+        log_path = logs / f"{self.job['id']}.log"
+        sys.stdout.flush()
+        with open(log_path, "ab") as log:
+            start = log.tell()
+            self.event("prompts", f"head {head[:12]}'s own build runs this review job ({out})")
+            try:
+                # Same process group (no new session): `agent-bus cancel` signals both.
+                proc = subprocess.Popen(
+                    [os.path.join(out, "bin", "agent-bus"), "run-job", self.job["id"]],
+                    env=headbuild.child_env(f"{self.job['id']} {self.owner} {head}"),
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, cwd=str(cfg.state_dir()))
+            except OSError as e:
+                return self.installed_build(head, f"its worker could not be started ({e})")
+        stopping = None
+        while True:
+            try:
+                code = proc.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if self._stop.is_set() and stopping is None:  # SIGTERM, cancelled, taken over, or done
+                stopping = time.monotonic()
+                j = self.bus.job(self.job["id"])
+                if j["lease_owner"] != self.owner or j["status"] not in ("done", "failed"):
+                    proc.terminate()  # not the child finishing the job, which it may still be tidying up after
+            elif stopping is not None and time.monotonic() - stopping > 30:
+                proc.kill()
+        j = self.bus.job(self.job["id"])
+        if j["status"] != "running" or j["lease_owner"] != self.owner:
+            return code  # it finished the job (done, failed or cancelled), or lost it
+        self.check()
+        how = f"signal {-code}" if code < 0 else f"code {code}"
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(max(start, os.path.getsize(log_path) - 8192))
+                said = headbuild.last_line(f.read())
+        except OSError:
+            said = "no output"
+        # Its own turns and posts count (a review-request notice, a parking notice); a note
+        # from the author or the human meanwhile doesn't.
+        t = self.thread()
+        started = any(e["kind"] == "turn_start" for e in self.bus.events(
+            self.thread_id, after_id=upto_ev, job_id=self.job["id"])) or any(
+            m["id"] > upto_msg and m["sender"] not in (t["initiator"], HUMAN)
+            for m in self.bus.history(self.thread_id)["messages"])
+        if not started:
+            return self.installed_build(head, f"its worker exited ({how}) before any turn: {said}")
+        why = f"head {head[:12]}'s build's worker exited ({how}) without finishing the job: {said}"
+        if self.bus.finish_job(self.job["id"], "failed", self.owner, why):
+            self.bus.add_event(self.thread_id, "error", f"{why} (log: {log_path})", job_id=self.job["id"])
+        return 1
+
     def run_review(self) -> None:
         if (self.thread()["refs"] or {}).get("reviewers"):
             self.run_review_rounds()
@@ -1283,19 +1416,29 @@ class Worker:
             return self._review_round(mode, snap, full)
 
     def head_prompts(self, refs: dict, snap: snapshot.Snapshot) -> headprompts.Active | None:
-        """The pass's review prompt text from the head (#138): None unless the repo is listed
-        in self_hosted_prompts; else the head's texts, or none (the installed ones) with why."""
-        if not self.config.head_prompts(refs["repo"]):
-            return None
+        """The pass's review prompt text from the head (#138): None unless the repo opts in
+        (self_hosted_reviews or self_hosted_prompts), or when this is the head's own build
+        (#181); else the head's texts, or none (the installed ones) with why, after why the
+        head's build isn't running the job if it was tried."""
         head = refs["head_commit_id"][:12]
+        if self.head_build:  # this is the head's build (#181): its prompts are its own
+            self.event("prompts", f"head {head}'s own build runs this pass (agent-bus {build_label()})")
+            return None
+        if not self.config.self_hosted(refs["repo"]):
+            return None
+        built, before = "", ""
+        if self.build_reason:
+            built = prompts.BUILD_INSTALLED.format(head=head, reason=clause(self.build_reason), build=build_label())
+            before = f"installed build (head {head}'s can't: {self.build_reason}); "
         try:
             texts = headprompts.load(snap)
         except headprompts.NotLoadable as e:
-            self.event("prompts", f"installed review prompts: head {head}'s could not be loaded ({e})")
-            return headprompts.Active(note=prompts.PROMPTS_INSTALLED.format(head=head, reason=e, build=build_label()))
-        self.event("prompts", f"review prompts from head {head}'s {headprompts.PATH}")
-        return headprompts.Active(texts, prompts.PROMPTS_HEAD.format(head=head, path=headprompts.PATH,
-                                                                     build=build_label()))
+            self.event("prompts", f"{before}installed review prompts: head {head}'s could not be loaded ({e})")
+            return headprompts.Active(note=built + prompts.PROMPTS_INSTALLED.format(head=head, reason=e,
+                                                                                    build=build_label()))
+        self.event("prompts", f"{before}review prompts from head {head}'s {headprompts.PATH}")
+        return headprompts.Active(texts, built + prompts.PROMPTS_HEAD.format(head=head, path=headprompts.PATH,
+                                                                             build=build_label()))
 
     def _review_round(self, mode: str, snap: snapshot.Snapshot, full: tuple[str, str]) -> dict | None:
         t = self.thread()
@@ -2483,8 +2626,10 @@ def verdict_format(prior: dict[str, dict], review_only: bool = False) -> str:
     """How the verdict ends (#93), with complete follow-up examples when it has earlier
     blocking findings to settle (#126): "earlier" entries and a finding reused by "id".  A
     review-only review adds how to write findings its author can read on GitHub (#151)."""
-    tail = (prompts.REVIEW_ONLY if review_only else "") + "\n" + prompts.FORMAT_LABEL.format(
-        version=prompts.VERDICT_FORMAT_VERSION, build=build_label()) + headprompts.note()
+    label = (prompts.FORMAT_LABEL_HEAD.format(version=prompts.VERDICT_FORMAT_VERSION, head=HEAD_BUILD[:12],
+                                              build=build_label()) if HEAD_BUILD else
+             prompts.FORMAT_LABEL.format(version=prompts.VERDICT_FORMAT_VERSION, build=build_label()))
+    tail = (prompts.REVIEW_ONLY if review_only else "") + "\n" + label + headprompts.note()
     if not prior:
         return prompts.VERDICT_FORMAT + tail
     ids = list(prior)
@@ -2698,10 +2843,18 @@ def format_review(st: dict) -> str:
     return "\n".join(lines) or "- no reviewers"
 
 
+# The head this process's build is, when an installed worker handed it a review job (#181).
+HEAD_BUILD: str | None = None
+
+
 def main(job_id: str) -> int:
-    bus = Bus()
+    global HEAD_BUILD
+    handoff = headbuild.take_handoff(job_id)
+    if handoff:
+        HEAD_BUILD = handoff[1]
+    bus = Bus(migrate=not handoff)  # a head's build never creates or migrates the shared database
     try:
-        return Worker(bus, job_id).run()
+        return Worker(bus, job_id, handoff=handoff).run()
     finally:
         bus.close()
 

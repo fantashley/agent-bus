@@ -257,24 +257,47 @@ same things in parallel:
   states the turn's time limit, and that only the JSON verdict is posted. It names the verdict
   format's version and the running build (`Verdict format v1 … agent-bus 0.3.0, <store item>`),
   so a reviewer of a change to the format can tell which one the running worker expects.
-- **Reviewing agent-bus itself with the head's prompts** (opt-in). Reviewers normally get the
-  installed build's prompts, so a change to a review prompt can only be judged from its diff.
-  List a repo in `self_hosted_prompts` in `config.json` (off by default; a listed directory
-  also covers the repos under it, e.g. a directory of jj workspaces):
-  `"self_hosted_prompts": ["~/src/agent-bus", "~/src/agent-bus-ws"]`. A review pass there
-  takes the review prompt text (the review templates, rules, follow-up framing and reading
-  notes) from the head's `src/agent_bus/prompts.py` in its read-only snapshot. The head's
-  code never runs: the file is parsed with Python's `ast`, and only top-level string literals
-  (and `+` of literals and names defined earlier) are read. Everything else stays installed:
-  the worker, the adapters and their preambles, the verdict format the worker parses, and the
+- **Reviewing agent-bus itself with the head's own build** (opt-in). Reviewers normally get the
+  installed build, so a change to a review prompt, the usage search, an adapter or the verdict
+  parser can only be judged from its diff. List a repo in `self_hosted_reviews` in
+  `config.json` (off by default; a listed directory also covers the repos under it, e.g. a
+  directory of jj workspaces): `"self_hosted_reviews": ["~/src/agent-bus", "~/src/agent-bus-ws"]`.
+  (The older `self_hosted_prompts` only takes the head's prompt text, below, and never runs
+  the head's code: move a repo to `self_hosted_reviews` for its own build.) A review
+  job there runs from the head's own build: the installed worker claims the job, builds the
+  head's flake from its read-only snapshot (`nix build path:<snapshot>#default`, cached per
+  head commit under `$XDG_STATE_HOME/agent-bus/head-builds`, where the out-links are GC
+  roots dropped after 7 days unused), and runs that build's `agent-bus run-job` for the job,
+  under its own lease. So the head's prompts, usage search, snapshots, adapters and verdict
+  parsing all run, for every reviewer's pass in that job. The installed worker stays the
+  job's process (`agent-bus cancel` stops both) and reports a head worker that dies. The
+  shared database is never migrated by a head: a head whose `src/agent_bus/db.py` defines
+  another schema or other migrations (compared with Python's `ast`, before anything is
+  built) is reviewed by the installed build, and the head's worker opens the database
+  without creating or migrating anything. The installed build also runs the job, and says
+  why, when the head has no full snapshot or `flake.nix`, `nix` isn't on PATH, the build
+  fails or takes over `self_hosted_build_timeout_s` (600 s, capped by the thread's deadline;
+  set it to 0 to turn the builds off), the build doesn't speak the hand-off protocol
+  (`agent-bus self-host-info`; any head from before this feature), or the head's worker
+  exits before its first turn. One that dies after a turn started fails the job, with an
+  `error` event naming the exit code and the job's log. Discussions, debriefs and other
+  repos' reviews always run the installed build. Each pass says which build runs it, after
+  the verdict format label, and in a `prompts` event (`agent-bus tail --events`). List only
+  repos whose heads you'd run as your own code: any head reviewed there, someone else's pull
+  request included, runs with your agents' credentials, just as its tests would.
+
+  When the installed build runs a review in a repo listed in either key (builds off, the
+  head's can't, or `self_hosted_prompts` only), it still takes the review prompt text (the review templates, rules, follow-up framing and
+  reading notes) from the head's `src/agent_bus/prompts.py` in its read-only snapshot. That
+  file is never run: it is parsed with `ast`, and only top-level string literals (and `+`
+  of literals and names defined earlier) are read. Everything else stays installed: the
+  worker, the adapters and their preambles, the verdict format the worker parses, and the
   database. If any of those constants can't be read that way (missing, not a literal, bound
-  twice, empty, a template taking other `{fields}` (or the same ones a different number of times) than the installed
-  worker fills, a top-level statement other than imports, assignments and definitions, over 256 KiB, no
-  snapshot), the pass uses the installed prompts. Either way, after the verdict format label
-  the prompt says which prompts it uses (and why it fell back), and `agent-bus tail --events`
-  shows a `prompts` event. A repo that isn't listed sees no change. List only repos whose
-  heads you'd trust to write your reviewers' instructions: any head reviewed there, someone
-  else's pull request included, can change what the reviewers are told.
+  twice, empty, a template taking other `{fields}` (or the same ones a different number of
+  times) than the installed worker fills, a top-level statement other than imports,
+  assignments and definitions, over 256 KiB, no snapshot), the pass uses the installed
+  prompts. Either way the prompt says which prompts it uses (and why it fell back), and the
+  `prompts` event says so too. A repo that isn't listed sees no change.
 - A verdict counts only for the base and head it was given on. **Any new head (or a new base)
   makes every earlier approval stale**, so the review is complete (the thread resolves) once
   every required reviewer has approved the same base..head. Re-reviews are follow-ups, so
@@ -819,7 +842,7 @@ looks like an agent's shell: one of `AI_AGENT`, `CLAUDECODE`, `CLAUDE_CODE_ENTRY
 `codex`, `agy` or `copilot`. Agents use their MCP tools instead, which speak as themselves.
 Reading (`threads`, `history`, `tail`, `agents`, `usage`) stays open to them. A headless peer
 (`AGENT_BUS_PEER` set) gets no CLI at all, reading included, since `history` would show it the
-blind round's proposals (`PEER_READ_ONLY`); only `mcp`, `hook` and `run-job` still start.
+blind round's proposals (`PEER_READ_ONLY`); only `mcp`, `hook`, `run-job` and `self-host-info` still start.
 
 If you're typing in an agent's shell yourself (Claude Code's `!` prompt, a terminal an agent
 launched), set `AGENT_BUS_ALLOW_HUMAN=1` for that command. It doesn't lift the headless-peer
@@ -944,6 +967,7 @@ documents each.
 | `hook --client <client> --event <event>` | client hooks (see Hooks) |
 | `setup-codex`, `setup-copilot` | Home Manager activation (see Install) |
 | `run-job <job>` | the MCP server or CLI, to run a queued job |
+| `self-host-info` | the installed worker, checking a head's build can run a review job (see Reviews) |
 | `auto-resume [--wait]` | itself, after a usage limit resets (see Out of usage); without `--wait`, shows what's planned |
 | `stream [thread …]` | notification hooks (see below) |
 | `rex-check` | you or an agent, diagnosing Rex status (see Rex sessions) |

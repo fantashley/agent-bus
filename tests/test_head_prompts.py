@@ -150,16 +150,32 @@ def write_config(env, **extra):
 
 
 def test_self_hosted_prompts_config(env, tmp_path):
-    assert cfg.Config.load().head_prompts(env["repo"]) is False  # off by default
+    assert cfg.Config.load().self_hosted(env["repo"]) is False  # off by default
     ws = tmp_path / "ws"
-    write_config(env, self_hosted_prompts=[str(env["repo"]), str(ws)])
+    # #181: self_hosted_reviews also takes the head's prompt text; only it runs the head's build
+    # (codex-1: the older key never grants running the head's code).
+    for key in ("self_hosted_prompts", "self_hosted_reviews"):
+        write_config(env, **{key: [str(env["repo"]), str(ws)]})
+        conf = cfg.Config.load()
+        assert conf.self_hosted(env["repo"]) and conf.self_hosted(ws / "task")
+        assert not conf.self_hosted(tmp_path) and not conf.self_hosted(str(env["repo"]) + "-other")
+        assert conf.head_builds(env["repo"]) is (key == "self_hosted_reviews")
+        for bad in ("~/src/agent-bus", [""], [1]):
+            write_config(env, **{key: bad})
+            with pytest.raises(ValueError, match=key):
+                cfg.Config.load()
+        write_config(env, **{key: []})
+    write_config(env, self_hosted_reviews=[str(ws)], self_hosted_prompts=[str(env["repo"])])
     conf = cfg.Config.load()
-    assert conf.head_prompts(env["repo"]) and conf.head_prompts(ws / "task")
-    assert not conf.head_prompts(tmp_path) and not conf.head_prompts(str(env["repo"]) + "-other")
-    for bad in ("~/src/agent-bus", [""], [1]):
-        write_config(env, self_hosted_prompts=bad)
-        with pytest.raises(ValueError, match="self_hosted_prompts"):
+    assert conf.self_hosted(env["repo"]) and conf.self_hosted(ws)
+    write_config(env, self_hosted_reviews=[str(ws)], self_hosted_build_timeout_s=0)
+    conf = cfg.Config.load()
+    assert conf.self_hosted(ws) and not conf.head_builds(ws)  # builds off: prompts only (#138)
+    for bad in (-1, True, "600", 1.5):
+        write_config(env, self_hosted_build_timeout_s=bad)
+        with pytest.raises(ValueError, match="self_hosted_build_timeout_s"):
             cfg.Config.load()
+    write_config(env, self_hosted_build_timeout_s=0)
 
 
 # ------------------------------------------------------------ a review with a real head

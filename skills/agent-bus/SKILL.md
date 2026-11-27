@@ -181,11 +181,13 @@ listed apart and never blocks, whatever its severity.
 the reviewer settles each of its earlier blocking findings by id (fixed, withdrawn or still
 blocking), and the verdict shows how.
 
-**Reviewing a change to agent-bus's own prompts.** Reviewers get the installed build's prompts,
-unless the user lists the repo in `self_hosted_prompts`: then each pass takes its review prompt
-text from the head's `src/agent_bus/prompts.py` (read, never run; the worker, tools and verdict
-format stay installed). The prompt says which prompts it used, or why it fell back to the
-installed ones; check that line before judging how a prompt change reads to a reviewer.
+**Reviewing a change to agent-bus itself.** Reviewers get the installed build, unless the user
+lists the repo in `self_hosted_reviews`: then the review job runs from the head's own Nix
+build, its prompts, adapters and verdict parsing included. When it can't (the build fails or
+is too slow, the head changes the database schema, builds are off), or the repo is listed only
+in the older `self_hosted_prompts`, the installed build runs it and takes the review prompt
+text from the head's `src/agent_bus/prompts.py` (read, never run). The prompt says which build and prompts it used,
+and why it fell back; check that line before judging how a change reads to a reviewer.
 
 **Follow-ups.** After fixing findings:
 1. `send(thread, body=...)` a short note on how each finding was addressed, by id (`codex-1: ...`).

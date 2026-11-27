@@ -233,6 +233,16 @@ CREATE TABLE cli_version_timeouts (  -- a `--version` probe that timed out (#41)
 """
 
 
+# What a Bus opened with migrate=False may not do (#181): change the database's shape.
+_SCHEMA_ACTIONS = frozenset(getattr(sqlite3, n) for n in dir(sqlite3) if n.startswith((
+    "SQLITE_CREATE_", "SQLITE_DROP_")) and not n.startswith(("SQLITE_CREATE_TEMP_", "SQLITE_DROP_TEMP_"))
+) | {sqlite3.SQLITE_ALTER_TABLE}
+
+
+def _no_schema_changes(action: int, *_args) -> int:
+    return sqlite3.SQLITE_DENY if action in _SCHEMA_ACTIONS else sqlite3.SQLITE_OK
+
+
 class BusError(Exception):
     """An error reported to callers by code (e.g. THREAD_LIMIT_REACHED)."""
 
@@ -330,8 +340,12 @@ class _LockedConn:
 
 
 class Bus:
-    def __init__(self, path: str | os.PathLike | None = None, timeout: float = 30):
+    def __init__(self, path: str | os.PathLike | None = None, timeout: float = 30, migrate: bool = True):
+        """``migrate=False`` (a head build's worker, #181): open an existing database as it
+        is, creating and migrating nothing, and refuse one that needs a migration."""
         self.path = Path(path) if path else cfg.db_path()
+        if not migrate and not self.path.is_file():
+            raise RuntimeError(f"no agent-bus database at {self.path}, and this worker creates none")
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not self.path.exists():
             fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -339,6 +353,8 @@ class Bus:
         os.chmod(self.path, 0o600)
         raw = sqlite3.connect(self.path, timeout=timeout, isolation_level=None, check_same_thread=False)
         raw.row_factory = sqlite3.Row
+        if not migrate:
+            raw.set_authorizer(_no_schema_changes)  # before anything else runs on it (#181)
         self.conn = _LockedConn(raw)
         self.conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -347,8 +363,11 @@ class Bus:
         # Set by the CLI for a command acting as the human user (#108): recorded with every
         # trust "human" message this Bus posts, and with record_human_action.
         self.human_provenance: dict | None = None
-        self.conn.executescript(SCHEMA)
-        self._migrate()
+        if migrate:
+            self.conn.executescript(SCHEMA)
+            self._migrate()
+        elif self._needs_migration():
+            raise RuntimeError("the agent-bus database needs a migration, and this worker runs none")
 
     SESSION_COLUMNS = (("rex_reason", "TEXT"), ("client_pid", "INTEGER"), ("client_start", "TEXT"),
                        ("harness", "TEXT"))
