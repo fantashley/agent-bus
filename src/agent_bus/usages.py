@@ -40,6 +40,14 @@ mention qualified by a module or object (``snapshot.ensure()``, ``monkeypatch.un
 last part is a generic word is searched as written (its last two parts), which finds the calls
 meant rather than every ``ensure``.
 
+#186: a read or mentioned name that looks like a constant or environment variable
+(``AGENT_BUS_BIN``), or that the change introduces (on its added lines, not its removed
+ones), is searched and given room before the other reads and mentions, which are often
+generic words (``refs``, ``cancel``).  A name with no room for its hits' text is one line of
+where they are, as ``path:line`` numbers rather than files and counts (a very common name
+keeps those), and a name with no room left in MAX_CHARS isn't just named: within LEFT_CHARS
+more it gets that line too, so a reviewer that can't search still knows where to read.
+
 #174, #175: in a Python file, which definition a changed line touches is read from the file
 itself, parsed with ``ast`` (pinned_python): a changed ``def`` or ``class`` line defines its
 name unless it sits in a function (a local helper), and any other changed line touches the
@@ -70,6 +78,12 @@ PER_SYMBOL = 8
 SAMPLE = 3
 MAX_LINE = 140
 MAX_CHARS = 6_000
+# The compact lines of the names with no room in MAX_CHARS (#186): this many characters more in
+# all, and at most COMPACT each.
+LEFT_CHARS = 2_000
+COMPACT = 200
+# The lines a very common name's one line gives, to start reading at (#186).
+SAMPLE_CHARS = 100
 MAX_OUTPUT = 2_000_000
 GREP_TIMEOUT_S = 60
 # More names on top of MAX_SYMBOLS: changed methods whose other definitions are searched, and
@@ -109,6 +123,10 @@ _TEST_PATH = re.compile(r"(?:^|/)(?:tests?|__tests__|spec)/|(?:^|/)(?:test_[^/]*
 # A module-level constant (FOO_BAR = ..., FOO: int = ...), assigned at the start of the line.
 _CONST = re.compile(r"^([A-Z][A-Z0-9_]+)\s*(?::[^=]*)?=(?!=)")
 _UPPER = re.compile(r"[A-Z][A-Z0-9_]+")
+# A name that looks like a constant or an environment variable (#186): AGENT_BUS_BIN, MAX_2.
+_CONSTANT = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
+# A word on a diff's line, for which names it adds (#186).
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # The function or class git names in a hunk header, failing a definition: the first call-like name.
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
 _CALL = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
@@ -160,12 +178,15 @@ _EXT = frozenset({"py", "js", "ts", "tsx", "jsx", "md", "json", "toml", "txt", "
 @dataclass(frozen=True)
 class Term:
     """One thing to search for: ``pattern`` (a name, or ``def name`` / ``fn name`` for a method's
-    definitions), its ``kind`` (see KINDS), for a field the class it is in, and whether the
-    change touches it only in test files (then it gets room after every other name, #135)."""
+    definitions), its ``kind`` (see KINDS), for a field the class it is in, whether the
+    change touches it only in test files (then it gets room after every other name, #135),
+    and for a read or mentioned name whether it is a constant-like or new one (then it gets
+    room before the other names of its priority, #186)."""
     pattern: str
     kind: str = "defined"
     owner: str = ""
     test: bool = False
+    sharp: bool = False
 
 
 def priority(t: Term) -> int:
@@ -189,6 +210,27 @@ def _defs(text: str, path: str) -> list[str]:
     if _COMMENT.match(text):
         return []
     return [d.group(1) for d in _DEF.finditer(_mask(text, path))]
+
+
+def _added(diff: str) -> set[str]:
+    """The words on ``diff``'s added lines that are on none of its removed ones (#186)."""
+    plus: set[str] = set()
+    minus: set[str] = set()
+    for line in diff.split("\n"):
+        if line.startswith(("+++ ", "--- ")):
+            continue
+        if line.startswith("+"):
+            plus.update(_WORD.findall(line, 1))
+        elif line.startswith("-"):
+            minus.update(_WORD.findall(line, 1))
+    return plus - minus
+
+
+def _sharp(name: str, added: set[str]) -> bool:
+    """Whether a read or mentioned ``name`` looks like a constant or an environment variable,
+    or is new in the change (#186): such a name is ranked before the generic ones."""
+    last = name.rsplit(".", 1)[-1]
+    return bool(_CONSTANT.fullmatch(last)) or last in added
 
 
 def _ok(name: str) -> bool:
@@ -640,10 +682,14 @@ def terms(diff: str, mention: list[str] | None = None, limit: int = MAX_SYMBOLS,
              if not (n.startswith("__") and n.endswith("__")) and n not in _SKIP and not n.startswith("test")]
     found += meths[:MAX_METHODS]
     have = {t.pattern for t in found} | set(out)
-    found += [Term(n, "read", test=first(n)) for n in sorted(reads, key=first)
+    # By where the change touches them, then constant-like and new names first (#186).
+    added = _added(diff)
+    found += [Term(n, "read", test=first(n), sharp=_sharp(n, added))
+              for n in sorted(reads, key=lambda n: (first(n), not _sharp(n, added)))
               if n not in have and _specific(n)][:MAX_READ]
     have = {t.pattern for t in found}
-    found += [Term(n, "mentioned") for n in (mention or []) if n not in have][:MAX_MENTIONED]
+    found += [Term(n, "mentioned", sharp=_sharp(n, added))
+              for n in sorted(mention or [], key=lambda n: not _sharp(n, added)) if n not in have][:MAX_MENTIONED]
     return found
 
 
@@ -789,9 +835,12 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
     capped: at most ``per_symbol`` lines each, hits outside test files first (then a count
     and the files of the rest), and ``limit`` characters in all; a name with no room for that
     gets SAMPLE of its hits.
-    A name with over GENERIC_HITS hits, or one that doesn't fit in full, is one line: its
-    count and busiest files.  The changed definitions are always shown (at worst as that
-    line); the others are left out, highest priority last, when even that doesn't fit.
+    A name with over GENERIC_HITS hits is one line: its count and busiest files; one that
+    doesn't fit in full is one line of where its hits are, as ``path:line`` numbers (#186).
+    The changed definitions are always shown (at worst as that line); the others are left
+    out, highest priority last, when even that doesn't fit.  Within a priority, constant-like
+    and new names get room first (#186).  A name left out still gets that line, without its
+    description, in LEFT_CHARS more; only the names with no room for that either are just named.
     ``readable``: the files the reviewer can read at the head (a sparse snapshot's); a hit
     or a listed file elsewhere is marked.  When git grep's output was cut, counts are lower
     bounds and no hit means none found before the cut, not none at all."""
@@ -802,14 +851,16 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
     full: dict[str, str] = {}
     sample: dict[str, str] = {}
     short: dict[str, str] = {}
+    where: dict[str, str] = {}  # where a name's hits are, in one line (#186)
+    compact: dict[str, str] = {}  # that line, for a name left out (#186)
     for n in u.names:
         t = u.terms.get(n) or Term(n)
         desc = ", ".join(d for d in (_desc(t), "only in tests" if t.test else "") if d)
         hits = u.hits.get(n) or []
         if not hits:
-            full[n] = sample[n] = short[n] = (f"{n}{f' ({desc})' if desc else ''}: "
-                                  + ("none found before the search output was cut" if n in lower
-                                     else "no uses at head"))
+            full[n] = sample[n] = short[n] = compact[n] = (
+                f"{n}{f' ({desc})' if desc else ''}: "
+                + ("none found before the search output was cut" if n in lower else "no uses at head"))
             continue
         files: dict[str, int] = {}
         for p, _, _ in hits:
@@ -833,21 +884,28 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
         full[n] = listing(per_symbol)
         # Failing room for that, a sample of the hits rather than none (#156).
         sample[n] = listing(SAMPLE) if len(hits) > SAMPLE else full[n]
-        busiest = sorted(files, key=lambda p: -files[p])[:6]
-        why = "too common to list" if len(hits) > GENERIC_HITS else "not listed, for space"
-        short[n] = (f"{head}: {why}; most in " + ", ".join(f"{mark(p)} ({files[p]})" for p in busiest)
-                    + (f" and {len(files) - 6} more files" if len(files) > 6 else ""))
         if len(hits) > GENERIC_HITS:
-            full[n] = sample[n] = short[n]
+            busiest = sorted(files, key=lambda p: -files[p])[:6]
+            where[n] = ("most in " + ", ".join(f"{mark(p)} ({files[p]})" for p in busiest)
+                        + (f" and {len(files) - 6} more files" if len(files) > 6 else "")
+                        # and a few lines to start reading at (codex-3)
+                        + "; first at " + _lines_at(hits, mark, SAMPLE_CHARS))
+            short[n] = full[n] = sample[n] = f"{head}: too common to list; {where[n]}"
+        else:
+            # Its line numbers, not just its files (#186): what a reviewer with no search reads by.
+            where[n] = "at " + _lines_at(hits, mark)
+            short[n] = f"{head}: not listed, for space; {where[n]}"
+        compact[n] = f"{n} ({count}): {where[n]}"
     index = {n: i for i, n in enumerate(u.names)}
     prio = {n: priority(u.terms.get(n) or Term(n)) for n in u.names}
     size = {n: len(u.hits.get(n) or []) for n in u.names}
-    # Room is handed out by priority, fewest hits first within one, with the one-line form of
-    # every changed definition still to come kept in reserve.
+    # Room is handed out by priority, constant-like and new names first within one (#186), then
+    # fewest hits, with the one-line form of every changed definition still to come kept in reserve.
+    rank = sorted(u.names, key=lambda n: (prio[n], not (u.terms.get(n) or Term(n)).sharp, size[n], index[n]))
     reserve = sum(len(short[n]) + 1 for n in u.names if prio[n] == 0)
     kept: dict[str, str] = {}
     used = 0
-    for n in sorted(u.names, key=lambda n: (prio[n], size[n], index[n])):
+    for n in rank:
         if prio[n] == 0:
             reserve -= len(short[n]) + 1
         for block in dict.fromkeys((full[n], sample[n], short[n])):
@@ -859,10 +917,50 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
     # there was room, it shouldn't come before the production names (#142 debrief).
     order = sorted(u.names, key=lambda n: ((u.terms.get(n) or Term(n)).test, size[n], index[n]))
     out = [kept[n] for n in order if n in kept]
-    left = [n for n in order if n not in kept]
+    # The names left out, in the order they had room handed out: where each appears, compactly,
+    # while LEFT_CHARS lasts (#186).
+    left = [n for n in rank if n not in kept]
+    shown, used = [], 0
+    for n in list(left):
+        line = compact[n]
+        if used + len(line) + 1 > LEFT_CHARS:
+            continue  # a shorter one after it may still fit (codex-4)
+        shown.append(line)
+        used += len(line) + 1
+        left.remove(n)
+    if shown:
+        out.append("No room for these, so where each appears:")
+        out += shown
     if left:
         out.append(f"[... {_plural(len(left), 'more name')} not shown: {', '.join(left)}]")
     return f"{OPEN}\n" + "\n".join(out) + f"\n{CLOSE}"
+
+
+def _lines_at(hits: list[tuple[str, int, str]], mark, limit: int = COMPACT) -> str:
+    """Where ``hits`` are, in about ``limit`` characters (#186): outside test files first, as
+    ``path:line,line; path:line``, then how many more there are.  A file whose first line
+    doesn't fit is skipped, not the rest (codex-4).  ``mark`` shows a path."""
+    by: dict[str, list[int]] = {}
+    for p, ln, _ in sorted(hits, key=lambda h: is_test(h[0])):
+        by.setdefault(p, []).append(ln)
+    room = limit - len(" [+99999 more]")  # what is left out is counted after
+    out, done = "", 0
+    for p, lns in by.items():
+        first = f"{'; ' if out else ''}{mark(p)}:{lns[0]}"
+        if len(out) + len(first) > room:
+            continue
+        out += first
+        done += 1
+        for ln in lns[1:]:
+            if len(out) + len(f",{ln}") > room:
+                break
+            out += f",{ln}"
+            done += 1
+    if not out and by:
+        # No path fits the room: the shortest one's first line anyway, over it (antigravity-2).
+        p = min(by, key=lambda p: len(mark(p)))
+        out, done = f"{mark(p)}:{by[p][0]}", 1
+    return out + (f" [+{len(hits) - done} more]" if done < len(hits) else "")
 
 
 def note(repo: str, head: str, diff: str, readable: frozenset[str] | set[str] | None = None,

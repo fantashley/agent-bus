@@ -337,8 +337,10 @@ finding (fixed, withdrawn or still blocking), and a new blocking finding must co
 the latest changes introduced or exposed, unless it is a newly substantiated `high`, and say why
 it wasn't visible on the earlier head. A resumed pass with findings to settle is a lighter
 confirmation pass (#159): its prompt leads with the open finding ids (one line each; the session
-has their full text), then the interdiff, then your notes and `testing`, and it names the read
-commands from the reviewer's first pass rather than listing them again.
+has their full text) and the path of the head's read-only copy, then the interdiff, then your
+notes and `testing`, and it names the read commands from the reviewer's first pass rather than
+listing them again. In every review prompt, each of your notes on the thread is labelled with the
+head of the review pass that followed it, and the `testing` note with its head.
 
 A review counts your follow-up requests (each new base or head, and each pushback; reviewer
 handoffs, retries and repeats are free). The soft budget, `review_followup_budget` in the config
@@ -546,10 +548,15 @@ codex 0.171.0 and 0.172.0, and agy 1.5.13:
   defines or edits are used (with changed class fields, the other definitions of changed
   methods, and names in backticks in the thread's findings and notes since its last pass),
   fewest hits first, with a very common name collapsed to one line, each name's hits outside
-  test files first, and a name short of room cut to a sample of its hits. Names read off a
+  test files first, and a name short of room cut to a sample of its hits, or failing that to
+  one line of `path:line` numbers. A name with no room left at all still gets that line, in a
+  small extra budget, before names are only listed. Names read off a
   common standard-library module and generic words (`repo`, `path`) aren't searched, and a
   backticked generic name qualified by a module or object (`snapshot.ensure()`) is searched as
-  written. A prompt too long for one
+  written. Among the names the changed lines read and those the thread mentions, ones that look
+  like constants or environment variables (`AGENT_BUS_BIN`) and ones the change adds are searched
+  and given room first. In a discussion with a `repo`, agy's prompt lists the repository's files
+  at its checked-out commit (capped, like a review's snapshot list). A prompt too long for one
   argument goes in as far as fits and continues in numbered part files, each small enough for
   one `read_file` call (agy reads at most 800 lines or 46,080 bytes per call; a part stays under
   750 lines and 44,000 bytes). Turns also

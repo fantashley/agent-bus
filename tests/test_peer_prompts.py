@@ -182,7 +182,7 @@ def test_review_prompt_leads_with_files_commits_and_testing(env, no_spawn, monke
     assert files < p.index("```diff")
     assert "2 files, +3 -1" in p and "  A new.txt  +2 -0" in p and "  M a.txt  +1 -1" in p
     assert f"{head[:12]} changed" in p and "Commit messages, base..head" in p
-    assert "Testing done, as claude reports it" in p and "pytest -q: 400 passed" in p
+    assert f"Testing done on head {head[:12]}, as claude reports it" in p and "pytest -q: 400 passed" in p
     assert f"Diff from base to head (base {base[:12]} to head {head[:12]}), the whole change, because this is your first pass" in p
     assert "time limit of about 1 minute." in p
     # codex has a shell: copyable read-only commands for the pinned head.
@@ -402,9 +402,14 @@ def test_a_confirmation_pass_leads_with_the_open_findings(env, no_spawn, monkeyp
     run_job(bus, tid)
     p = calls(env)[-1]["prompt"]
     assert "- codex-1 [high] a.txt:1: The lock is released too early.\n" in p and "races with the writer" not in p
-    order = ["Your open blocking findings", "confirm or reopen it", "```diff", "`release_lock` now runs",
-             "pytest: 12 passed", "Reading the pinned head", "settle the findings listed at the top"]
+    # The copy's path goes with the findings, before the interdiff (#186); the note is labelled
+    # with the head it was sent for, and so is the testing note.
+    order = ["Your open blocking findings", "confirm or reopen it", "(the verdict format is at the end)",
+             "Reading the pinned head", "```diff", f"[message, before the pass on head {h2[:12]}]",
+             "`release_lock` now runs", f"Testing done on head {h2[:12]}", "pytest: 12 passed",
+             "settle the findings listed at the top", "End your reply with your verdict"]
     assert [p.index(s) for s in order] == sorted(p.index(s) for s in order)
+    assert p.count("Reading the pinned head") == 1
     assert "why it wasn't visible on\nthe earlier head" in p
     # The snapshot's path first, then the commands by name with the pinned ids.
     assert f"use the read-only git commands from your first\npass with base {base} and head {h2}" in p
