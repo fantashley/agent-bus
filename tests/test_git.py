@@ -198,6 +198,8 @@ def test_missing_commit_in_plain_git_needs_human(env, no_spawn, unchecked_commit
     # The failed job doesn't block requesting the same review again.
     again = claude.request_review("codex", str(env["repo"]), base, head)
     assert not again["job"].get("deduplicated")
+    # #179 (antigravity-4): the commits are checked before any snapshot is made.
+    assert not [e for e in bus.events(tid) if e["kind"] in ("snapshot", "prompts")]
 
 
 def test_missing_commit_in_jj_repo_needs_human(env, no_spawn, unchecked_commits):

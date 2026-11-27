@@ -101,11 +101,19 @@ def test_a_long_flat_concatenation_falls_back_rather_than_failing():
         headprompts.parse(changed("PURE_REBASE = \"\"\"", f"PURE_REBASE = {chain} + \"\"\""))
 
 
-def test_all_the_strings_together_are_capped():
-    """codex-2: many distinct near-limit strings, even unused ones, can't pile up."""
-    big = "".join(f"_U{i} = '{i}' + '{'x' * 100_000}'\n" for i in range(12))
+def test_all_the_strings_together_are_capped(tmp_path):
+    """codex-2: many distinct near-limit strings, even unused ones, can't pile up.  Built
+    from one shared literal, so the file is under the 256 KiB file cap (#179, codex-7) and
+    it is the 1 MiB total that refuses it."""
+    big = f"_X = '{'x' * 100_000}'\n" + "".join(f"_U{i} = '{i}' + _X\n" for i in range(12))
+    source = changed("PURE_REBASE = \"\"\"", big + "PURE_REBASE = \"\"\"")
+    assert len(source.encode()) <= headprompts.MAX_BYTES
+    target = tmp_path / headprompts.PATH
+    target.parent.mkdir(parents=True)
+    target.write_text(source)
+    snap = Snapshot(head="h" * 40, path=str(tmp_path), files=[headprompts.PATH])
     with pytest.raises(headprompts.NotLoadable, match="add up to over 1024 KiB"):
-        headprompts.parse(changed("PURE_REBASE = \"\"\"", big + "PURE_REBASE = \"\"\""))
+        headprompts.load(snap)
 
 
 def test_load_reads_only_a_regular_file_in_the_snapshot(tmp_path):

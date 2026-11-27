@@ -1241,9 +1241,16 @@ class Worker:
         it, or returns None after parking the thread for the human user.  The pass's
         prompts are the head's, in a repository that opts in (#138)."""
         t = self.thread()
+        try:
+            # The whole change's diff first: a missing base or head is reported before any
+            # snapshot is made or prompts event recorded (#179, antigravity-4).
+            full = self.review_diff(t["refs"] or {}, interdiff=False)
+        except MissingRevision as e:
+            self.report_missing(t, e)
+            raise
         snap = self.pin_snapshot(t, t["refs"] or {})
         with headprompts.using(self.head_prompts(t["refs"] or {}, snap)):
-            return self._review_round(mode, snap)
+            return self._review_round(mode, snap, full)
 
     def head_prompts(self, refs: dict, snap: snapshot.Snapshot) -> headprompts.Active | None:
         """The pass's review prompt text from the head (#138): None unless the repo is listed
@@ -1260,7 +1267,7 @@ class Worker:
         return headprompts.Active(texts, prompts.PROMPTS_HEAD.format(head=head, path=headprompts.PATH,
                                                                      build=build_label()))
 
-    def _review_round(self, mode: str, snap: snapshot.Snapshot) -> dict | None:
+    def _review_round(self, mode: str, snap: snapshot.Snapshot, full: tuple[str, str]) -> dict | None:
         t = self.thread()
         refs = t["refs"] or {}
         reviewer = refs["reviewer"]
@@ -1288,7 +1295,7 @@ class Worker:
         pushback = followup and refs.get("pushback_round") == t["round"]
         rebase_note = fallback = fallback_why = range_note = ""
         try:
-            full_diff, full_heading = self.review_diff(refs, interdiff=False)
+            full_diff, full_heading = full  # computed by review_round, before the snapshot
             if pushback:
                 pass  # no interdiff: the head is the one it last reviewed
             elif rebased:
@@ -1311,9 +1318,7 @@ class Worker:
             elif resume:
                 inter, inter_heading = self.review_diff(refs, interdiff=True)
         except MissingRevision as e:
-            # A later head on a several-reviewer thread is a follow-up of the thread, even for a
-            # reviewer seeing it for the first time: only `agent-bus resume` retries it.
-            self.report_missing(t, e, followup or bool(refs.get("revision")) or len(refs.get("heads") or []) > 1)
+            self.report_missing(t, e)
             raise
         # Large new data files, readable in full in the copy, are summarized (#161).  Only now,
         # so the interdiff checks above compared the diffs as git gave them (codex-3).
@@ -1515,11 +1520,15 @@ class Worker:
             return None
         return data.get("head_commit_id")
 
-    def report_missing(self, t: dict, e: MissingRevision, followup: bool) -> None:
+    def report_missing(self, t: dict, e: MissingRevision) -> None:
         """Tell the requester which pinned commit is missing, park the thread for them and fail
         the job, all in one transaction: once the notice is visible, the retry it describes
         (a new request, or `agent-bus resume`) can't trip over this job still running.
         Failing the job (not "done") is what lets the same request be made again."""
+        refs = t["refs"] or {}
+        # A later head on a several-reviewer thread is a follow-up of the thread, even for a
+        # reviewer seeing it for the first time: only `agent-bus resume` retries it.
+        followup = bool(refs.get("prev_head_commit_id") or refs.get("revision")) or len(refs.get("heads") or []) > 1
         what = "; ".join(f"the {label} commit {sha}" for label, sha in e.missing)
         retry = (f"then ask the human user to run `agent-bus resume {t['id']}` to retry this pass. "
                  "If a commit id is wrong, start a fresh review with the right ids and without "

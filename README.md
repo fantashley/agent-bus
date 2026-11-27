@@ -935,9 +935,10 @@ documents each.
 | `rex-check` | you or an agent, diagnosing Rex status (see Rex sessions) |
 
 `tail <thread> --events --once` is also what agents run to see whether a peer is still working.
-`--events-only` prints just the event lines for tools, turns, errors and retries (no header,
-messages, or the peers' streamed text and thinking), so grepping them for denials, timeouts or
-retries doesn't match what the peers wrote. A tool call that failed, where the CLI's stream
+`--events` shows every kind of event the bus records (tools, turns, errors, retries, the
+head's snapshot, prompts and so on, including kinds added later). `--events-only` prints just
+those event lines, without the header, messages, or the peers' streamed text and thinking, so
+grepping them for denials, timeouts or retries doesn't match what the peers wrote. A tool call that failed, where the CLI's stream
 says so, gets a `tool_failed` line after its `tool` line: a Claude tool result marked as an
 error, a Codex command that exited non-zero or was declined (or a failed MCP call or file
 change), an Antigravity tool step that ended in `ERROR`, and a Copilot tool that reported no

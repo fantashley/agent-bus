@@ -199,6 +199,10 @@ def _escaped(text: str) -> str:
     return re.sub(r"[\x00-\x1f\x7f-\x9f]", lambda m: m.group().encode("unicode_escape").decode(), text)
 
 
+# The event kinds that carry a peer's own streamed words, which `tail --events-only` leaves out.
+PEER_OUTPUT = ("text", "thinking")
+
+
 def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
     color = rex.stdout_is_tty() and not args.no_color
     # OSC 7501 status is a Rex feature: only emit it inside Rex.
@@ -237,10 +241,9 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
             if args.peer or args.events or only:
                 for e in bus.events(args.thread, after_id=last_ev, agent=args.peer):
                     last_ev = e["id"]
-                    if e["kind"] in (("tool", "tool_failed", "turn_start", "turn_end", "error", "format", "relaunch",
-                                      "api_retry", "repair", "prompts") if only else
-                                     ("text", "tool", "tool_failed", "thinking", "turn_start", "turn_end", "error",
-                                      "format", "relaunch", "api_retry", "repair", "prompts")):
+                    # Every kind, so a new one is never hidden (#179); --events-only drops
+                    # only the peers' own words.
+                    if not (only and e["kind"] in PEER_OUTPUT):
                         who = e["agent"] or "worker"
                         print(_color(SYSTEM, f"  · {who} {e['kind']}: {_escaped(e['text'] or '')}", color), flush=True)
             st = peer_status(bus, args.thread, args.peer) if args.peer else thread_status(bus, args.thread)
