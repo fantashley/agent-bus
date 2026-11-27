@@ -16,7 +16,7 @@ import time
 from . import config as cfg
 from . import evidence as ev
 from . import hooks, provenance, rex
-from .db import HUMAN, SYSTEM, Bus, BusError, format_progress, is_quiet
+from .db import HUMAN, SYSTEM, Bus, BusError, format_progress, head_build_attempt, is_quiet
 from .service import Service, finished_line, present, thread_summary
 from .worker import format_review
 
@@ -143,8 +143,10 @@ def thread_header(t: dict) -> str:
     return f"agent-bus {t['id']} · {t['kind']} · {roles}"
 
 
-def thread_status(bus: Bus, thread: str) -> tuple[str, str | None, str]:
-    """Map bus state to (OSC 7501 state, blocked kind, message)."""
+def thread_status(bus: Bus, thread: str, builds: dict[str, list[dict]] | None = None) -> tuple[str, str | None, str]:
+    """Map bus state to (OSC 7501 state, blocked kind, message).  ``builds``: the thread's
+    head_build events by job id, as `tail` has read them so far: while the active job's
+    worker builds the head (#206), the line says so rather than that its reviewer reviews."""
     t = bus.thread(thread)
     job = bus.active_job(thread)
     if t["status"] == "resolved":
@@ -161,6 +163,9 @@ def thread_status(bus: Bus, thread: str) -> tuple[str, str | None, str]:
             return "idle", None, f"{thread}: changes requested by {', '.join(st['changes_requested'])}"
     if job:
         if t["kind"] == "review":
+            build = head_build_attempt((builds or {}).get(job["id"], []), job.get("lease_owner"))
+            if build and build["end"] is None and build["owner"] in (None, job.get("lease_owner")):
+                return "working", None, f"{thread}: building head {build['head'][:12]} with nix (pass {t['round']})"
             return "working", None, f"{thread}: {(t['refs'] or {}).get('reviewer')} reviewing (pass {t['round']})"
         return "working", None, f"{thread}: round {t['round']}/{t['max_rounds']}"
     # Waiting on an interactive session that has mail here: only the human can nudge it (#20).
@@ -211,6 +216,7 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
     notices = hooks.MailNotices()
     last_msg = last_ev = last_act = 0
     last_status = None
+    builds: dict[str, list[dict]] = {}  # the head_build events read so far, by job (#206)
     t = bus.thread(args.thread)
     # --events-only (#122): event lines alone, so grepping for denials or timeouts doesn't
     # match the text of a review or proposal: no messages, and none of the peers' own
@@ -247,11 +253,13 @@ def cmd_tail(bus: Bus, args: argparse.Namespace) -> int:
             for e in bus.events(args.thread, after_id=last_ev, agent=args.peer,
                                 kind=None if every else "head_build", upto_id=upto):
                 last_ev = e["id"]
+                if e["kind"] == "head_build" and e["job_id"]:
+                    builds.setdefault(e["job_id"], []).append(e)
                 if not (only and e["kind"] in PEER_OUTPUT):
                     who = e["agent"] or "worker"
                     print(_color(SYSTEM, f"  · {who} {e['kind']}: {_escaped(e['text'] or '')}", color), flush=True)
             last_ev = max(last_ev, upto or 0)
-            st = peer_status(bus, args.thread, args.peer) if args.peer else thread_status(bus, args.thread)
+            st = peer_status(bus, args.thread, args.peer) if args.peer else thread_status(bus, args.thread, builds)
             if notify and not args.peer:
                 for w in notices.new(hooks.mail_waiting(bus, args.thread)):
                     sys.stdout.write(rex.notify("agent-bus", hooks.describe_mail(w)))

@@ -1223,8 +1223,12 @@ class Worker:
         if not self.config.self_hosted_review(refs["repo"]):
             return None  # not opted in, or to the head's prompt text only (#138)
         # A missing base or head (#179), or the first pass's missing previous head (#201), is
-        # reported before any snapshot, build or prompts event.
-        self.review_diffs(t, refs)
+        # reported before any snapshot, build or prompts event: the pass of the reviewer that
+        # runs first, which a resumed job hands on to after a recorded verdict (#206).
+        first = self.first_pass(t)
+        if first is None:
+            return None  # no pass left to run: the installed build records the outcome
+        self.review_diffs(*first)
         if not self.config.head_builds(refs["repo"]):
             return self.installed_build(refs["head_commit_id"], "head builds are off (self_hosted_build_timeout_s is 0)")
         head = refs["head_commit_id"]
@@ -1484,6 +1488,25 @@ class Worker:
         snap = self.pin_snapshot(t, refs)
         with headprompts.using(self.head_prompts(refs, snap)):
             return self._review_round(mode, snap, full, plan)
+
+    def first_pass(self, t: dict) -> tuple[dict, dict] | None:
+        """The thread and refs of the pass this review job runs first, as run_review_rounds
+        will set them: the current reviewer's, unless a several-reviewer thread's current
+        reviewer already has a verdict on this head (its worker died before the handoff,
+        #206), then the reviewer it hands the head to.  None when no pass runs."""
+        refs = t["refs"]
+        reviewer = refs["reviewer"]
+        if not refs.get("reviewers"):
+            return t, refs
+        state = self.bus.review_standings(self.thread_id)["reviewers"][reviewer]["state"]
+        if state not in ("approved", "changes_requested"):
+            return t, refs
+        nxt = handoff(self.bus, self.thread_id, reviewer, state, bool(refs.get("review_only")))
+        if nxt is None:
+            return None
+        mine = self.bus.review_standings(self.thread_id)["reviewers"][nxt]
+        refs = {**refs, "reviewer": nxt, "prev_head_commit_id": mine["head_commit_id"]}
+        return {**t, "refs": refs, "round": t["round"] + 1}, refs
 
     def review_diffs(self, t: dict, refs: dict) -> tuple[tuple[str, str], tuple]:
         """The current reviewer's pass plan, and the diffs it needs that must exist before

@@ -339,6 +339,36 @@ class Service:
             res["progress"] = progress
         return res
 
+    def settled(self, thread: str) -> bool:
+        """Whether nothing can arrive on ``thread`` for ``wait`` (#208): no job queued or
+        running on it (a debrief's included), and it is closed, or a review waiting for the
+        author's next head (next_action fix: or await_head:)."""
+        if self.bus.active_job(thread):
+            return False
+        t = self.bus.thread(thread)
+        if t["status"] in ("resolved", "cancelled"):
+            return True
+        return t["kind"] == "review" and t["status"] == "open" and \
+            self.review_state(t)["next_action"].startswith(("fix:", "await_head:"))
+
+    def may_settle(self, thread: str) -> bool:
+        """A cheap read for ``wait``'s poller before settled_wait's write transaction: no
+        live job on the thread (an expired lease's goes on to be reaped there), and the
+        thread is closed or an open review."""
+        if self.bus.has_live_job(thread):
+            return False
+        t = self.bus.thread(thread)
+        return t["status"] in ("resolved", "cancelled") or (t["kind"] == "review" and t["status"] == "open")
+
+    def settled_wait(self, thread: str) -> dict | None:
+        """What ``wait`` returns at once when the thread is settled (#208): its unread mail,
+        else what the timeout would give; None while something can still arrive.  One write
+        transaction, so no job (a debrief, say) is queued between the check and the result."""
+        with self.bus.tx():
+            if not self.settled(thread):
+                return None
+            return self.poll(thread) or self.wait_timeout(thread)
+
     def progress(self, thread: str) -> dict | None:
         """How the thread's latest job is going, from its progress events: per peer that
         has taken a turn in it, the turn's state, elapsed time, latest activity and counts.
@@ -387,7 +417,7 @@ class Service:
             out.update({k: turn[k] for k in ("failed_tool_calls", "api_retries", "errors") if turn[k]})
             peers[agent] = out
         res: dict[str, Any] = {"job": info, "peers": peers}
-        build = head_build_attempt(events)
+        build = head_build_attempt(events, job.get("lease_owner"))
         if build:
             # The head's nix build (#188): while it runs, no peer has a turn to show.  An
             # attempt by a worker that no longer holds the job stopped with it (#198).
