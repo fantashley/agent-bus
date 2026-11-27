@@ -217,9 +217,9 @@ def test_the_probe_refuses_an_old_or_other_build(tmp_path):
 # ------------------------------------------------------------ a review job
 
 
-def agent_bus_repo(repo, head_prompts: str, head_db: str = DB_SOURCE):
+def agent_bus_repo(repo, head_prompts: str, head_db: str = DB_SOURCE, head_files: dict | None = None):
     """A git repo shaped like agent-bus: a flake, db.py and prompts.py; the head changes
-    prompts.py (and db.py, if ``head_db`` differs)."""
+    prompts.py (and db.py, if ``head_db`` differs), and writes ``head_files``."""
     git_repo(repo)
     genv = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
                 GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
@@ -234,7 +234,13 @@ def agent_bus_repo(repo, head_prompts: str, head_db: str = DB_SOURCE):
     base = git("rev-parse", "HEAD")
     (repo / "src/agent_bus/prompts.py").write_text(head_prompts)
     (repo / headbuild.DB_PATH).write_text(head_db)
-    git("commit", "-qam", "change it")
+    for path, text in (head_files or {}).items():
+        if text is None:
+            (repo / path).unlink()
+        else:
+            (repo / path).write_text(text)
+    git("add", "-A")
+    git("commit", "-qm", "change it")
     return base, git("rev-parse", "HEAD")
 
 
@@ -263,9 +269,12 @@ def test_an_opted_in_review_runs_on_the_heads_build(env, no_spawn, nix, monkeypa
     assert env["bus"].thread(tid)["status"] == "resolved"
     h = head[:12]
     texts = [t for _, t in events]
-    assert texts[0] == f"building head {h} with nix"
-    assert texts[1].startswith(f"head {h}'s own build runs this review job (")
-    assert [t.split(" (agent-bus")[0] for t in texts[2:]] == [f"head {h}'s own build runs this pass"] * 2
+    builds = [e["text"] for e in env["bus"].events(tid) if e["kind"] == "head_build"]
+    assert builds[0] == f"building head {h} with nix"
+    assert builds[1].startswith(f"head {h}'s build ready after ") and builds[1].endswith(" s")
+    assert len(builds) == 2
+    assert texts[0].startswith(f"head {h}'s own build runs this review job (")
+    assert [t.split(" (agent-bus")[0] for t in texts[1:]] == [f"head {h}'s own build runs this pass"] * 2
     prompts_seen = [c["prompt"] for c in calls(env)]
     assert len(prompts_seen) == 2
     for p in prompts_seen:
@@ -292,10 +301,12 @@ def test_a_head_that_changes_the_schema_is_reviewed_by_the_installed_build(env, 
 def test_a_failed_build_falls_back_with_its_reason(env, no_spawn, nix):
     write_config(env, self_hosted_reviews=[str(env["repo"])])
     nix["fail"] = "its build failed (error: builder failed)"
-    job, events, head, _ = review(env)
+    job, events, head, tid = review(env)
     assert job["status"] == "done" and nix["builds"] == 1
-    assert events[0] == ("prompts", f"building head {head[:12]} with nix")
-    assert "its build failed (error: builder failed)" in events[1][1]
+    builds = [e["text"] for e in env["bus"].events(tid) if e["kind"] == "head_build"]
+    assert builds[0] == f"building head {head[:12]} with nix"
+    assert builds[1].startswith(f"head {head[:12]}'s build failed after ")
+    assert "its build failed (error: builder failed)" in events[0][1]
     assert "its build failed (error: builder failed)" in calls(env)[-1]["prompt"].replace("\n", " ")
 
 
@@ -305,7 +316,7 @@ def test_a_head_worker_that_dies_before_any_turn_falls_back(env, no_spawn, nix, 
                             "echo '{\"protocol\": 2}' && exit 0\necho 'ImportError: no module' >&2\nexit 3\n")
     job, events, head, _ = review(env)
     assert job["status"] == "done"
-    assert "its worker exited (code 3) before any turn: ImportError: no module" in events[2][1]
+    assert "its worker exited (code 3) before any turn: ImportError: no module" in events[1][1]
     assert len(calls(env)) == 1  # the installed build's pass
 
 
@@ -340,7 +351,7 @@ def test_a_build_packaging_another_schema_falls_back(env, no_spawn, nix, tmp_pat
     nix["out"] = out
     job, events, head, _ = review(env)
     assert job["status"] == "done" and len(calls(env)) == 1
-    assert "its build's database schema or migrations differ" in events[1][1]
+    assert "its build's database schema or migrations differ" in events[0][1]
 
 
 def test_a_head_worker_that_posts_then_dies_fails_the_job(env, no_spawn, nix, tmp_path):
@@ -397,7 +408,7 @@ def test_an_author_note_during_a_startup_crash_still_falls_back(env, no_spawn, n
                             f"\"$2\"\nexit 1\n")
     job, events, head, _ = review(env)
     assert job["status"] == "done" and len(calls(env)) == 1
-    assert "its worker exited (code 1) before any turn" in events[2][1]
+    assert "its worker exited (code 1) before any turn" in events[1][1]
 
 
 @pytest.mark.parametrize("sender, session", [("codex", "a-codex-session"), ("system", None)])
@@ -412,7 +423,7 @@ def test_anyone_elses_note_during_a_startup_crash_still_falls_back(env, no_spawn
                             f"\"$2\"\nexit 1\n")
     job, events, head, _ = review(env)
     assert job["status"] == "done" and len(calls(env)) == 1
-    assert "its worker exited (code 1) before any turn" in events[2][1]
+    assert "its worker exited (code 1) before any turn" in events[1][1]
 
 
 def test_a_worker_from_before_job_attribution_is_never_handed_the_job(env, no_spawn, nix, tmp_path):
@@ -425,7 +436,7 @@ def test_a_worker_from_before_job_attribution_is_never_handed_the_job(env, no_sp
                             f"echo '{{\"protocol\": 1}}' && exit 0\ntouch {ran}\nexit 1\n")
     job, events, head, _ = review(env)
     assert job["status"] == "done" and len(calls(env)) == 1 and not ran.exists()
-    assert "it speaks hand-off protocol 1, not 2" in events[1][1]
+    assert "it speaks hand-off protocol 1, not 2" in events[0][1]
 
 
 def test_a_workers_posts_carry_its_job(env, no_spawn, nix, monkeypatch):
@@ -511,3 +522,160 @@ def test_a_build_without_agent_bus_keeps_no_gc_root(env, nix, tmp_path):
     with pytest.raises(headbuild.Unusable, match="has no bin/agent-bus"):
         headbuild.build(snap_of(tmp_path / "snap", {"flake.nix": "{}"}), "d" * 40, 60, lambda: False)
     assert not (headbuild.cache_dir() / ("d" * 40)).is_symlink()
+
+
+# ------------------------------------------------------------ #188: said up front, and while it builds
+
+
+def requested(env, reviewers=("codex",), **head) -> tuple[dict, str]:
+    base, h = agent_bus_repo(env["repo"], changed(), **head)
+    claude = Service(env["bus"], "claude", env["bus"].register_session("claude"))
+    if len(reviewers) == 1:
+        return claude.request_review(reviewers[0], str(env["repo"]), base, h, change_id="PR-1"), h
+    return claude.request_review(None, str(env["repo"]), base, h, change_id="PR-1", reviewers=list(reviewers)), h
+
+
+@pytest.mark.parametrize("reviewers", [("codex",), ("codex", "antigravity")])
+@pytest.mark.parametrize("head, why", [
+    ({"head_db": DB_SOURCE.replace("blind INTEGER", "blinded INTEGER")},
+     "it changes the database schema or its migrations"),
+    ({"head_files": {headbuild.SELF_PATH: "import ast\n\nPROTOCOL = 3\n"}},
+     f"its {headbuild.SELF_PATH} sets hand-off protocol 3, the installed build's is {headbuild.PROTOCOL}"),
+    ({"head_files": {"flake.nix": None}}, "it has no flake.nix"),
+])
+def test_the_request_says_when_the_installed_build_will_run_it(env, no_spawn, head, why, reviewers):
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    res, h = requested(env, reviewers, **head)
+    assert res["build"].startswith(f"Expect the installed build to run this review: head {h[:12]}'s own build "
+                                   f"can't ({why}).")
+
+
+def test_the_request_says_the_heads_build_will_be_tried(env, no_spawn):
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    same = {"head_files": {headbuild.SELF_PATH: f"PROTOCOL = {headbuild.PROTOCOL}\n"}}
+    res, h = requested(env, **same)
+    assert res["build"].startswith(f"Head {h[:12]}'s own build will run this review once nix has built it")
+    assert "the installed build runs it instead" in res["build"]
+
+
+@pytest.mark.parametrize("key", [None, "self_hosted_prompts"])
+def test_the_request_says_nothing_about_builds_elsewhere(env, no_spawn, key):
+    if key:
+        write_config(env, **{key: [str(env["repo"])]})
+    assert "build" not in requested(env)[0]
+
+
+def test_the_request_says_when_builds_are_off(env, no_spawn):
+    write_config(env, self_hosted_reviews=[str(env["repo"])], self_hosted_build_timeout_s=0)
+    res, h = requested(env)
+    assert "head builds are off (self_hosted_build_timeout_s is 0)" in res["build"]
+
+
+def test_the_head_is_never_run_to_predict_its_build(env, no_spawn, tmp_path):
+    """Only literals are read: a PROTOCOL computed by code says nothing either way."""
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    ran = tmp_path / "ran"
+    res, h = requested(env, head_files={headbuild.SELF_PATH: f"import os\nPROTOCOL = os.system('touch {ran}')\n"})
+    assert res["build"].startswith(f"Head {h[:12]}'s own build will run") and not ran.exists()
+
+
+def test_wait_and_tail_show_the_heads_build(env, no_spawn, capsys):
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    res, h = requested(env)
+    bus, tid, jid = env["bus"], res["thread"]["id"], res["job"]["id"]
+    claude = Service(bus, "claude", bus.register_session("claude"))
+    assert "head_build" not in claude.progress(tid)
+    bus.add_event(tid, "head_build", f"building head {h[:12]} with nix", job_id=jid)
+    p = claude.progress(tid)
+    assert p["head_build"]["state"] == "building" and p["head_build"]["head"] == h[:12] and p["peers"] == {}
+    assert cli.main(["tail", tid, "--once", "--no-color"]) == 0
+    assert f"worker head_build: building head {h[:12]} with nix" in capsys.readouterr().out
+    bus.add_event(tid, "head_build", f"head {h[:12]}'s build ready after 3 s", job_id=jid)
+    assert claude.progress(tid)["head_build"]["state"] == "done"
+
+
+@pytest.mark.parametrize("source, want", [
+    ("PROTOCOL = 3\n", 3),
+    ("PROTOCOL = 3\nPROTOCOL: int = 2\n", None),  # codex-1: rebound, so it can't tell
+    ("PROTOCOL = 3\nPROTOCOL += 1\n", None),
+    ("PROTOCOL = '3'\n", None),
+    ("PROTOCOL = 1 + 2\n", None),
+    ("PROTOCOL[0] = 3\n", None),  # antigravity-4: not a binding of the name
+    ("(PROTOCOL,) = (3,)\n", None),
+    ("def f(:\n", None),
+])
+def test_the_heads_protocol_is_one_int_literal(source, want):
+    assert headbuild.protocol_of(source) == want
+
+
+@pytest.mark.parametrize("files", [
+    {headbuild.SELF_PATH: "PROTOCOL = 0x" + "f" * 20000 + "\n"},  # codex-2: too big to print
+    {headbuild.DB_PATH: "X = " + "(" * 5000 + "1" + ")" * 5000 + "\n"},  # codex-2: too deep to parse
+])
+def test_a_head_it_cant_parse_never_fails_the_request(env, no_spawn, files):
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    res, h = requested(env, head_files=files)
+    assert res["job"]["status"] == "queued"
+    assert res["build"].startswith(f"Head {h[:12]}'s own build will run") or "Expect the installed" in res["build"]
+
+
+def test_a_head_with_none_of_agent_bus_files_has_no_flake(env, no_spawn):
+    """codex-3: a commit without any of the files is a known miss, not an unreadable tree."""
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    gone = {"flake.nix": None, headbuild.DB_PATH: None, "src/agent_bus/prompts.py": None}
+    res, h = requested(env, head_files=gone)
+    assert "own build can't (it has no flake.nix)" in res["build"]
+    assert headbuild.predict(str(env["repo"]), "e" * 40) is None  # a commit git doesn't have: can't tell
+
+
+def test_the_note_reads_the_config_the_worker_will(env, no_spawn):
+    """codex-5: a config edited after this server started counts."""
+    claude = Service(env["bus"], "claude", env["bus"].register_session("claude"))
+    write_config(env, self_hosted_reviews=[str(env["repo"])], self_hosted_build_timeout_s=0)
+    base, h = agent_bus_repo(env["repo"], changed())
+    claude.config = cfg.Config.load()
+    write_config(env, self_hosted_build_timeout_s=600)
+    res = claude.request_review("codex", str(env["repo"]), base, h, change_id="PR-1")
+    assert res["build"].startswith(f"Head {h[:12]}'s own build will run")
+
+
+def test_a_wait_for_another_build_of_the_head_shows_as_building(env, nix, tmp_path):
+    """codex-6: building() is called before the per-head lock, so a second worker waiting on
+    the first's build shows it too."""
+    import fcntl
+    snap = snap_of(tmp_path / "snap", {"flake.nix": "{}"})
+    headbuild.cache_dir().mkdir(parents=True, exist_ok=True)
+    held = os.open(headbuild.cache_dir() / f".{'a' * 40}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    said = []
+    with pytest.raises(headbuild.Unusable, match="another build of it took over"):
+        headbuild.build(snap, "a" * 40, 0.6, lambda: False, building=lambda: said.append(1))
+    os.close(held)
+    assert said == [1]
+
+
+def test_a_blob_this_partial_clone_lacks_is_unknown_not_missing(env, no_spawn, tmp_path):
+    """antigravity-1: in a blobless clone the head's files aren't fetched; that says nothing."""
+    base, h = agent_bus_repo(env["repo"], changed())
+    subprocess.run(["git", "config", "uploadpack.allowFilter", "true"], cwd=env["repo"], check=True)
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", "--no-checkout", "--filter=blob:none", f"file://{env['repo']}", str(clone)],
+                   check=True, capture_output=True)
+    assert headbuild.predict(str(clone), h) is None
+    assert headbuild._head_files(str(clone), h) == {"flake.nix": "", headbuild.SELF_PATH: None}
+    assert headbuild._head_files(str(env["repo"]), h)["flake.nix"] == ""
+
+
+def test_a_missing_flake_counts_even_when_db_py_cant_be_read(env, no_spawn):
+    """codex-9: each file on its own: an over-size db.py doesn't hide a missing flake.nix."""
+    write_config(env, self_hosted_reviews=[str(env["repo"])])
+    big = DB_SOURCE + "#" * (headbuild.MAX_BYTES + 1) + "\n"
+    res, h = requested(env, head_db=big, head_files={"flake.nix": None})
+    assert "own build can't (it has no flake.nix)" in res["build"]
+
+
+def test_the_prediction_has_one_short_deadline(env, monkeypatch):
+    """codex-4: past PREDICT_TIMEOUT_S in all, it can't tell."""
+    base, h = agent_bus_repo(env["repo"], changed())
+    monkeypatch.setattr(headbuild, "PREDICT_TIMEOUT_S", 0)
+    assert headbuild._head_files(str(env["repo"]), h) is None

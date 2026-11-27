@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 from . import config as cfg
-from . import autoresume, evidence as ev, provenance, quota
+from . import autoresume, evidence as ev, headbuild, provenance, quota
 from . import rex, unvotable, worker
 from .db import (HUMAN, SYSTEM, Bus, BusError, deadline_message, is_quiet, over_followup_limit, overdue,
                  past_deadline, review_progress, wrap_peer)
@@ -352,8 +352,12 @@ class Service:
         # Not the job's error: it can quote what a peer was about to post.
         info: dict[str, Any] = {"status": job["status"], "elapsed_s": round(now - job["created_at"])}
         turns: dict[str, dict] = {}
+        builds: list[dict] = []
         for e in self.bus.events(thread, job_id=job["id"]):
             agent, kind = e["agent"], e["kind"]
+            if kind == "head_build" and not agent:
+                builds.append(e)  # the worker's: a start, then its end (#188)
+                continue
             if not agent:
                 continue
             if kind == "turn_start":
@@ -385,7 +389,15 @@ class Service:
                    "tool_calls": turn["tool_calls"]}
             out.update({k: turn[k] for k in ("failed_tool_calls", "api_retries", "errors") if turn[k]})
             peers[agent] = out
-        return {"job": info, "peers": peers}
+        res: dict[str, Any] = {"job": info, "peers": peers}
+        if builds:
+            # The head's nix build (#188): while it runs, no peer has a turn to show.
+            start, end = builds[0], builds[1] if len(builds) > 1 else None
+            state = "done" if end else "building" if job["status"] in ("queued", "running") else "stopped"
+            head = (self.bus.thread(thread)["refs"] or {}).get("head_commit_id") or ""
+            res["head_build"] = {"head": head[:12], "state": state,
+                                 "elapsed_s": round((end["created_at"] if end else now) - start["created_at"])}
+        return res
 
     def history(self, thread: str, limit: int = 200) -> dict:
         self.bus.expire_discussion(thread)
@@ -761,8 +773,35 @@ class Service:
             worker.launch(self.bus, job_row["id"])
         job = self._job_info(job_row, created)
         t = self.bus.thread(t["id"])
-        return {"thread": thread_summary(t), "job": job, "review": self.bus.review_standings(t["id"]),
-                "next": f"Call wait(\"{t['id']}\") for the verdict, or check inbox later."}
+        return self._build_note({"thread": thread_summary(t), "job": job,
+                                 "review": self.bus.review_standings(t["id"]),
+                                 "next": f"Call wait(\"{t['id']}\") for the verdict, or check inbox later."}, t)
+
+    def _build_note(self, res: dict, t: dict) -> dict:
+        """``res`` with a ``build`` note, for a pass in a ``self_hosted_reviews`` repo (#188):
+        which build will run it, as far as the head's files tell (read from git, never run)."""
+        refs = t["refs"] or {}
+        if (res.get("job") or {}).get("status") != "queued":
+            return res
+        try:
+            conf = cfg.Config.load()  # what the worker will read, not this server's copy from its start
+        except Exception:  # noqa: BLE001 - the worker reports a broken config itself
+            return res
+        if not conf.self_hosted_review(refs["repo"]):
+            return res
+        h = refs["head_commit_id"][:12]
+        if not conf.head_builds(refs["repo"]):
+            why = "head builds are off (self_hosted_build_timeout_s is 0)"
+        else:
+            why = headbuild.predict(refs["repo"], refs["head_commit_id"])
+        if why:
+            res["build"] = (f"Expect the installed build to run this review: head {h}'s own build can't ({why}). "
+                            "The worker checks again when the pass starts.")
+        else:
+            res["build"] = (f"Head {h}'s own build will run this review once nix has built it (minutes when it "
+                            "isn't cached; wait's progress shows the build). If the build or its checks fail, "
+                            "the installed build runs it instead, and a `prompts` event says why.")
+        return res
 
     @staticmethod
     def _no_followup_evidence(t: dict, evidence: list | None) -> None:
@@ -1145,7 +1184,7 @@ class Service:
             nxt = (f"Call wait(\"{t['id']}\"): {t['refs']['reviewer']} reviews first; each approval hands the "
                    "head to the next reviewer, and a request for changes waits for "
                    + ("the author's next head (or finish_review)." if t["refs"].get("review_only") else "your fix."))
-        return {"thread": thread_summary(t), "job": job, "review": st, "next": nxt}
+        return self._build_note({"thread": thread_summary(t), "job": job, "review": st, "next": nxt}, t)
 
     def _fresh_reviews(self, order: list[str], repo_path: str, request: list, settings: dict,
                        focus: str | None, goal: str, change_id: str | None,
@@ -1332,9 +1371,9 @@ class Service:
         if created:
             worker.launch(self.bus, job_row["id"])
         t = self.bus.thread(t["id"])
-        return {"thread": thread_summary(t), "job": self._job_info(job_row, created),
-                "review": self.bus.review_standings(t["id"]),
-                "next": f"Call wait(\"{t['id']}\") for the verdict, or check inbox later."}
+        return self._build_note({"thread": thread_summary(t), "job": self._job_info(job_row, created),
+                                 "review": self.bus.review_standings(t["id"]),
+                                 "next": f"Call wait(\"{t['id']}\") for the verdict, or check inbox later."}, t)
 
     def _initiator_retry(self, t: dict, reviewer: str, request: list,
                          active: dict | None) -> tuple[dict, bool] | None:

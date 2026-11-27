@@ -1191,13 +1191,29 @@ class Worker:
             return self.installed_build(refs["head_commit_id"], "head builds are off (self_hosted_build_timeout_s is 0)")
         head = refs["head_commit_id"]
         snap = self.pin_snapshot(t, refs)
+        started: list[float] = []
+
+        def building() -> None:
+            # A head_build event pair (#188): wait's progress shows the build while it runs.
+            started.append(time.monotonic())
+            self.event("head_build", f"building head {head[:12]} with nix")
+
+        def built(how: str) -> None:
+            if started:
+                self.event("head_build", f"head {head[:12]}'s build {how} after "
+                                         f"{round(time.monotonic() - started[0])} s")
+
         try:
             headbuild.check(snap)
             headbuild.child_env()  # the installed command it needs, before any build
             limit = min(self.config.self_hosted_build_timeout_s, self.deadline_left())
-            out, self._build_hold = headbuild.build(
-                snap, head, limit, self.cancelled,
-                building=lambda: self.event("prompts", f"building head {head[:12]} with nix"))
+            try:
+                out, self._build_hold = headbuild.build(snap, head, limit, self.cancelled, building=building)
+            except (headbuild.Unusable, OSError):
+                self.check()  # cancelled or taken over: no end event; progress says stopped
+                built("failed")
+                raise
+            built("ready")
             headbuild.check_package(out)
             headbuild.probe(out)
         except (headbuild.Unusable, OSError) as e:
