@@ -52,7 +52,7 @@ def test_the_verdict_format_and_preambles_are_never_taken_from_the_head():
     (("from . import provenance", "from . import provenance as REVIEW"), "REVIEW is missing"),
     (("def render_message", "from .db import *\n\n\ndef render_message"), "a wildcard import"),  # antigravity-2
     (("def render_message", "X = (SNAPSHOT := 'x')\n\n\ndef render_message"), "SNAPSHOT is missing"),
-    (("def render_message(m: dict)", "def render_message(m: dict, _=(USAGES := ''))"), "USAGES is missing"),
+    (("def render_message(m: dict, ", "def render_message(m: dict, _=(USAGES := ''), "), "USAGES is missing"),
     (("def render_message", "def f():\n    global TIME_LIMIT\n\n\ndef render_message"), "TIME_LIMIT is missing"),
     (("def render_message", "class SEVERITY:\n    pass\n\n\ndef render_message"), "SEVERITY is missing"),
     # Any top-level statement other than imports, assignments and definitions (codex-4).

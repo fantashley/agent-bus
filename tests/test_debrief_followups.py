@@ -80,7 +80,8 @@ def test_render_caps_hits_per_name_and_in_all():
     assert text.index("beta:") < text.index("gamma (") < text.index("alpha (")
     # Out of room, a changed definition shrinks to one line rather than going.
     short = usages.render(u, limit=200, per_symbol=3)
-    assert "alpha (12 hits in 12 files): not listed, for space; most in f0.py (1)" in short
+    # It says where its hits are, by line (#186).
+    assert "alpha (12 hits in 12 files): not listed, for space; at f0.py:0; f1.py:1; f2.py:2" in short
     assert "alpha x" not in short and "beta: no uses at head" in short and "gamma (1 hit" in short
 
 
@@ -111,7 +112,23 @@ def test_generic_names_cannot_crowd_out_the_specific_ones():
     # Tight on room: the mentioned and enclosing names go first; the definitions stay.
     tight = usages.render(u, limit=400)
     assert "drop_usage (" in tight and "pin_snapshot (" in tight
-    assert "not shown: " in tight and "thread" in tight.split("not shown: ")[1]
+    # The names left out still say where they are (#186), in the order room was handed out,
+    # without their descriptions.
+    rest = tight.split("No room for these, so where each appears:\n")[1]
+    assert rest.index("ensure (57 hits in 57 files): at src/e0.py:0; src/e1.py:1;") \
+        < rest.index("thread (1567 hits in 30 files): most in src/m0.py (53), src/m1.py (53)") \
+        and "not shown" not in rest
+    # A very common name gives a few lines to start at too (codex-3).
+    assert "and 24 more files; first at src/m0.py:0,30,60," in rest
+    tighter = usages.render(u, limit=200)
+    assert "\nneeds_you (1 hit in 1 file): at src/cli.py:10\n" in tighter.split("No room for these")[1]
+    assert len(tight) < 400 + usages.LEFT_CHARS + 200
+    # Past LEFT_CHARS too, a name is only named.
+    many = {f"name_{i}": [(f"src/n{j}.py", j, "x") for j in range(30)] for i in range(40)}
+    text = usages.render(usages.Usages(names=list(many), hits=many, terms={n: T(n, "mentioned") for n in many}),
+                         limit=300)
+    assert "No room for these" in text and "more names not shown: name_" in text
+    assert len(text) < 300 + usages.LEFT_CHARS + 600
 
 
 def test_a_name_short_of_room_shows_a_sample_of_its_hits_outside_tests_first():

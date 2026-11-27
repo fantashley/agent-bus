@@ -57,7 +57,7 @@ def test_test_only_names_render_after_production_ones_and_say_so():
     assert text.index("unread (5 hits") < text.index("helper_one (")
     # With room for one, the production name keeps it, though it has more hits.
     tight = usages.render(u, limit=len(usages.render(usages.Usages(names=["unread"], hits=hits))))
-    assert "unread (5 hits" in tight and "not shown: helper_one" in tight
+    assert "unread (5 hits" in tight and "No room for these, so where each appears:\nhelper_one (1 hit in 1 file): at tests/t.py:1" in tight
     # Every test-only term, whatever its kind, gets room after production reads and mentions
     # (codex-1, antigravity-1), even with fewer hits and an earlier place in the list.
     one = [("tests/t.py", 1, "x")]
@@ -71,7 +71,8 @@ def test_test_only_names_render_after_production_ones_and_say_so():
         u = usages.Usages(names=list(hits), hits=hits, terms=terms)
         room = len(usages.render(both)) - len(usages.OPEN) - len(usages.CLOSE) - 1  # the two blocks, each with its newline
         tight = usages.render(u, limit=room)
-        assert "runtime_flag (" in tight and "mentioned_one (" in tight and "not shown: test_side" in tight, kind
+        assert "runtime_flag (" in tight and "mentioned_one (" in tight and "\ntest_side (1 hit in 1 file): at" in tight, kind
+        assert tight.index("No room for these") < tight.index("\ntest_side ("), kind
     u = usages.Usages(names=["def helper_method"], hits={"def helper_method": one},
                       terms={"def helper_method": T("def helper_method", "override", test=True)})
     assert "changed method helper_method: overrides, or the one it overrides, only in tests;" in usages.render(u)

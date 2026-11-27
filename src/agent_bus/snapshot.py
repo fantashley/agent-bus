@@ -163,6 +163,37 @@ def _tree(repo: str, env: dict, head: str) -> list[_Entry] | None:
     return entries
 
 
+def tracked(repo: str) -> Snapshot | None:
+    """The files of ``repo``'s checked-out commit, for a discussion's file list (#186): git's
+    HEAD, or in a jj repository the working-copy commit as jj last recorded it (read with
+    --ignore-working-copy, so nothing is snapshotted).  A Snapshot with no ``path`` that only
+    carries ``files`` (sorted, at most MAX_FILES), for listing(); None if they can't be read."""
+    env = _git_env(repo)
+    if env is None:
+        return None
+    head = _git(repo, env, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    rev = head.decode().strip() if head else ""
+    if cfg.vcs(repo) == "jj":
+        try:
+            out = subprocess.run(["jj", "log", "--ignore-working-copy", "--no-graph", "--color=never", "-r", "@",
+                                  "-T", "commit_id"], cwd=repo, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if out.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", out.stdout.strip()):
+            return None
+        rev = out.stdout.strip()
+    if not rev:
+        return None
+    # Names only: ls-tree's -l reads every blob's size, which in a partial clone would fetch
+    # the missing ones; lazy fetching is off too, for this optional list (codex-2).
+    out = _git(repo, {**env, "GIT_NO_LAZY_FETCH": "1"}, "ls-tree", "-r", "-z", "--name-only", "--full-tree",
+               f"{rev}^{{tree}}")
+    if out is None:
+        return None
+    files = sorted(os.fsdecode(p) for p in out.split(b"\0") if p)[:MAX_FILES]
+    return Snapshot(head=rev, files=files, tree_files=len(files))
+
+
 def _safe(path: str) -> bool:
     parts = path.split("/")
     return bool(path) and not path.startswith("/") and all(
@@ -532,7 +563,7 @@ def delta(repo: str, old_head: str, snap: Snapshot, baseline: bool) -> tuple[lis
     if len(added) + len(removed) > MAX_DELTA:
         return None
     # The earlier prompt listed the old copy whole only if its list fit (see listing).
-    esc = lambda p: p.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")  # noqa: E731
+    esc = escaped  # as listing() shows them (antigravity-1)
     old = (have - set(added)) | set(removed)
     if len("\n".join(map(esc, old))) > MAX_LISTING:  # measured as listing() shows them
         return None
@@ -544,22 +575,27 @@ def complete(snap: Snapshot) -> bool:
     whose list fits MAX_LISTING (listing() shows it whole).  A baseline for delta()."""
     if not snap.path or snap.mode != "full":
         return False
-    esc = (p.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace") for p in snap.files)
-    return len("\n".join(esc)) <= MAX_LISTING
+    return len("\n".join(escaped(p) for p in snap.files)) <= MAX_LISTING
 
 
 # How much of a snapshot's file list a prompt shows a peer that can't list directories.
 MAX_LISTING = 12_000
 
 
+def escaped(path: str) -> str:
+    """``path`` as a prompt lists it: a non-UTF-8 byte and a control character escaped."""
+    path = path.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+    return re.sub(r"[\x00-\x1f\x7f]", lambda m: f"\\x{ord(m.group()):02x}", path)
+
+
 def listing(snap: Snapshot, limit: int = MAX_LISTING) -> str:
     """The snapshot's files, one per line, capped at ``limit`` characters.  When they don't
     all fit, the changed files' directories and the top level come first, then a count of
     files per directory, so a peer that can't list directories still sees the layout."""
-    # A non-UTF-8 name (kept as surrogates for the filesystem) is shown escaped.
-    files = [p.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace") for p in snap.files]
-    snap = Snapshot(head=snap.head, files=files, changed=[
-        p.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace") for p in snap.changed])
+    # A non-UTF-8 name (kept as surrogates for the filesystem) is shown escaped, and so is a line
+    # break or other control character in one, so each name stays on its own line (#186, codex-1).
+    files = [escaped(p) for p in snap.files]
+    snap = Snapshot(head=snap.head, files=files, changed=[escaped(p) for p in snap.changed])
     text = "\n".join(files)
     if len(text) <= limit:
         return text
