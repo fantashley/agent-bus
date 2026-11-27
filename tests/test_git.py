@@ -235,10 +235,13 @@ def test_missing_previous_head_on_followup_needs_human(env, no_spawn, unchecked_
     head2 = sh("git", "rev-parse", "HEAD")
     sh("git", "reflog", "expire", "--expire=now", "--all")
     sh("git", "gc", "-q", "--prune=now")
+    seen = len([e for e in bus.events(tid) if e["kind"] in ("snapshot", "prompts")])
     claude.request_review("codex", str(repo), base, head2, prev_head_commit_id=head1)
     Worker(bus, bus.jobs(tid)[-1]["id"]).run()
     body = missing_report(env, tid)
     assert f"the previous head commit {head1}" in body and head2 not in body
+    # #183: the interdiff's previous head is checked before this pass makes a snapshot.
+    assert len([e for e in bus.events(tid) if e["kind"] in ("snapshot", "prompts")]) == seen
     # A follow-up's refs already moved to head2, so only `resume` retries this pass.
     assert "ask the human user to run `agent-bus resume" in body and "request this review again" not in body
     assert "without prev_head_commit_id" in body

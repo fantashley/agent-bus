@@ -131,7 +131,8 @@ request_review(
   request the same head again (`prev_head_commit_id` = `head_commit_id`). Once per reviewer per
   head.
 - **Budget.** Each new head, new base or pushback is a follow-up; the soft budget (3 by
-  default) counts those that drew a new blocking finding from a re-review, and the hard limit
+  default) counts those that drew a new blocking finding from any reviewer (a later reviewer's
+  first look included), and the hard limit
   (twice the budget) counts them all. Past the budget, defer non-blocking work. Low findings on
   an approval are fine to leave: open an issue for any worth doing. On `REVIEW_LIMIT_REACHED`,
   `THREAD_LIMIT_REACHED`, a `needs_human` thread, or a reviewer that is out of usage or keeps

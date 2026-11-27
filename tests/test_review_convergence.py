@@ -392,6 +392,8 @@ def test_two_reviewer_follow_ups_count_through_new_heads_and_a_pushback(env, no_
     # A new head goes to antigravity, which has never reviewed: still the author's follow-up.
     assert new_head("two\n")["thread"]["follow_ups"] == 1
     assert f"Review follow-up requested from antigravity at head {heads[-1][:12]}." in status_bodies(bus, tid)
+    # Its first pass, at that follow-up's head, asked for changes: a new blocker (#183, as on #197).
+    assert thread_summary(bus.thread(tid))["new_blocker_follow_ups"] == 1
     assert new_head("three\n")["thread"]["follow_ups"] == 2
     assert not thread_summary(bus.thread(tid))["budget_warning"]
     assert "run long" not in claude.inbox(thread=tid)["messages"][-1]["body"]
@@ -399,10 +401,11 @@ def test_two_reviewer_follow_ups_count_through_new_heads_and_a_pushback(env, no_
     assert new_head("four\n", approve="antigravity")["thread"]["follow_ups"] == 3
     t = bus.thread(tid)
     assert t["round"] == 5 and thread_summary(t)["follow_ups"] == 3
-    # Only codex's re-reviews drew new blockers (#140): antigravity's first look at head two
-    # and its confirming approval don't count against the soft budget.
-    assert thread_summary(t)["new_blocker_follow_ups"] == 2
-    assert not thread_summary(t)["budget_warning"] and t["status"] == "open"
+    # Every follow-up so far drew a new blocker: codex's re-reviews and antigravity's first look
+    # at head two (#183: a later reviewer's first pass counts too, #140 left it out).  Its
+    # confirming approval doesn't, but codex's blocker at the same follow-up does.
+    assert thread_summary(t)["new_blocker_follow_ups"] == 3
+    assert thread_summary(t)["budget_warning"] and t["status"] == "open"
 
     # A pushback counts too.
     claude.send("PUSHBACK: intended", thread=tid)
@@ -411,10 +414,10 @@ def test_two_reviewer_follow_ups_count_through_new_heads_and_a_pushback(env, no_
     assert res["thread"]["follow_ups"] == 4 and bus.jobs(tid)[-1]["params"]["mode"] == "pushback"
     run_job(bus, tid)
     t = bus.thread(tid)
-    assert thread_summary(t)["new_blocker_follow_ups"] == 3 and thread_summary(t)["budget_warning"]
+    assert thread_summary(t)["new_blocker_follow_ups"] == 4 and thread_summary(t)["budget_warning"]
     notice = claude.inbox(thread=tid)["messages"][-1]["body"]
     assert notice.startswith("codex requested changes")
-    assert "run long: 4 follow-up requests, 3 of them drawing new blocking findings" in notice
+    assert "run long: 4 follow-up requests, 4 of them drawing new blocking findings" in notice
     assert f"Review pushback requested from codex at head {heads[-1][:12]}." in status_bodies(bus, tid)
     assert bus.review_standings(tid)["approved"] == ["antigravity"]
 

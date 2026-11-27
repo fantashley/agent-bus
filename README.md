@@ -352,9 +352,12 @@ head of the review pass that followed it, and the `testing` note with its head.
 
 A review counts your follow-up requests (each new base or head, and each pushback; reviewer
 handoffs, retries and repeats are free). The soft budget, `review_followup_budget` in the config
-(default 3), counts only the follow-ups that drew a new blocking finding from a reviewer's
-re-review (#140): one whose passes only confirm fixes, or find an earlier finding still blocking,
-is free, and so is a reviewer's first look at a later head. Once the budget is spent, or one
+(default 3), counts only the follow-ups that drew a new blocking finding (#140): a high or
+medium finding, not pre-existing, without an id from that reviewer's earlier verdicts, raised by
+any pass at that follow-up, a reviewer's first look at a later head included (#183: with several
+reviewers, a later reviewer first sees the change only after another one asked for changes). One
+whose passes only confirm fixes, approve, or find an earlier finding still blocking is free, and
+the first request never counts. Once the budget is spent, or one
 follow-up before the hard limit below, reviewers are told the review has run long (the severity
 and follow-up rules don't change, so a real bug still blocks; only nice-to-haves are deferred) and your
 changes-requested notices suggest deferring non-blocking findings to a follow-up issue. A review

@@ -201,8 +201,10 @@ and why it fell back; check that line before judging how a change reads to a rev
 `head_commit_id`). The reviewer that asked for changes reconsiders, once per reviewer per head.
 
 **Follow-up budget.** Each new head, new base or pushback is a follow-up. The soft budget
-(`review_followup_budget`, default 3) counts only those where a reviewer's re-review raised a
-new blocking finding; follow-ups that only confirm fixes are free. Once it's spent (or one
+(`review_followup_budget`, default 3) counts only those where a reviewer raised a new
+blocking finding (one with no id from its own earlier verdicts), a reviewer's first look at a
+later head included; follow-ups that only confirm fixes, approve or find an earlier finding still
+blocking are free. Once it's spent (or one
 follow-up before the hard limit), reviewers are told the review has run long: severity rules
 don't change (a real bug still blocks), but nice-to-haves go in as low; defer non-blocking work
 to a follow-up issue. A review still asking for changes after twice the

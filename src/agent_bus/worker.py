@@ -1445,16 +1445,29 @@ class Worker:
         it, or returns None after parking the thread for the human user.  The pass's
         prompts are the head's, in a repository that opts in (#138)."""
         t = self.thread()
+        refs = t["refs"] or {}
+        reviewer = refs["reviewer"]
+        followup = bool(refs.get("prev_head_commit_id"))
+        mine = self.bus.last_verdict(self.thread_id, reviewer)
+        frm = self.interdiff_from(refs, reviewer, mine) if followup else None
+        # The author pushes back on this reviewer's findings without changing the code (#71).
+        # (A retry of that pass too: the request marked its round.)
+        pushback = followup and refs.get("pushback_round") == t["round"]
+        inter = None
         try:
             # The whole change's diff first: a missing base or head is reported before any
             # snapshot is made or prompts event recorded (#179, antigravity-4).
-            full = self.review_diff(t["refs"] or {}, interdiff=False)
+            full = self.review_diff(refs, interdiff=False)
+            # So is a missing previous head, when this pass sends the interdiff from it on the
+            # same base (#183).  (A rebase-aware interdiff falls back to the full diff instead.)
+            if frm is not None and not pushback and mine["data"]["base_commit_id"] == refs["base_commit_id"]:
+                inter = self.review_diff({**refs, "prev_head_commit_id": frm}, interdiff=True)
         except MissingRevision as e:
             self.report_missing(t, e)
             raise
-        snap = self.pin_snapshot(t, t["refs"] or {})
-        with headprompts.using(self.head_prompts(t["refs"] or {}, snap)):
-            return self._review_round(mode, snap, full)
+        snap = self.pin_snapshot(t, refs)
+        with headprompts.using(self.head_prompts(refs, snap)):
+            return self._review_round(mode, snap, full, (mine, frm, pushback, inter))
 
     def head_prompts(self, refs: dict, snap: snapshot.Snapshot) -> headprompts.Active | None:
         """The pass's review prompt text from the head (#138): None unless the repo opts in
@@ -1481,13 +1494,14 @@ class Worker:
         return headprompts.Active(texts, built + prompts.PROMPTS_HEAD.format(head=head, path=headprompts.PATH,
                                                                              build=build_label()))
 
-    def _review_round(self, mode: str, snap: snapshot.Snapshot, full: tuple[str, str]) -> dict | None:
+    def _review_round(self, mode: str, snap: snapshot.Snapshot, full: tuple[str, str],
+                      plan: tuple[dict | None, str | None, bool, tuple[str, str] | None]) -> dict | None:
         t = self.thread()
         refs = t["refs"] or {}
         reviewer = refs["reviewer"]
         followup = bool(refs.get("prev_head_commit_id"))
-        mine = self.bus.last_verdict(self.thread_id, reviewer)
-        frm = self.interdiff_from(refs, reviewer, mine) if followup else None
+        # Worked out by review_round, with the same-base interdiff, before the snapshot (#183).
+        mine, frm, pushback, same_base_inter = plan
         resume = frm is not None
         # The previous head the prompts name is one this reviewer gave a verdict on (#69): the
         # interdiff's start, or for the full diff its last verdict's head, if it has one.
@@ -1504,36 +1518,29 @@ class Worker:
         # interdiff, or the full diff in a fresh session if that can't be trusted (#75).
         old_base = mine["data"]["base_commit_id"] if resume else None
         rebased = resume and old_base != refs["base_commit_id"]
-        # The author pushes back on this reviewer's findings without changing the code (#71).
-        # (A retry of that pass too: the request marked its round.)
-        pushback = followup and refs.get("pushback_round") == t["round"]
         rebase_note = fallback = fallback_why = range_note = ""
-        try:
-            full_diff, full_heading = full  # computed by review_round, before the snapshot
-            if pushback:
-                pass  # no interdiff: the head is the one it last reviewed
-            elif rebased:
-                inter, why = self.rebase_interdiff(refs, old_base, full_diff)
-                # The commits, old against new: with the interdiff, or with the full diff it falls
-                # back to (#135).
-                range_note = self.range_diff_note(refs, old_base)
-                if inter is None:
-                    resume, fallback, fallback_why = False, f" Full diff: the base changed and {why}.", why
-                else:
-                    inter_heading = (f"Interdiff since the head you last reviewed (rebase-aware: old head "
-                                     f"{refs['prev_head_commit_id'][:12]} on old base {old_base[:12]}, replayed "
-                                     f"onto base {refs['base_commit_id'][:12]}, against new head "
-                                     f"{refs['head_commit_id'][:12]}):")
-                    rebase_note = prompts.REBASE_NOTE.format(old_base=old_base, base=refs["base_commit_id"])
-                    if not inter:
-                        inter = "(empty diff: a pure rebase)"
-                        rebase_note += prompts.PURE_REBASE
-                    rebase_note += range_note
-            elif resume:
-                inter, inter_heading = self.review_diff(refs, interdiff=True)
-        except MissingRevision as e:
-            self.report_missing(t, e)
-            raise
+        full_diff, full_heading = full  # computed by review_round, before the snapshot
+        if pushback:
+            pass  # no interdiff: the head is the one it last reviewed
+        elif rebased:
+            inter, why = self.rebase_interdiff(refs, old_base, full_diff)
+            # The commits, old against new: with the interdiff, or with the full diff it falls
+            # back to (#135).
+            range_note = self.range_diff_note(refs, old_base)
+            if inter is None:
+                resume, fallback, fallback_why = False, f" Full diff: the base changed and {why}.", why
+            else:
+                inter_heading = (f"Interdiff since the head you last reviewed (rebase-aware: old head "
+                                 f"{refs['prev_head_commit_id'][:12]} on old base {old_base[:12]}, replayed "
+                                 f"onto base {refs['base_commit_id'][:12]}, against new head "
+                                 f"{refs['head_commit_id'][:12]}):")
+                rebase_note = prompts.REBASE_NOTE.format(old_base=old_base, base=refs["base_commit_id"])
+                if not inter:
+                    inter = "(empty diff: a pure rebase)"
+                    rebase_note += prompts.PURE_REBASE
+                rebase_note += range_note
+        elif resume:
+            inter, inter_heading = same_base_inter
         # Large new data files, readable in full in the copy, are summarized (#161).  Only now,
         # so the interdiff checks above compared the diffs as git gave them (codex-3).
         full_diff = self.summarize_data(full_diff, snap)
@@ -1679,9 +1686,12 @@ class Worker:
             # A refusal to run it at all (PEER_SETUP, #100) would only be refused again.
             self.park_failed_pass(reviewer, why, retryable=not gave.refused)
             return None
-        # A re-review's blocking finding with no earlier id is new (#140): the follow-up that
-        # drew it counts against the soft budget; one that only confirmed fixes doesn't.
-        new_blocker = mine is not None and any(f["id"] not in prior and blocks(f) for f in verdict["findings"])
+        # A blocking finding with no earlier id of this reviewer's is new (#140): the follow-up
+        # that drew it counts against the soft budget; one that only confirmed fixes doesn't.
+        # A reviewer's first look at a later head counts too (#183): with several reviewers it
+        # comes only after another reviewer's request for changes, and its blockers cost the
+        # author a round all the same.  (The first request is no follow-up: it never counts.)
+        new_blocker = any(f["id"] not in prior and blocks(f) for f in verdict["findings"])
         number_findings(reviewer, verdict["findings"], earlier)
         lines = [f"Verdict: {verdict['verdict']}", "", verdict["summary"]]
         if verdict["earlier"]:

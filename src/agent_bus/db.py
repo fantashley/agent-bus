@@ -1646,9 +1646,10 @@ def review_progress(t: dict) -> dict:
     requests, and whether it is parked for the human because it ran past its limit.  Reviews
     report this instead of a discussion's ``max_rounds``.
 
-    The soft budget counts only the follow-ups that drew a new blocking finding from a
-    reviewer's re-review (#140): one whose passes only confirmed fixes (or found an earlier
-    finding still blocking) is free.  Its warning also comes one follow-up before the hard
+    The soft budget counts only the follow-ups that drew a new blocking finding (#140): one
+    without an earlier id of that reviewer's, a reviewer's first look at a later head included
+    (#183).  One whose passes only confirmed fixes (or found an earlier finding still
+    blocking) is free, and the first request is no follow-up.  Its warning also comes one follow-up before the hard
     limit, which still counts every follow-up, so a review never parks unannounced."""
     refs = t["refs"] or {}
     budget = int(refs.get("followup_budget") or DEFAULT_FOLLOWUP_BUDGET)
