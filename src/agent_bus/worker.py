@@ -105,6 +105,17 @@ class MissingRevision(Exception):
         self.missing = missing  # (label, commit id), e.g. ("head", "0123...")
         super().__init__(f"{repo} has no commit " + ", ".join(f"{sha} ({label})" for label, sha in missing))
 
+    @staticmethod
+    def failed(job: dict | None) -> bool:
+        """Whether ``job`` failed on a missing commit: report_missing's park, by this build or an
+        older one (its error is the message above since #50), the one a repeat of a
+        several-reviewer review's first request may retry (#199)."""
+        return bool(job) and job["status"] == "failed" and bool(
+            _MISSING_ERROR.search(job.get("error") or ""))
+
+
+_MISSING_ERROR = re.compile(r" has no commit [0-9a-f]+ \((base|head|previous head)\)")
+
 
 def clause(text: str) -> str:
     """``text`` without its closing full stop, to sit inside a sentence that adds its own (#100)."""
@@ -407,6 +418,19 @@ class Worker:
         self.after_park(plan)
         return True
 
+    def park_human_only(self, reviewer: str, quota: bool) -> None:
+        """Park a review pass that only the human user's resume reruns: ``reviewer`` out of
+        usage (with its automatic resume planned), or its CLI's output format or config
+        broken.  The park and the job's end commit together, as in park_failed_pass (#199):
+        a worker that died in between would leave a failed job, which a repeat of the
+        review's first request would retry past the human."""
+        plan = None
+        with self.fenced():
+            if self.bus.transition(self.thread_id, "needs_human") and quota:
+                plan = self.plan_auto_resume(self.thread(), [reviewer])
+            self.bus.finish_job(self.job["id"], "done", self.owner)
+        self.after_park(plan)
+
     def plan_auto_resume(self, t: dict, agents: list[str]) -> dict | None:
         """Inside the parking transaction: plan the automatic resume and say so."""
         plan = autoresume.schedule(self.bus, self.config, t, agents)
@@ -445,8 +469,9 @@ class Worker:
         server may hold from before the repo was removed; this worker loaded its own.  Checked
         once, before anything reads the repo (the review diff, snapshot and usage search too),
         for every job kind.  Like a missing commit (report_missing), a review or discussion is
-        parked as needs_human and the job failed in one transaction, so the same request can be
-        made again once the repo is allow-listed; a debrief leaves the thread as it was."""
+        parked as needs_human and the job failed in one transaction, for the human user's
+        resume once the repo is allow-listed (a several-reviewer review's repeated request
+        doesn't retry it, #199); a debrief leaves the thread as it was."""
         t = self.thread()
         if not t["repo"] or self.config.repo_allowed(t["repo"]):
             return False
@@ -1332,15 +1357,7 @@ class Worker:
                 refs = self.thread()["refs"]  # the pass may have counted a new blocker (#140)
                 state = self.bus.review_standings(self.thread_id)["reviewers"][reviewer]["state"]
             mode = "first"
-            if state == "approved":
-                nxt = self.bus.next_reviewer(self.thread_id, after=reviewer)
-                if nxt is not None and refs.get("review_only") and \
-                        self.bus.review_standings(self.thread_id)["reviewers"][nxt]["state"] == "changes_requested":
-                    nxt = self.bus.next_unreviewed(self.thread_id, after=reviewer)
-            elif refs.get("review_only"):
-                nxt = self.bus.next_unreviewed(self.thread_id, after=reviewer)
-            else:
-                nxt = None
+            nxt = handoff(self.bus, self.thread_id, reviewer, state, bool(refs.get("review_only")))
             if nxt is None:
                 break
             mine = self.bus.review_standings(self.thread_id)["reviewers"][nxt]
@@ -1632,10 +1649,7 @@ class Worker:
         if res.quota or res.format_changed or res.config_error:
             # Head, reviewer and session stay pinned for `agent-bus resume` after the reset
             # (or once the adapter handles the new format).  A reset can resume it by itself.
-            if res.quota:
-                self.park_on_quota(reviewer)
-            else:
-                self.finish_thread("needs_human")
+            self.park_human_only(reviewer, res.quota)
             return None
         if res.ok or res.text:
             self.mark_delivered(reviewer, upto)
@@ -1656,10 +1670,7 @@ class Worker:
                    "you use one).")
             res2 = self.turn(reviewer, ask, fresh_prompt=fresh + "\n\n" + ask, read_dirs=read_dirs, purpose="repair")
             if res2.quota or res2.format_changed or res2.config_error:
-                if res2.quota:
-                    self.park_on_quota(reviewer)
-                else:
-                    self.finish_thread("needs_human")
+                self.park_human_only(reviewer, res2.quota)
                 return None
             first = verdict
             raw2 = extract_reply(res2.text, "summary") if res2.text else None
@@ -1758,6 +1769,9 @@ class Worker:
         # A later head on a several-reviewer thread is a follow-up of the thread, even for a
         # reviewer seeing it for the first time: only `agent-bus resume` retries it.
         followup = bool(refs.get("prev_head_commit_id") or refs.get("revision")) or len(refs.get("heads") or []) > 1
+        # So is a several-reviewer first request whose repeat would be refused (#199): the
+        # retry of the reviewer due is used, or there is no room left for its verdict.
+        followup = followup or bool(refs.get("reviewers") and dead_pass_retry(self.bus, self.thread())[1])
         what = "; ".join(f"the {label} commit {sha}" for label, sha in e.missing)
         retry = (f"then ask the human user to run `agent-bus resume {t['id']}` to retry this pass. "
                  "If a commit id is wrong, start a fresh review with the right ids and without "
@@ -2851,6 +2865,38 @@ def retry_offer(t: dict) -> dict | None:
             (reviewer, f"{reviewer}@{revision_key(refs)}", t.get("round")) or offer["key"] in (refs.get("retried") or []):
         return None
     return offer
+
+
+def handoff(bus, thread_id: str, reviewer: str, state: str, review_only: bool) -> str | None:
+    """Who a several-reviewer round hands the head to once ``reviewer`` has a verdict on it
+    (``state``): after an approval, the next reviewer without one (on a review-only review,
+    #148, without any verdict); after a request for changes, None (the author's turn),
+    except on a review-only review, where every reviewer gives a verdict on each head."""
+    if state == "approved":
+        nxt = bus.next_reviewer(thread_id, after=reviewer)
+        if nxt is not None and review_only and \
+                bus.review_standings(thread_id)["reviewers"][nxt]["state"] == "changes_requested":
+            nxt = bus.next_unreviewed(thread_id, after=reviewer)
+        return nxt
+    return bus.next_unreviewed(thread_id, after=reviewer) if review_only else None
+
+
+def dead_pass_retry(bus, t: dict) -> tuple[str, str | None]:
+    """The reviewer a repeat of a several-reviewer review's first request retries after its
+    worker died (#199), and why that repeat would be refused, or None.  The thread's current
+    reviewer until it has a verdict on this revision, else the one it hands the head to
+    (itself if none: the retry then only reports the request for changes).  Refused once
+    that reviewer's retry at this base..head is used (by this repeat or #154's retry call),
+    or with no room left on the thread for its verdict."""
+    refs = t.get("refs") or {}
+    reviewer = refs["reviewer"]
+    state = bus.review_standings(t["id"])["reviewers"][reviewer]["state"]
+    if state in ("approved", "changes_requested"):  # it died after this reviewer's verdict
+        reviewer = handoff(bus, t["id"], reviewer, state, bool(refs.get("review_only"))) or reviewer
+    why = (f"{reviewer}'s one retry at this head is used"
+           if f"{reviewer}@{revision_key(refs)}" in (refs.get("retried") or []) else
+           "the thread has no room left for its verdict" if t.get("limit_reached") else None)
+    return reviewer, why
 
 
 def retry_key(t: dict, reviewer: str | None) -> str:

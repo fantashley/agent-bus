@@ -170,6 +170,12 @@ the human user (`stop: ...`), and any request that would rerun that head (a foll
 pushback) is refused with `REVIEW_FAILED` until they resume it. No retry is offered when the
 thread has no room left for the verdict (its message cap): only a resume raises that. A turn agent-bus refused to start (`PEER_SETUP`), a reviewer out of usage,
 a CLI format change or a missing commit get no such offer: those need the human user.
+The same retry covers a several-reviewer review whose worker died mid-pass on its first request
+(#199): repeating that request reruns the pass once, charged to the reviewer due to run it (an
+approval already posted stands, and a thread with every approval in is just resolved). Once that
+reviewer's retry at this base..head is used, with no room left for its verdict, or on a thread
+parked for the human user (other than by a missing commit, whose notice offers the repeat), the
+repeat is refused with `REVIEW_FAILED` and only `agent-bus resume` retries it.
 
 **Reviewing someone else's change** (#145). `request_review(..., review_only=true)` marks a
 review whose initiator isn't the change's author, say a colleague's pull request. A request for
