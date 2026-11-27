@@ -1383,13 +1383,21 @@ class Bus:
             (thread_id, job_id, agent, kind, text[:2000], _now(), purpose))
 
     def events(self, thread_id: str, after_id: int = 0, agent: str | None = None,
-               job_id: str | None = None) -> list[dict]:
+               job_id: str | None = None, kind: str | None = None, upto_id: int | None = None) -> list[dict]:
         sql, args = "SELECT * FROM events WHERE thread_id=? AND id>?", [thread_id, after_id]
+        if upto_id is not None:
+            sql, args = sql + " AND id<=?", [*args, upto_id]
         if agent:
             sql, args = sql + " AND agent=?", [*args, agent]
         if job_id:
             sql, args = sql + " AND job_id=?", [*args, job_id]
+        if kind:
+            sql, args = sql + " AND kind=?", [*args, kind]
         return [dict(r) for r in self._all(sql + " ORDER BY id", *args)]
+
+    def last_event_id(self, thread_id: str) -> int:
+        row = self._one("SELECT MAX(id) AS id FROM events WHERE thread_id=?", thread_id)
+        return (row and row["id"]) or 0
 
     def peer_busy(self, thread_id: str, agent: str) -> bool:
         row = self._one("SELECT kind FROM events WHERE thread_id=? AND agent=? AND kind IN ('turn_start','turn_end')"
@@ -1691,3 +1699,25 @@ def format_progress(t: dict) -> str:
 
 def new_uuid() -> str:
     return str(uuid.uuid4())
+
+
+def head_build_attempt(events: list[dict]) -> dict | None:
+    """The latest attempt at building the head (#188) among a job's events: {"head",
+    "owner", "start", "end"} (end None until it ends), or None.  Paired per attempt (#198):
+    a worker's head_build event records its phase, head and lease owner in its purpose
+    ("start <head> <owner>", "end <head> <owner>"), so a start opens an attempt and only the
+    same worker's end closes it.  An older build's events have no purpose: their text says
+    which is which ("building head <head12> with nix" starts one), with no owner."""
+    attempt = None
+    for e in events:
+        if e["kind"] != "head_build" or e["agent"]:
+            continue  # only the worker's own
+        phase, head, owner = ((e.get("purpose") or "").split(" ") + ["", "", ""])[:3]
+        if not phase:
+            m = re.match(r"(building )?head ([0-9a-f]+)", e["text"] or "")
+            phase, head = ("start" if m and m[1] else "end"), (m[2] if m else "")
+        if phase == "start":
+            attempt = {"head": head, "owner": owner or None, "start": e["created_at"], "end": None}
+        elif attempt and attempt["end"] is None and (owner or None) == attempt["owner"]:
+            attempt["end"] = e["created_at"]
+    return attempt

@@ -221,8 +221,38 @@ def test_a_missing_commit_park_is_recognised_by_its_jobs_error(env, no_spawn, mo
     bus.claim_job(jid, "old", lease_s=60)
     bus.transition(tid, "needs_human")
     assert bus.finish_job(jid, "failed", "old", str(worker.MissingRevision(str(env["repo"]), [("head", head)])))
-    assert worker.MissingRevision.failed(bus.job(jid))
+    refs = bus.thread(tid)["refs"]
+    assert worker.MissingRevision.failed(bus.job(jid), refs)
     assert request()["job"]["status"] == "queued"
     assert bus.thread(tid)["status"] == "open" and bus.thread(tid)["refs"]["retried"] == [f"codex@{base}..{head}"]
-    assert not worker.MissingRevision.failed({"status": "failed", "error": "worker died (lease expired or never claimed)"})
-    assert not worker.MissingRevision.failed({"status": "failed", "error": "RuntimeError('could not compute diff')"})
+    assert not worker.MissingRevision.failed({"status": "failed", "error": "worker died (lease expired or never claimed)"}, refs)
+    assert not worker.MissingRevision.failed({"status": "failed", "error": "RuntimeError('could not compute diff')"}, refs)
+
+
+def test_a_missing_commit_park_matches_the_whole_error():
+    """#204: the error must be report_missing's, whole, for this thread's repo and pinned ids
+    (the format older builds wrote too), not merely contain one."""
+    repo, base, head, old = "/src/my repo", "b" * 40, "c" * 40, "a" * 40
+    refs = {"repo": repo, "base_commit_id": base, "head_commit_id": head, "prev_head_commit_id": old,
+            "heads": [old, head]}
+    failed = lambda error, status="failed": worker.MissingRevision.failed({"status": status, "error": error}, refs)  # noqa: E731
+    for missing in ([("head", head)], [("base", base)], [("base", base), ("head", head)],
+                    [("previous head", old)], [("previous head", old), ("head", head)]):
+        assert failed(str(worker.MissingRevision(repo, missing)))
+    # An older build's error, written the same way since #50.
+    assert failed(f"{repo} has no commit {base} (base), {head} (head)")
+    assert not failed(str(worker.MissingRevision(repo, [("head", head)])), status="done")
+    for error in (
+            "REPO_NOT_ALLOWED: /x has no commit a (head) is not allowed",  # codex-4's example
+            f"REPO_NOT_ALLOWED: {repo} has no commit {head} (head) is not allowed",
+            f"x{repo} has no commit {head} (head)",
+            f"/other has no commit {head} (head)",
+            f"{repo} has no commit {head} (head) and more",
+            f"{repo} has no commit {base} (head)",  # not the pinned head
+            f"{repo} has no commit {'d' * 40} (previous head)",  # never a head of this thread
+            f"{repo} has no commit {head} (head), {base} (base)",  # not report_missing's order
+            f"{repo} has no commit ",
+            ""):
+        assert not failed(error), error
+    assert not worker.MissingRevision.failed(None, refs)
+    assert not worker.MissingRevision.failed({"status": "failed", "error": f"None has no commit {head} (head)"}, {})
