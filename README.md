@@ -265,7 +265,7 @@ same things in parallel:
   (The older `self_hosted_prompts` only takes the head's prompt text, below, and never runs
   the head's code: move a repo to `self_hosted_reviews` for its own build.) A review
   job there runs from the head's own build: the installed worker claims the job, builds the
-  head's flake from its read-only snapshot (`nix build path:<snapshot>#default`, cached per
+  head's flake from its read-only snapshot (`nix build path:<snapshot>#default^out`, cached per
   head commit under `$XDG_STATE_HOME/agent-bus/head-builds`, where the out-links are GC
   roots dropped after 7 days unused), and runs that build's `agent-bus run-job` for the job,
   under its own lease. So the head's prompts, usage search, snapshots, adapters and verdict

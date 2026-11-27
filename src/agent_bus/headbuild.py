@@ -3,7 +3,7 @@
 In a repository listed in ``self_hosted_reviews`` (never the older, prompts-only
 ``self_hosted_prompts``), the installed worker claims a review job as usual and then hands
 the whole job to the agent-bus build of the head under review: it builds the head's flake from its pinned read-only snapshot
-(``nix build path:<snapshot>#default``, cached per head commit), checks that build speaks this
+(``nix build path:<snapshot>#default^out``, cached per head commit), checks that build speaks this
 hand-off protocol, and runs its ``agent-bus run-job`` as a child under the installed worker's
 lease.  The installed worker stays the supervisor: it keeps the lease alive, stays the job's
 recorded process (so ``agent-bus cancel`` reaches both), and reports a child that dies.
@@ -13,13 +13,16 @@ different schema or migrations (compared with ``ast``, never run), the installed
 the job.  So it does when the head can't be built in time, isn't an agent-bus flake, or its
 build doesn't speak ``PROTOCOL``, each with the reason in the prompt and in a ``prompts`` event.
 
-The hand-off contract (protocol 1), between the installed build and the head's:
-- ``<head build>/bin/agent-bus self-host-info`` prints ``{"protocol": 1}`` without opening the
+The hand-off contract (protocol 2), between the installed build and the head's:
+- ``<head build>/bin/agent-bus self-host-info`` prints ``{"protocol": 2}`` without opening the
   database or the config.
 - ``<head build>/bin/agent-bus run-job <job>`` with ``AGENT_BUS_HANDOFF="<job> <owner> <head>"``
   in its environment runs that job under the supervisor's lease ``owner`` instead of claiming
   it, opens the database without creating or migrating anything, and leaves a job it fails
   on an unexpected error running, for the supervisor to report.
+- Every message it posts for the job carries ``job:<job>`` as its session (#185): the
+  supervisor counts only those, and the job's ``turn_start`` events, as the head's worker
+  having started.  (Protocol 1's workers posted their notices unattributed.)
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ from typing import Callable
 
 from . import config as cfg
 
-PROTOCOL = 1
+PROTOCOL = 2
 ENV = "AGENT_BUS_HANDOFF"
 DB_PATH = "src/agent_bus/db.py"
 MAX_BYTES = 512 * 1024
@@ -214,12 +217,16 @@ def build(snap, head: str, timeout: float, cancelled: Callable[[], bool],
 
 def nix_build(nix: str, src: str, out_link: Path, timeout: float, cancelled: Callable[[], bool]) -> None:
     """``nix build`` the flake at ``src`` (never writing its lock file) to ``out_link``, in
-    its own process group, stopped on ``timeout`` or ``cancelled()``.  Raises Unusable."""
+    its own process group, stopped on ``timeout`` or ``cancelled()``.  Raises Unusable.
+
+    Only the package's ``out`` output (#185): one built with several outputs to install
+    (``meta.outputsToInstall``) would also get suffixed links (``out_link-dist``), GC roots
+    the cache's entry, refresh and prune know nothing about."""
     if timeout <= 0:
         raise Unusable("there was no time left to build it")
     with tempfile.TemporaryFile() as err:
         proc = subprocess.Popen([nix, "build", "--no-write-lock-file", "--no-update-lock-file",
-                                 "--out-link", str(out_link), f"path:{src}#default"],
+                                 "--out-link", str(out_link), f"path:{src}#default^out"],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
                                 start_new_session=True)
         end = time.monotonic() + timeout

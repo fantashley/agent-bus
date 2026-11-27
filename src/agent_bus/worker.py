@@ -376,7 +376,13 @@ class Worker:
             # A debrief's notices don't say why the thread is parked (`agent-bus threads`).
             kw["data"] = {**(kw.get("data") or {}), "debrief": True}
         with self.fenced():
-            return self.bus.post(self.thread_id, sender, body, **kw)
+            return self.bus_post(sender, body, **kw)
+
+    def bus_post(self, sender: str, body: str, **kw) -> dict:
+        """Post on the thread as this job (#185): its messages carry ``job:<id>`` as their
+        session, so what this job posted can be told apart from anyone else's note."""
+        kw.setdefault("session_id", f"job:{self.job['id']}")
+        return self.bus.post(self.thread_id, sender, body, **kw)
 
     def safe_post(self, sender: str, body: str, **kw) -> None:
         """Post, reporting (not raising) protocol rejections such as THREAD_LIMIT_REACHED."""
@@ -405,7 +411,7 @@ class Worker:
         """Inside the parking transaction: plan the automatic resume and say so."""
         plan = autoresume.schedule(self.bus, self.config, t, agents)
         if plan:
-            self.bus.post(self.thread_id, SYSTEM, autoresume.notice(plan, self.config), kind="status")
+            self.bus_post(SYSTEM, autoresume.notice(plan, self.config), kind="status")
         return plan
 
     def after_park(self, plan: dict | None) -> None:
@@ -451,7 +457,7 @@ class Worker:
                  f"Add it back, then run `agent-bus resume {self.thread_id}`; or `agent-bus cancel {self.thread_id}`")
         with self.fenced():
             if self.debriefing or self.bus.transition(self.thread_id, "needs_human"):
-                self.bus.post(self.thread_id, SYSTEM, f"{what} not started: {why}. No peer was run. {retry}.",
+                self.bus_post(SYSTEM, f"{what} not started: {why}. No peer was run. {retry}.",
                               kind="status", recipient=None if asker == HUMAN else asker,
                               data={"debrief": True} if self.debriefing else None)
             self.bus.finish_job(self.job["id"], "failed", self.owner, f"REPO_NOT_ALLOWED: {why}")
@@ -1240,12 +1246,11 @@ class Worker:
                 said = headbuild.last_line(f.read())
         except OSError:
             said = "no output"
-        # Its own turns and posts count (a review-request notice, a parking notice); a note
-        # from the author or the human meanwhile doesn't.
-        t = self.thread()
+        # Its own turns and posts count (a review-request notice, a parking notice); anyone
+        # else's note meanwhile doesn't, whoever sent it (#185): a worker's posts carry its job.
         started = any(e["kind"] == "turn_start" for e in self.bus.events(
             self.thread_id, after_id=upto_ev, job_id=self.job["id"])) or any(
-            m["id"] > upto_msg and m["sender"] not in (t["initiator"], HUMAN)
+            m["id"] > upto_msg and m["session_id"] == f"job:{self.job['id']}"
             for m in self.bus.history(self.thread_id)["messages"])
         if not started:
             return self.installed_build(head, f"its worker exited ({how}) before any turn: {said}")
@@ -1321,7 +1326,7 @@ class Worker:
         if st["complete"]:
             with self.fenced():
                 if self.bus.transition(self.thread_id, "resolved"):
-                    self.bus.post(self.thread_id, SYSTEM, f"Review complete: every required reviewer approved "
+                    self.bus_post(SYSTEM, f"Review complete: every required reviewer approved "
                                   f"head {head[:12]}.\n{board}", kind="status", recipient=to)
             return
         order = refs["reviewers"]
@@ -1370,7 +1375,7 @@ class Worker:
                        f"{self.thread_id}`" if offer else
                        "Run `agent-bus resume` to retry" + (" (the requester's one retry at this head is used)"
                                                            if used else ""))
-                self.bus.post(self.thread_id, SYSTEM, f"{reviewer} {why}. {how}.", kind="status",
+                self.bus_post(SYSTEM, f"{reviewer} {why}. {how}.", kind="status",
                               recipient=t["initiator"])
                 self.bus.finish_job(self.job["id"], "done", self.owner)
         except BusError as e:  # the post rejected (say THREAD_LIMIT_REACHED): park without it
@@ -1392,7 +1397,7 @@ class Worker:
             if self.bus.transition(self.thread_id, "needs_human"):
                 refs = now["refs"] or {}
                 self.bus.set_thread(self.thread_id, refs=json.dumps({**refs, "budget_parked": True}))
-                self.bus.post(self.thread_id, SYSTEM,
+                self.bus_post(SYSTEM,
                               f"{what}\nThis review still asks for changes after {p['follow_ups']} follow-up "
                               "requests, so it now waits for the human user: they can settle the open findings, "
                               f"or run `agent-bus resume {self.thread_id}` to allow more follow-ups.",
@@ -1658,7 +1663,7 @@ class Worker:
         # the saved one (see interdiff_from).  That turn's own id: a turn that failed without
         # reporting one leaves an older session saved, which never saw this pass.
         with self.fenced():  # the verdict and its budget charge (#140) commit together
-            self.bus.post(self.thread_id, reviewer, "\n".join(lines).strip(), kind="review_verdict",
+            self.bus_post(reviewer, "\n".join(lines).strip(), kind="review_verdict",
                           session_id=f"job:{self.job['id']}", recipient=t["initiator"],
                           data={"verdict": verdict["verdict"], "findings": verdict["findings"],
                                 "earlier": verdict["earlier"], "head_commit_id": refs["head_commit_id"],
@@ -1710,7 +1715,7 @@ class Worker:
                  "id is wrong, request a new review with the right one")
         with self.fenced():
             if self.bus.transition(self.thread_id, "needs_human"):
-                self.bus.post(self.thread_id, SYSTEM,
+                self.bus_post(SYSTEM,
                               f"Review not started: {e.repo} does not contain {what}. "
                               f"{t['refs']['reviewer']} was not run and no verdict was posted. Make the "
                               "commit available in that repository (push or fetch it; in a jj repo you may "
