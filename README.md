@@ -580,7 +580,9 @@ codex 0.171.0 and 0.172.0, and agy 1.5.13:
   and given room first. A changed Python file too long for one `read_file` call (over 40,000
   characters) also gets an outline: its definitions outside functions, a class's methods in
   parentheses, each with its first and last line (at most 8,000 characters in all; a file with
-  more definitions than fit gets as many as fit, and a count of the rest). In a discussion with a `repo`, agy's prompt
+  more definitions than fit gets as many as fit, and a count of the rest). A resumed follow-up
+  gets only what changed in an outline its session was given (`A..B +7` for a run of definitions that
+  moved 7 lines down), or just the file's name if nothing did. In a discussion with a `repo`, agy's prompt
   lists the repository's files at its checked-out commit (capped, like a review's snapshot list),
   and where the names in backticks in the question and evidence appear and are defined at that
   commit (not in a partial clone, where `git grep` would fetch missing blobs, nor in a jj repo

@@ -69,6 +69,9 @@ tail gives line numbers, not just files.
 too, so a reviewer sees whether the function still has other callers before calling it unused.
 A changed Python file too long to read whole gets an outline (its definitions with their line
 ranges), and a dotted mention ending in a keyword or builtin name (`cfg.from()`) is not searched.
+A resumed follow-up gets a file's outline again only where it changed since the outline that
+session was given: a file with the same outline is named once, and one whose definitions only
+moved or grew gets those changes (``A..B +7`` for a run that moved down 7 lines).
 #202: a discussion's peer gets the same search for the names in its question and evidence.
 """
 
@@ -76,6 +79,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import difflib
 import keyword
 import re
 import subprocess
@@ -1247,33 +1251,67 @@ def _render_defs(defs: dict[str, list[tuple[str, int]]], mark, cut: bool = False
 
 
 def outline(diff: str, scopes: dict[tuple[str, str], PyScopes],
-            readable: frozenset[str] | set[str] | None = None) -> tuple[list[str], list[str]]:
+            readable: frozenset[str] | set[str] | None = None,
+            seen: dict[str, tuple[str, Outline]] | None = None,
+            known: set[str] | None = None) -> tuple[list[str], list[str]]:
     """(The outline lines, the paths outlined) of ``diff``'s long changed Python files at the
     head (#196), outside test files first: ``path: name first-last (method first-last, ...);
     ...``, from their PyScopes (see pinned_python), for those over LONG_FILE characters.  At
     most OUTLINE_CHARS in all, the notices included: a file's definitions are listed in order
     while they fit, and how many more there are is said (codex-4 of #211); a file with no room
     for any is named at the end, while that fits.  ``readable``: as for render, a file outside
-    it is marked."""
+    it is marked.
+    ``seen``: for a resumed follow-up, the outline its session was given of a file (path ->
+    (the head it was given at, the outline)): a file whose outline is the same is only named,
+    with that head, and one whose outline changed gets only the changes (see _outline_delta)
+    when that is shorter and fits, else its outline as usual.  ``known`` gets the paths whose
+    whole outline at the head the reader now has (one cut short is left out)."""
     heading = ("Outline of the changed files too long to read whole (definitions outside functions, a class's "
                "methods in parentheses, first-last line):")
     tail = " [+99999 more definitions]"
-    paths = [f.new for f in _files(diff) if not f.deleted and ("+", f.new) in scopes]
-    lines, left, done = [], [], []
+    paths = [p for p in dict.fromkeys(f.new for f in _files(diff) if not f.deleted and ("+", f.new) in scopes)
+             if scopes["+", p].chars > LONG_FILE and scopes["+", p].outline]
+    paths.sort(key=is_test)
+    seen = seen or {}
+
+    def mark(p: str) -> str:
+        return _defuse(p) + (" (not in the copy)" if readable is not None and p not in readable else "")
+    # The files the reader has the same outline of, by the head it was given at: one line after
+    # the outlines, in the room they leave (codex-8), naming them or failing that counting them.
+    same: dict[str, list[str]] = {}
+    for p in paths:
+        if p in seen and seen[p][1] == scopes["+", p].outline:
+            same.setdefault(seen[p][0], []).append(p)
+    lines, left, done = [], [], [p for ps in same.values() for p in ps]
     used = len(heading) + 1
-    room = OUTLINE_CHARS - COMPACT  # the last line, for the files left out
-    for p in sorted(dict.fromkeys(paths), key=is_test):
-        sc = scopes["+", p]
-        if sc.chars <= LONG_FILE or not sc.outline:
+    # The last lines, for the files left out and the unchanged ones counted, share COMPACT.
+    room = OUTLINE_CHARS - COMPACT
+    legend = False
+    for p in paths:
+        if p in done:
             continue
+        sc = scopes["+", p]
         # The pieces in order, each with what goes before it: "; " between definitions, " ("
         # and ", " for a class's methods; a cut inside a class's list still closes it.
         pieces: list[tuple[str, str, bool]] = []  # (before, text, inside a class's list)
         for n, a, b, ms in sc.outline:
             pieces.append((("); " if pieces[-1][2] else "; ") if pieces else "", f"{n} {a}-{b}", False))
             pieces += [(" (" if i == 0 else ", ", f"{m} {c}-{d}", True) for i, (m, c, d) in enumerate(ms)]
-        mark = " (not in the copy)" if readable is not None and p not in readable else ""
-        line = f"  {_defuse(p)}{mark}: "
+        line = f"  {mark(p)}: "
+        whole = line + "".join(before + text for before, text, _ in pieces) + (")" if pieces[-1][2] else "")
+        change = _outline_delta(seen[p][1], sc.outline) if p in seen else ""
+        if change:
+            # Its cost with the legend, if this is the first such line; only when it is cheaper and fits.
+            short = f"  {mark(p)} (changes since your outline at head {seen[p][0][:12]}): {change}"
+            cost = len(short) + 1 + (0 if legend else len(OUTLINE_DELTA))
+            if cost < len(whole) + 1 and used + cost <= room:
+                lines.append(short)
+                done.append(p)
+                used += cost
+                legend = True
+                if known is not None:
+                    known.add(p)
+                continue
         taken = 0
         for before, text, inside in pieces:
             if used + len(line) + len(before) + len(text) + len(")") + len(tail) + 1 > room:
@@ -1287,15 +1325,110 @@ def outline(diff: str, scopes: dict[tuple[str, str], PyScopes],
             line += ")"
         if taken < len(pieces):
             line += f" [+{len(pieces) - taken} more definitions]"
+        elif known is not None:
+            known.add(p)
         lines.append(line)
         done.append(p)
         used += len(line) + 1
-    if not lines and not left:
+    if not lines and not left and not same:
         return [], []
+    footer = f"[... no room for the outline of {_plural(len(left), 'more file')}" if left else ""
+    if same:
+        note = "Same as the outline you were given, so not repeated: "
+        named = note + "; ".join(f"{', '.join(map(mark, ps))} (at head {h[:12]})" for h, ps in same.items())
+        counted = note + _plural(sum(map(len, same.values())), "file") + " (no room to name them)"
+        # Named if that fits with the shortest footer; counted always does (with it, within COMPACT).
+        line = named if used + len(named) + 1 + (len(footer) + 2 if left else 0) <= OUTLINE_CHARS else counted
+        lines.append(line)
+        used += len(line) + 1
     if left:
-        names = f": {', '.join(left)}" if len(", ".join(left)) <= COMPACT - 60 else ""
-        lines.append(f"[... no room for the outline of {_plural(len(left), 'more file')}{names}]")
-    return [heading, *lines], done
+        names = f": {', '.join(left)}"
+        lines.append(footer + (names if used + len(footer) + len(names) + 2 <= OUTLINE_CHARS else "") + "]")
+    if known is not None:
+        known.update(p for ps in same.values() for p in ps)
+    return [heading + (OUTLINE_DELTA if legend else ""), *lines], done
+
+
+
+# The legend for a file's line that lists only the changes since an earlier outline (#196).
+OUTLINE_DELTA = (" A line marked (changes since your outline at head X) lists only what changed from that"
+                 " outline: a definition with new lines as name first-last, (new) and (removed) ones, and A..B +N"
+                 " (or -N) for a run of definitions, A to B in that outline's order, that moved N lines down (or"
+                 " up); the others kept their lines.")
+
+
+Outline = tuple[tuple[str, int, int, tuple[tuple[str, int, int], ...]], ...]
+
+
+def _outline_delta(old: Outline, new: Outline) -> str:
+    """What changed from outline ``old`` to ``new`` (see PyScopes.outline), in file order: a
+    definition (a method as ``Class.name``) whose length changed or that is new as ``name
+    first-last`` (``(new)``), a removed one as ``name (removed)``, and a run of unchanged
+    definitions that all moved by N lines as ``first..last +N`` (one alone as ``name +N``).
+    "" when nothing changed, or when a name appears twice in either (a property's getter and
+    setter, overloads), which would make the change ambiguous (codex-2)."""
+    def flat(o: Outline) -> list[tuple[str, int, int]]:
+        out = []
+        for n, a, b, ms in o:
+            out.append((n, a, b))
+            out += [(f"{n}.{m}", c, d) for m, c, d in ms]
+        return out
+    was, now = flat(old), flat(new)
+    if len({n for n, _, _ in was}) < len(was) or len({n for n, _, _ in now}) < len(now):
+        return ""
+    parts: list[str] = []
+    run: list = []  # [first name, last name, shift]
+
+    def close() -> None:
+        if run:
+            sign = "+" if run[2] > 0 else ""
+            parts.append(f"{run[0]}{'..' + run[1] if run[1] != run[0] else ''} {sign}{run[2]}")
+            run.clear()
+    ops = difflib.SequenceMatcher(None, [n for n, _, _ in was], [n for n, _, _ in now], autojunk=False)
+    for op, i1, i2, j1, j2 in ops.get_opcodes():
+        if op != "equal":
+            close()
+            parts += [f"{n} (removed)" for n, _, _ in was[i1:i2]]
+            parts += [f"{n} {c}-{d} (new)" for n, c, d in now[j1:j2]]
+            continue
+        for (n, a, b), (_, c, d) in zip(was[i1:i2], now[j1:j2]):
+            if d - c != b - a:
+                close()
+                parts.append(f"{n} {c}-{d}")
+            elif c == a:
+                close()
+            elif run and run[2] == c - a:
+                run[1] = n
+            else:
+                close()
+                run.extend([n, n, c - a])
+    close()
+    return "; ".join(parts)
+
+
+def seen_outlines(repo: str, seen: dict[str, str], paths: list[str]) -> dict[str, tuple[str, Outline]]:
+    """(The head, the outline there) for each of ``paths`` at the head ``seen`` gives for it
+    (path -> head: where a resumed session was last given that file's whole outline); a file
+    that can't be read or parsed there is left out, and so gets its whole outline again."""
+    env = snapshot._git_env(repo) if seen else None
+    if env is None:
+        return {}
+    by_head: dict[str, list[str]] = {}
+    for p in paths:
+        if isinstance(seen.get(p), str):
+            by_head.setdefault(seen[p], []).append(p)
+    found: dict[str, tuple[str, Outline]] = {}
+    for head, ps in by_head.items():
+        read = _read_blobs(repo, env, head, ps, MAX_SOURCES)
+        if read is None:
+            continue
+        sizes, blobs, _ = read
+        for p in ps:
+            oid = sizes.get(p, ("", 0))[0]
+            sc = py_scopes(blobs[oid]) if oid in blobs else None
+            if sc is not None and sc.outline:
+                found[p] = (head, sc.outline)
+    return found
 
 
 def _lines_at(hits: list[tuple[str, int, str]], mark, limit: int = COMPACT, busiest: bool = False) -> str:
@@ -1338,12 +1471,16 @@ def _lines_at(hits: list[tuple[str, int, str]], mark, limit: int = COMPACT, busi
 
 def note(repo: str, head: str, diff: str, readable: frozenset[str] | set[str] | None = None,
          mention: list[str] | None = None, mentioned_as: str | None = None,
-         define: bool = False) -> tuple[str, bool, bool]:
+         define: bool = False, seen: dict[str, str] | None = None,
+         known: dict[str, str] | None = None) -> tuple[str, bool, bool]:
     """(rendered hits, whether git grep's output was cut, whether a hit is outside
     ``readable``) for ``diff`` at ``head``, and for the names in ``mention`` (see
     mentioned()), with the outline of its long changed files; ("", False, False) when there
     is nothing to show or git can't search.  ``mentioned_as``: see render.  ``define``: where
-    the mentioned names are defined too (a discussion's, which has no diff: codex-3 of #211)."""
+    the mentioned names are defined too (a discussion's, which has no diff: codex-3 of #211).
+    ``seen``: for a resumed follow-up, the head at which its session was last given each long
+    file's whole outline (path -> head), so only what changed since is shown (see outline);
+    ``known`` gets the paths whose whole outline at ``head`` this note gives, mapped to it."""
     # The Python files' scopes, from the full diff (a capped one keeps it as ``raw``), whose
     # hunks rebuild the old sides; the names come from the diff the reviewer sees.
     raw = getattr(diff, "raw", None) or diff
@@ -1361,7 +1498,10 @@ def note(repo: str, head: str, diff: str, readable: frozenset[str] | set[str] | 
                     called.append(last)
                     if q:
                         qualifier.setdefault(last, q.rsplit(".", 1)[-1])
-    outlined, outlined_paths = outline(raw, scopes, readable)
+    given = seen_outlines(repo, seen, [p for (side, p), sc in scopes.items()
+                                       if side == "+" and sc.chars > LONG_FILE]) if seen else None
+    full: set[str] = set()
+    outlined, outlined_paths = outline(raw, scopes, readable, seen=given, known=full)
     if not found and not called and not outlined:
         return "", False, False
     u = search(repo, head, [t.pattern for t in found])
@@ -1377,6 +1517,8 @@ def note(repo: str, head: str, diff: str, readable: frozenset[str] | set[str] | 
     shown = ([p for hs in u.hits.values() for p, _, _ in hs] + [p for ws in defs.values() for p, _ in ws[:DEF_HITS]]
              + outlined_paths)
     outside = readable is not None and any(p not in readable for p in shown)
+    if known is not None:  # only once the outline is sure to be shown
+        known.update(dict.fromkeys(full, head))
     return (render(u, readable=readable, defs=defs, defs_cut=defs_cut, outlined=outlined, mentioned_as=mentioned_as,
                    defs_title="Where these names are defined:" if define else None),
             u.truncated, outside)
