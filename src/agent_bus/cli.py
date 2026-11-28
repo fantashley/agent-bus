@@ -520,6 +520,7 @@ common tasks:
   agent-bus resume t-1a2b3c        unstick a thread (out of rounds, failed)
   agent-bus cancel t-1a2b3c t-4d5e6f
                                    dismiss threads you no longer need
+  agent-bus doctor                 check each agent's CLI and peer isolation
 
 Commands for wiring up clients (mcp, hook, setup-codex, setup-copilot, run-job,
 self-host-info, auto-resume, stream, rex-check) are left out of this list: see
@@ -663,6 +664,16 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--clear-quota", metavar="AGENT",
                    help="forget that AGENT is out of usage (e.g. after upgrading a plan); this lifts it for "
                         "every participant sharing its harness and account")
+
+    s = sub.add_parser("doctor", help="check each agent's CLI and the isolation its peer turns ask for",
+                       description="A passive local check: no agent turns, no network.  For each agent, the "
+                                   "executable a peer turn would run, its version, the adapter recipe, and the "
+                                   "write and MCP isolation flags the turn asks for, which stay inconclusive "
+                                   "until a live check shows them enforced.  Codex's MCP servers are read from "
+                                   "its config files.  Exits 1 when a check a turn would fail fails here.")
+    s.add_argument("--agent", help="only this agent")
+    s.add_argument("--repo", help="the checkout a turn would run in (default: the current directory)")
+    s.add_argument("--json", action="store_true")
 
     s = sub.add_parser("usage", help="how many tokens your agents' turns used, per agent and per thread")
     s.add_argument("--hours", type=float, default=24, help="how far back to look (default 24)")
@@ -830,6 +841,17 @@ def main(argv: list[str] | None = None) -> int:
 
 def _dispatch(bus: Bus, args: argparse.Namespace) -> int:
     from . import autoresume
+    if args.cmd == "doctor":  # passive: before the auto-resume sweep, which may start turns
+        from . import doctor
+        repo = os.path.abspath(os.path.expanduser(args.repo or os.getcwd()))
+        if not os.path.isdir(repo):
+            raise ValueError(f"--repo {args.repo}: not a directory")
+        rep = doctor.report(bus, cfg.Config.load(), repo, args.agent)
+        if args.json:
+            print(json.dumps(rep, indent=2))
+        else:
+            print(doctor.format_report(rep), end="")
+        return 1 if rep["failed"] else 0
     if args.cmd == "auto-resume":
         if args.wait:
             return autoresume.wait(bus)

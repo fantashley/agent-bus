@@ -7,7 +7,7 @@ import pytest
 from agent_bus import cli, procinfo
 from agent_bus.db import SYSTEM
 
-HUMAN_CMDS = ("ask", "threads", "history", "tail", "reply", "resume", "cancel", "finish", "debrief", "agents", "usage",
+HUMAN_CMDS = ("ask", "threads", "history", "tail", "reply", "resume", "cancel", "finish", "debrief", "agents", "usage", "doctor",
               "watch")
 PLUMBING = ("mcp", "hook", "setup-codex", "setup-copilot", "run-job", "auto-resume", "stream", "rex-check")
 

@@ -53,6 +53,7 @@ run are left out of it (see [Wiring up clients](#wiring-up-clients)).
 | `finish` | a review ended without every approval, its open findings recorded |
 | `debrief` | a finished thread's agents on what got in their way |
 | `agents`, `usage` | which agents you have, whether they're out of usage, and tokens used |
+| `doctor` | each agent's CLI, version and recipe, and the isolation its peer turns ask for (see When a CLI changes) |
 | `watch` | inside Rex: panes following a thread and each agent on it |
 
 ## Discussions
@@ -844,8 +845,60 @@ agreed on agent-bus thread t-35d692 (issue #32). Stage 1 is in place:
 - **Codex MCP listing:** a malformed entry in `codex mcp list --json` now fails the turn
   instead of being skipped. A server agent-bus can't name is one it can't switch off.
 
-Stage 2, still to come: `agent-bus doctor` / `doctor --live`, and a launch gate that refuses a
-peer whose isolation can't be shown for the installed version.
+### `agent-bus doctor`
+
+Stage 2A (agent-bus thread t-606fcd) is `agent-bus doctor`, a passive local check. It runs no
+agent turn, uses no account or quota, and contacts nothing: it doesn't run `codex mcp list` or
+`copilot mcp list`, and doesn't start the auto-resume sweep other commands run. Its only
+subprocess is a CLI's `--version`, when the cache `agents` and the turns share doesn't have it
+yet: run from `/` and not cached. For each agent it shows:
+
+- the executable a peer turn would launch (and what it resolves to), its version, and the
+  adapter recipe, e.g. `codex/5`;
+- the write and MCP isolation flags a peer turn asks for: Codex's read-only sandbox, Claude
+  Code's `dontAsk` permission mode with its tool list and `--strict-mcp-config`, Antigravity's
+  `--sandbox`, deny rules and tool-limited agent, Copilot's tool list and deny rules. Each is
+  reported as **inconclusive**: a flag being passed isn't evidence the CLI enforces it. Only a
+  controlled test with a positive control can show that, and it ships later with
+  `doctor --live` and the launch gate;
+- **known failed checks**, separately: a pre-launch check a peer turn would fail (a checkout's
+  Codex config that writes outside the sandbox, an Antigravity MCP server, a checkout's
+  Antigravity or Copilot hooks), or one that can't read the files it checks. Antigravity's
+  `allow_mcp`, and a `--mcp-config` in Claude's configured args, show as `waived` (unsafe);
+- **Codex's MCP servers, read from its config files**: `/etc/codex/config.toml`, the
+  participant's `CODEX_HOME/config.toml` (from its launch environment), each
+  `.codex/config.toml` from the repository root down to the checkout, and the configured
+  `-c mcp_servers.<name>.<enabled|command|url>` overrides (plugins and apps are off in peer
+  turns). A project file loads only if Codex trusts the project, which doctor can't tell, so its
+  servers are listed as conditional. Whether a server is enabled isn't modelled, so disabled
+  servers are listed too: a turn switches off by name each one Codex reports enabled, and doctor
+  flags a name it couldn't write. Whatever
+  doctor doesn't model is **unaccounted for**, never taken as absent: a file that can't be
+  parsed or isn't a regular file, a malformed entry, a server without exactly one transport, a
+  selected profile, `project_root_markers`, an override of `profile`, `profiles`, `features` or
+  another `mcp_servers` form, an override key that isn't a plain dotted path,
+  `/etc/codex/managed_config.toml` or `requirements.toml` (which outrank agent-bus's overrides),
+  macOS managed preferences, and Codex's workspace-managed cloud config, which it loads for a
+  ChatGPT sign-in and which can't be ruled out without reading the sign-in. Any of them makes
+  the inventory **incomplete** and not eligible for the future launch gate, so on Codex 0.172.0
+  it is always incomplete.
+
+A CLI found through the checkout (a relative command or `PATH` entry) isn't run for its
+version: doctor shows the cached one, or `unknown`. Names and paths from the checkout's files
+are printed with terminal control characters replaced.
+
+```sh
+agent-bus doctor                      # every agent, for a turn in the current directory
+agent-bus doctor --repo ~/src/project --agent codex
+agent-bus doctor --json
+```
+
+It exits 1 when a known check fails, else 0 (inconclusive isolation and an incomplete
+inventory don't fail it yet).
+
+Still to come, shipped together: `doctor --live` (a bounded start and resume turn per agent,
+with write and MCP sentinels and a positive control) and a launch gate that refuses a peer whose
+isolation can't be shown for the exact executable, recipe and launch configuration.
 
 ## Watching and stepping in
 
@@ -879,7 +932,7 @@ failure as each arrives.
 looks like an agent's shell: one of `AI_AGENT`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
 `CODEX_THREAD_ID`, `CODEX_SANDBOX` or `CODEX_CI` is set, or a parent process is `claude`,
 `codex`, `agy` or `copilot`. Agents use their MCP tools instead, which speak as themselves.
-Reading (`threads`, `history`, `tail`, `agents`, `usage`) stays open to them. A headless peer
+Reading (`threads`, `history`, `tail`, `agents`, `usage`, `doctor`) stays open to them. A headless peer
 (`AGENT_BUS_PEER` set) gets no CLI at all, reading included, since `history` would show it the
 blind round's proposals (`PEER_READ_ONLY`); only `mcp`, `hook`, `run-job` and `self-host-info` still start.
 

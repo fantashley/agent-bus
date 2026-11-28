@@ -212,6 +212,13 @@ class Adapter:
     def invocation(self, prompt: str, resume_id: str | None, cwd: str, add_dirs: list[str]) -> Invocation:
         raise NotImplementedError
 
+    def isolation_request(self) -> dict[str, list[str]]:
+        """The flags a headless turn passes to keep the CLI from writing ("write") and from
+        reaching MCP servers ("mcp"), as `agent-bus doctor` shows them (#32 stage 2A).  Each
+        entry is a piece of the turn's own argv; ``<name>`` stands for each server switched
+        off.  What was asked for, not evidence that the CLI enforces it."""
+        return {"write": [], "mcp": []}
+
     def parse_line(self, obj: dict, st: StreamState, emit: Emit) -> None:
         raise NotImplementedError
 
@@ -468,40 +475,48 @@ def cli_version(bus, agent: str, command: str, cwd: str | None = None) -> str:
         found = settled()
         if found is not None:
             return found
-        version = "unknown"
-        try:
-            # errors="replace": a stray undecodable byte (say, a wrapper's diagnostic on
-            # stderr) must not stop the turn this probe runs ahead of.  Its own session, so
-            # a timeout kills the whole group: a grandchild still holding the pipes (a shim
-            # launching the real binary) can't keep this probe, and the lock, waiting (#52).
-            proc = subprocess.Popen([launch, "--version"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, errors="replace", stdin=subprocess.DEVNULL, start_new_session=True,
-                                    env={**os.environ, "AGENT_BUS_PEER": "version-probe"})
-        except OSError:
-            proc = None
-        if proc is not None:
-            with proc:
-                try:
-                    stdout, stderr = proc.communicate(timeout=VERSION_PROBE_TIMEOUT_S)
-                except BaseException as e:  # a timeout, a pipe error, or an interrupt
-                    # SIGKILL straight away: the wrapper may already be gone, so waiting on
-                    # it (as _killpg does) wouldn't escalate for a descendant ignoring SIGTERM.
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    if not isinstance(e, (subprocess.TimeoutExpired, OSError)):
-                        raise
-                    if isinstance(e, subprocess.TimeoutExpired):
-                        bus.set_cli_version_timeout(key, agent, launch, time.time() + VERSION_TIMEOUT_COOLDOWN_S)
-                        return "unknown"
-                    stdout = stderr = ""
-            text = stdout if (stdout or "").strip() else stderr
-            line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
-            if proc.returncode == 0 and line:
-                version = "".join(ch for ch in line if ch.isprintable())[:80]
+        version = probe_version(launch, cwd)
+        if version is None:
+            bus.set_cli_version_timeout(key, agent, launch, time.time() + VERSION_TIMEOUT_COOLDOWN_S)
+            return "unknown"
         bus.set_cli_version(key, agent, launch, version)
         return version
+
+
+def probe_version(launch: str, cwd: str | None = None) -> str | None:
+    """Run ``launch --version`` once: its first non-empty line, "unknown" when it fails or
+    says nothing, None when it timed out.  Nothing is cached here."""
+    version = "unknown"
+    try:
+        # errors="replace": a stray undecodable byte (say, a wrapper's diagnostic on
+        # stderr) must not stop the turn this probe runs ahead of.  Its own session, so
+        # a timeout kills the whole group: a grandchild still holding the pipes (a shim
+        # launching the real binary) can't keep this probe, and the lock, waiting (#52).
+        proc = subprocess.Popen([launch, "--version"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, errors="replace", stdin=subprocess.DEVNULL, start_new_session=True,
+                                env={**os.environ, "AGENT_BUS_PEER": "version-probe"})
+    except OSError:
+        return version
+    with proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=VERSION_PROBE_TIMEOUT_S)
+        except BaseException as e:  # a timeout, a pipe error, or an interrupt
+            # SIGKILL straight away: the wrapper may already be gone, so waiting on
+            # it (as _killpg does) wouldn't escalate for a descendant ignoring SIGTERM.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if not isinstance(e, (subprocess.TimeoutExpired, OSError)):
+                raise
+            if isinstance(e, subprocess.TimeoutExpired):
+                return None
+            stdout = stderr = ""
+    text = stdout if (stdout or "").strip() else stderr
+    line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
+    if proc.returncode == 0 and line:
+        version = "".join(ch for ch in line if ch.isprintable())[:80]
+    return version
 
 
 # How long _killpg gives a stopped turn's process group to exit after SIGTERM.
@@ -863,7 +878,7 @@ class ClaudeAdapter(Adapter):
         # system prompt asks for a plan file and ExitPlanMode, which a headless reply can't
         # follow; dontAsk adds no instructions (Claude Code 2.1.331, live probes 2026-11-24: the
         # same five tools declared, Write "No such tool available", a resumed turn works; #110).
-        tools = ",".join(t for t in self.allowed_tools if self.web_search or t not in self.web_tool_names)
+        tools = self.tool_list()
         # --setting-sources user: the checkout's .claude/settings.json and settings.local.json
         # don't load.  -p skips the trust dialog, so their hooks ran in a peer turn, and so did
         # their apiKeyHelper, and their env could point the CLI at another API endpoint;
@@ -889,6 +904,15 @@ class ClaudeAdapter(Adapter):
         # only setting sources (one could load the checkout's settings again).
         argv += _strip_flags(self.extra_args(), {"--tools", "--settings", "--permission-mode", "--setting-sources"})
         return Invocation(argv=argv, stdin=self.headless + prompt, external_id=sid)
+
+    def tool_list(self) -> str:
+        return ",".join(t for t in self.allowed_tools if self.web_search or t not in self.web_tool_names)
+
+    def isolation_request(self):
+        tools = self.tool_list()
+        return {"write": ["--permission-mode dontAsk", f"--tools {tools}", f"--allowedTools {tools}",
+                          "--setting-sources user"],
+                "mcp": ["--strict-mcp-config"]}
 
     def flag_settings(self) -> dict:
         """Settings passed with --settings, which outrank the user's own (the project's don't load)
@@ -1339,6 +1363,13 @@ class CodexAdapter(Adapter):
                                   else None, w.get("window_minutes"), w.get("resets_at")))
         return [{**w, "observed_at": seen} for w in out if w] or None
 
+    def isolation_request(self):
+        mcp_features = ("apps", "plugins")  # each brings MCP servers of its own
+        return {"write": ["--ignore-rules", '-c sandbox_mode="read-only"', '-c approval_policy="never"',
+                          *(f"-c features.{f}=false" for f in CODEX_FEATURES_OFF if f not in mcp_features)],
+                "mcp": ["-c mcp_servers.<name>.enabled=false",
+                        *(f"-c features.{f}=false" for f in CODEX_FEATURES_OFF if f in mcp_features)]}
+
     def before_run(self, st, resume_id):
         path = codex_rollout(resume_id, self.home) if resume_id else None
         if path:
@@ -1603,12 +1634,33 @@ class AntigravityAdapter(Adapter):
                 servers = (json.loads(text).get("mcpServers") or {}) if text else {}  # agy leaves it empty
             except (OSError, json.JSONDecodeError, AttributeError) as e:
                 raise PeerSetupError(f"can't read {f} to check Antigravity's MCP servers: {e}") from e
+            if not isinstance(servers, dict):
+                raise PeerSetupError(f"{f} has an `mcpServers` that isn't an object, so agent-bus can't check "
+                                     "Antigravity's MCP servers")
             live += [n for n, spec in servers.items()
                      if n != "agent-bus" and not (isinstance(spec, dict) and spec.get("disabled"))]
         if live:
             raise PeerSetupError(
                 f"Antigravity has MCP servers configured ({', '.join(sorted(live))}) that a headless peer "
                 "can't be isolated from. Remove them, or set peers.antigravity.allow_mcp = true to accept that.")
+
+    def workspace_dirs(self, cwd: str, add_dirs: list[str] = ()) -> list[str]:
+        """The turn's workspace directories: its own, the added ones, and any in the configured
+        args.  A relative one there is relative to the turn's directory, where agy runs, not
+        the worker's."""
+        configured = [os.path.join(cwd, d) for d in _agy_flag_values(self.extra_args(), {"--add-dir", "-add-dir"})]
+        return [cwd, *add_dirs, *configured]
+
+    def peer_agent_name(self) -> str:
+        return f"agent-bus-peer-{'web' if self.web_search else 'noweb'}"
+
+    def deny_settings(self) -> str:
+        return json.dumps({"permissions": {"deny": list(self.deny_rules)}})
+
+    def isolation_request(self):
+        # No MCP switch: agy has none per session, so check_isolation refuses the turn instead.
+        return {"write": ["--sandbox", f"--settings {self.deny_settings()}", f"--agent {self.peer_agent_name()}"],
+                "mcp": []}
 
     def peer_agent(self) -> tuple[str, str]:
         """(name, directory) of the custom agent a headless turn runs as: with only
@@ -1618,7 +1670,7 @@ class AntigravityAdapter(Adapter):
         repo's .agents doesn't win over it (live probe, agy 1.5.13), and an unknown --agent
         name fails the turn ("unknown agent") rather than falling back to the default."""
         tools = list(self.agent_tools) + (list(self.web_tool_names) if self.web_search else [])
-        name = f"agent-bus-peer-{'web' if self.web_search else 'noweb'}"
+        name = self.peer_agent_name()
         base = cfg.state_dir() / "antigravity-agent"
         agents = base / ".agents" / "agents"
         agents.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1635,10 +1687,7 @@ class AntigravityAdapter(Adapter):
 
     def invocation(self, prompt, resume_id, cwd, add_dirs):
         self.check_isolation()
-        # A directory in the configured args is a workspace directory too: a relative one is
-        # relative to the turn's directory, where agy runs, not the worker's.
-        configured = [os.path.join(cwd, d) for d in _agy_flag_values(self.extra_args(), {"--add-dir", "-add-dir"})]
-        _agy_workspace_check([cwd, *add_dirs, *configured])
+        _agy_workspace_check(self.workspace_dirs(cwd, add_dirs))
         name, agent_dir = self.peer_agent()
         # --disable-slash-commands: in print mode, no slash command or skill expands from the
         # prompt (peer text included), and no /plan meta-prompt asks for plan and walkthrough
@@ -1646,7 +1695,7 @@ class AntigravityAdapter(Adapter):
         # also makes --mode a no-op (agy warns), so there is none: isolation comes from the
         # agent's tool list, the deny rules and --sandbox (recipe 12).
         argv = [self.command, "--sandbox", "--disable-slash-commands", "--output-format", "stream-json",
-                "--settings", json.dumps({"permissions": {"deny": list(self.deny_rules)}}),
+                "--settings", self.deny_settings(),
                 "--agent", name, "--add-dir", agent_dir]
         for d in add_dirs:
             argv += ["--add-dir", d]
@@ -2035,9 +2084,17 @@ class CopilotAdapter(Adapter):
             raise PeerSetupError("`copilot mcp list --json` names a server that can't be switched off")
         return sorted(servers)
 
+    def tool_list(self) -> list[str]:
+        return list(COPILOT_TOOLS) + (list(COPILOT_WEB_TOOLS) if self.web_search else [])
+
+    def isolation_request(self):
+        return {"write": [f"--available-tools={','.join(self.tool_list())}",
+                          *(f"--deny-tool={rule}" for rule in COPILOT_DENY), "--no-ask-user"],
+                "mcp": ["--disable-builtin-mcps", "--disable-mcp-server <name>"]}
+
     def invocation(self, prompt, resume_id, cwd, add_dirs):
         _copilot_repo_hooks_check(cwd)
-        tools = list(COPILOT_TOOLS) + (list(COPILOT_WEB_TOOLS) if self.web_search else [])
+        tools = self.tool_list()
         # The prompt is read from stdin when -p is empty (live probe).  --no-auto-update runs
         # the binary agent-bus fingerprinted, not a newer copy it downloaded earlier.
         argv = [self.command, "-p", "", "--output-format", "json", "--stream", "on", "--no-ask-user",
