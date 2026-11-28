@@ -266,7 +266,7 @@ same things in parallel:
   there is none and the prompt says files on disk may not match. Codex also gets copyable
   read-only `git` (and `jj`) commands for the pinned commits' history. The prompt
   states the turn's time limit, and that only the JSON verdict is posted. It names the verdict
-  format's version and the running build (`Verdict format v2 … agent-bus 0.3.0, <store item>`),
+  format's version and the running build (`Verdict format v3 … agent-bus 0.3.0, <store item>`),
   so a reviewer of a change to the format can tell which one the running worker expects.
 - **Reviewing agent-bus itself with the head's own build** (opt-in). Reviewers normally get the
   installed build, so a change to a review prompt, the usage search, an adapter or the verdict
@@ -577,8 +577,15 @@ codex 0.171.0 and 0.172.0, and agy 1.5.13:
   backticked generic name qualified by a module or object (`snapshot.ensure()`) is searched as
   written. Among the names the changed lines read and those the thread mentions, ones that look
   like constants or environment variables (`AGENT_BUS_BIN`) and ones the change adds are searched
-  and given room first. In a discussion with a `repo`, agy's prompt lists the repository's files
-  at its checked-out commit (capped, like a review's snapshot list). A file list that shows a name
+  and given room first. A changed Python file too long for one `read_file` call (over 40,000
+  characters) also gets an outline: its definitions outside functions, a class's methods in
+  parentheses, each with its first and last line (at most 8,000 characters in all; a file with
+  more definitions than fit gets as many as fit, and a count of the rest). In a discussion with a `repo`, agy's prompt
+  lists the repository's files at its checked-out commit (capped, like a review's snapshot list),
+  and where the names in backticks in the question and evidence appear and are defined at that
+  commit (not in a partial clone, where `git grep` would fetch missing blobs, nor in a jj repo
+  that isn't colocated with git, and given at most
+  15 seconds, since every peer's first turn waits for it). A file list that shows a name
   escaped (a control character or non-UTF-8 byte as `\xNN`, a backslash doubled) says so. A
   prompt too long for one argument goes in as far as fits and continues in numbered part files, each small enough for
   one `read_file` call (agy reads at most 800 lines or 46,080 bytes per call; a part stays under

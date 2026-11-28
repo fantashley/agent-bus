@@ -54,16 +54,20 @@ def test_a_confirmation_pass_says_the_earlier_copy_is_gone_and_how_to_read_the_o
     assert "- codex-1 [high] a.txt:1: Broken. Second sentence.\n" in p
     assert "The read-only copy from your earlier pass was deleted when that pass ended" in p
     assert "for the head you last reviewed, use its id (at the top of\nthis prompt) in place of the head's" in p
-    # The carried-over finding example, in "findings" with its id and in "earlier".
+    # How to update a carried-over finding, in "findings" with its id; one example (#196 again).
     assert '"findings" with its "id" too to update its text' in p
-    assert json.dumps({"id": "codex-1", "file": "src/app.py", "line": 34, "severity": "medium",
-                       "comment": "The updated text."}) + ' with\nits "earlier" entry' in p
+    assert "The updated text." not in p and p.count('"verdict": "request_changes"') == 1
+    # The resumed session had the severity rules and the verdict format in full on its first pass.
+    assert prompts.SEVERITY_BRIEF in p and prompts.SEVERITY not in p
+    assert prompts.VERDICT_BRIEF in p and prompts.VERDICT_FORMAT not in p
 
 
 def test_the_carried_over_example_uses_the_reviewers_own_id():
     text = verdict_format({"antigravity-2": {"id": "antigravity-2"}})
-    assert '{"id": "antigravity-2", "file": "src/app.py", "line": 34' in text
-    assert "{update}" not in text and "Verdict format v2" in text
+    assert '"earlier": [{"id": "antigravity-2", "status": "still_blocking"' in text
+    assert '"line": 34' not in text and "{update}" not in text and "Verdict format v3" in text
+    assert text.startswith(prompts.VERDICT_FORMAT)
+    assert verdict_format({"antigravity-2": {"id": "antigravity-2"}}, brief=True).startswith(prompts.VERDICT_BRIEF)
     assert '"id": "antigravity-2"' not in verdict_format({})
 
 

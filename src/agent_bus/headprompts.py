@@ -34,7 +34,10 @@ MAX_TOTAL = 1024 * 1024  # all the constants' text together
 # The review turn's prompt text (worker.review_round and its helpers).  Not here, so always
 # installed: the verdict format (VERDICT_FORMAT, VERDICT_FOLLOWUP, FORMAT_LABEL and its
 # version: the installed worker parses the verdict), the adapters' headless preambles, the
-# discussion, debrief and repair prompts, and the functions.
+# discussion, debrief and repair prompts, and the functions.  Newer review texts (SNAPSHOT_GONE,
+# ESCAPED, SEVERITY_BRIEF) are left out on purpose (#196): a head that predates a name here has
+# no such constant, so its whole pass would fall back to the installed prompts.  Since #181,
+# self_hosted_reviews runs the head's own build, whose prompts are all the head's anyway.
 NAMES = (
     "REVIEW", "REVIEW_FOLLOWUP", "REVIEW_PUSHBACK",
     "SEVERITY", "FIRST_PASS", "CONVERGE", "ALREADY_APPROVED", "APPROVED_OTHERS", "APPROVED_AUTHOR",

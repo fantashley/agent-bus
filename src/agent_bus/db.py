@@ -1713,7 +1713,8 @@ def head_build_attempt(events: list[dict], holder: str | None = None) -> dict | 
     a worker's head_build event records its phase, head and lease owner in its purpose
     ("start <head> <owner>", "end <head> <owner>"), so a start opens an attempt and only the
     same worker's end closes it.  An older build's events have no purpose: their text says
-    which is which ("building head <head12> with nix" starts one), with no owner.  Once
+    which is which ("building head <head12> with nix" starts one, "head <head12>'s build ..."
+    ends one, and any other text is skipped), with no owner.  Once
     ``holder``, the job's lease owner, has recorded an attempt, such an ownerless start
     replaces nothing (#206): it came late from an older worker that has lost the job."""
     attempt, held = None, False
@@ -1723,7 +1724,9 @@ def head_build_attempt(events: list[dict], holder: str | None = None) -> dict | 
         phase, head, owner = ((e.get("purpose") or "").split(" ", 2) + ["", "", ""])[:3]
         if not phase:
             m = re.match(r"(building )?head ([0-9a-f]+)", e["text"] or "")
-            phase, head = ("start" if m and m[1] else "end"), (m[2] if m else "")
+            if not m:
+                continue  # neither of an older build's texts: it opens or closes nothing (#210)
+            phase, head = ("start" if m[1] else "end"), m[2]
         if phase == "start":
             if not owner and held:
                 continue
