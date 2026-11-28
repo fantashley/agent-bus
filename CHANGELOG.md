@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.4.0](https://github.com/fantashley/agent-bus/compare/v0.3.0...v0.4.0) (2026-11-28)
+
+
+### Features
+
+* follow-up prompts lead with each open finding's full text, say earlier copies are gone, and search deleted calls ([#207](https://github.com/fantashley/agent-bus/issues/207)) ([57af737](https://github.com/fantashley/agent-bus/commit/57af73743dbb01d380016ab8e4b5f9fa1e5c1398))
+* let a review's initiator retry a pass that gave no verdict once ([#182](https://github.com/fantashley/agent-bus/issues/182)) ([8b2908c](https://github.com/fantashley/agent-bus/commit/8b2908ca833317dfaa7bc007af146d4f531c1036))
+* lighter confirmation passes and review prompt polish ([#160](https://github.com/fantashley/agent-bus/issues/160)) ([c3e1753](https://github.com/fantashley/agent-bus/commit/c3e17534e280806534beca67a3575b77f921eb42))
+* list where the functions changed lines call are defined, line numbers in a name's tail ([#195](https://github.com/fantashley/agent-bus/issues/195)) ([73fa5b9](https://github.com/fantashley/agent-bus/commit/73fa5b9d54d879d67c337194c1e7669d4fbfc7b5))
+* move MCP servers onto the installed build without a client reload ([#162](https://github.com/fantashley/agent-bus/issues/162)) ([fb41029](https://github.com/fantashley/agent-bus/commit/fb41029d20f2f7d598c4fa7223ba3af8efd0b109))
+* opt-in review prompts from the head under review ([#178](https://github.com/fantashley/agent-bus/issues/178)) ([b8491cc](https://github.com/fantashley/agent-bus/commit/b8491cc8134c0578c00cf97abc0d3ba9fdd88ab1))
+* outline long changed files, usages for discussions, shorter follow-ups ([#211](https://github.com/fantashley/agent-bus/issues/211)) ([46c63b5](https://github.com/fantashley/agent-bus/commit/46c63b5fc7c5d49945983aceb0ae61d5325f6844))
+* passive agent-bus doctor (issue [#32](https://github.com/fantashley/agent-bus/issues/32) stage 2A) ([#214](https://github.com/fantashley/agent-bus/issues/214)) ([40d7a1b](https://github.com/fantashley/agent-bus/commit/40d7a1b614fb10753bd76987cfa3aa1629d8b9d7))
+* peer prompts list a discussion's files, place left-out usage names and label notes by head ([#189](https://github.com/fantashley/agent-bus/issues/189)) ([5809a87](https://github.com/fantashley/agent-bus/commit/5809a87b1306e47faa3a1f7852272bb2bde3c29f))
+* **pr-review:** GitHub-ready review-only findings, one comment per shared line ([#170](https://github.com/fantashley/agent-bus/issues/170)) ([36b6d6e](https://github.com/fantashley/agent-bus/commit/36b6d6ea97796f331cafd12d1c023a8aa1170020))
+* run an opted-in review job from the head's own build ([#184](https://github.com/fantashley/agent-bus/issues/184)) ([8ae87e3](https://github.com/fantashley/agent-bus/commit/8ae87e37c6b4425a83692f84c3b8da7e863eadd9))
+* say which build will run a self-hosted review, and show the head's nix build ([#197](https://github.com/fantashley/agent-bus/issues/197)) ([99ab2f1](https://github.com/fantashley/agent-bus/commit/99ab2f10988bc135f28899ab6e166618d6319c26))
+* send only outline changes on resumed follow-ups ([#213](https://github.com/fantashley/agent-bus/issues/213)) ([380659c](https://github.com/fantashley/agent-bus/commit/380659cb884f32cf039c7df42d4796531f27451d))
+* sharper usage search and summarized data files in reviewers' diffs ([#173](https://github.com/fantashley/agent-bus/issues/173)) ([c19dacc](https://github.com/fantashley/agent-bus/commit/c19daccf2098b290aeff93cbc0d60df564ada4c9))
+* the follow-up budget counts only follow-ups that draw new blockers ([#158](https://github.com/fantashley/agent-bus/issues/158)) ([468d44f](https://github.com/fantashley/agent-bus/commit/468d44f32c36edc4b3c8648811a344713f4ad980))
+* turn purposes, failed tool calls and a per-pass usage view ([#172](https://github.com/fantashley/agent-bus/issues/172)) ([8730f08](https://github.com/fantashley/agent-bus/commit/8730f08c643454ed749ff7d8924a0ba4c39df21c))
+
+
+### Bug Fixes
+
+* build only the head's out output and attribute worker posts to their job ([#187](https://github.com/fantashley/agent-bus/issues/187)) ([2c97ace](https://github.com/fantashley/agent-bus/commit/2c97ace0b5bf7c156e0e434220520bff3567a829))
+* cap the dead-worker retry of a several-reviewer review's first request ([#203](https://github.com/fantashley/agent-bus/issues/203)) ([dd62e31](https://github.com/fantashley/agent-bus/commit/dd62e31c6ac7afcf0cba05c48ca89223512a7788))
+* check the previous head before self-hosted setup, pair head builds per attempt, match missing-commit parks exactly ([#205](https://github.com/fantashley/agent-bus/issues/205)) ([f00707a](https://github.com/fantashley/agent-bus/commit/f00707a7015178f2d1aa8210a0fdfeabae74e4e9))
+* count a later reviewer's first-pass blockers and check a follow-up's previous head before the snapshot ([#200](https://github.com/fantashley/agent-bus/issues/200)) ([cd58609](https://github.com/fantashley/agent-bus/commit/cd58609501e621add9cf618638566d3563640ebc))
+* keep a review's snapshot while its job runs; clearer run-long and follow-up prompts ([#165](https://github.com/fantashley/agent-bus/issues/165)) ([e75c87d](https://github.com/fantashley/agent-bus/commit/e75c87d1da11afa5891564017b9e20cf00598e8e))
+* keep agy prompt parts under read_file's line cap; review polish from [#154](https://github.com/fantashley/agent-bus/issues/154) ([#155](https://github.com/fantashley/agent-bus/issues/155)) ([702075a](https://github.com/fantashley/agent-bus/commit/702075a99cd91a488a2d1c35172e513ebf7276d0))
+* keep held snapshots, scope the shim failure cache, [#161](https://github.com/fantashley/agent-bus/issues/161) leftovers ([#169](https://github.com/fantashley/agent-bus/issues/169)) ([df80960](https://github.com/fantashley/agent-bus/commit/df80960192ceb497604a0ad07d95a127347cd15d))
+* move Claude Code's MCP session onto a new build (MCP 2026-07-28) ([#167](https://github.com/fantashley/agent-bus/issues/167)) ([497f2bd](https://github.com/fantashley/agent-bus/commit/497f2bd1ec232f91008edd87f426dd591b5e8ee9))
+* place changed Python definitions with ast and ignore prose in the usage search ([#176](https://github.com/fantashley/agent-bus/issues/176)) ([7535196](https://github.com/fantashley/agent-bus/commit/75351969d1fbb6da809f0acedf863544feaa669f))
+* show every event kind in tail, check pinned commits before the snapshot ([#180](https://github.com/fantashley/agent-bus/issues/180)) ([a6456f6](https://github.com/fantashley/agent-bus/commit/a6456f6a538d49c604eee9da2cdb6f2d0754f6ef))
+* usage search polish: busiest-file samples, skip keywords, distinguishable escapes ([#192](https://github.com/fantashley/agent-bus/issues/192)) ([195411b](https://github.com/fantashley/agent-bus/commit/195411bf1798cbf2e423c0c56e6d0b2be10a7988))
+* wait returns at once when nothing can arrive; [#206](https://github.com/fantashley/agent-bus/issues/206) leftovers ([#209](https://github.com/fantashley/agent-bus/issues/209)) ([fd43b92](https://github.com/fantashley/agent-bus/commit/fd43b9209b0a397cd94f73beea38d0597bb3b79f))
+
 ## [0.3.0](https://github.com/fantashley/agent-bus/compare/v0.2.1...v0.3.0) (2026-11-25)
 
 ### Behaviour changes
