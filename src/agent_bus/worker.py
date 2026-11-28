@@ -1688,6 +1688,10 @@ class Worker:
             heading = f"The change was rebased since your last verdict.{range_note}\n\n{heading}"
         # Which head each note was sent for (#186): after several heads they interleave.
         labels = note_heads(everything, refs["head_commit_id"])
+        # The long files' outlines this reviewer's session was given, by head (#196): a resumed
+        # prompt shows only what changed since; usages_note records what each prompt gives.
+        self.outlines_given = {}
+        outlines = self.outlined_baseline(reviewer) if resume else None
         fresh = self.review_prompt(t, refs, full_diff, heading,
                                    notes(everything), earlier, framing=framing, pushback=pushback, snap=snap,
                                    earlier_note=earlier_note, prior=prior, mention=mention, labels=labels)
@@ -1697,7 +1701,8 @@ class Worker:
         if resume and pushback:
             prompt = prompts.REVIEW_PUSHBACK.format(head=refs["head_commit_id"], replies=replies,
                                                     reading=self.reading_note(refs, snap, listing=False,
-                                                                              mention=mention, brief=True),
+                                                                              mention=mention, brief=True,
+                                                                              outlines=outlines),
                                                     severity=severity_brief(), budget=budget_note(t),
                                                     time_limit=self.time_limit_note(), earlier=earlier_note,
                                                     testing=("\n" + self.testing_note(t, refs) + "\n"
@@ -1718,7 +1723,7 @@ class Worker:
                 head=refs["head_commit_id"], prev=refs["prev_head_commit_id"], replies=replies, lead=lead,
                 where=where, rebase=rebase_note,
                 reading=self.reading_note(refs, snap, diff=inter, since=refs["prev_head_commit_id"],
-                                          mention=mention, brief=True, path_note=False),
+                                          mention=mention, brief=True, path_note=False, outlines=outlines),
                 converge=prompts.CONFIRM if prior else framing,
                 # The resumed session had the severity rules and the verdict format in full (#196).
                 severity=severity_brief(), budget=budget_note(t),
@@ -1744,6 +1749,7 @@ class Worker:
         if res.ok or res.text:
             self.mark_delivered(reviewer, upto)
             self.record_listing(refs, snap, resume and pushback)
+        fresh_turn = bool(getattr(self, "turn_fresh", None))  # a fresh session had the fresh prompt
         raw = extract_reply(res.text, "summary") if res.text else None
         # Its earlier pre-existing findings keep their ids when it lists them again (#145).
         reusable = {f["id"] for m in earlier for f in m["data"].get("findings") or []
@@ -1759,6 +1765,7 @@ class Worker:
                    "Reply again with only the JSON verdict object described above (and its body block, if "
                    "you use one).")
             res2 = self.turn(reviewer, ask, fresh_prompt=fresh + "\n\n" + ask, read_dirs=read_dirs, purpose="repair")
+            fresh_turn = fresh_turn or bool(getattr(self, "turn_fresh", None))
             if res2.quota or res2.format_changed or res2.config_error:
                 self.park_human_only(reviewer, res2.quota)
                 return None
@@ -1812,6 +1819,8 @@ class Worker:
         for f in pre:
             loc = f"{f['file']}:{f['line']}" if f["line"] else f["file"]
             lines.append(f"- [{severity_tag(f['severity'], pre_existing=True)}] {f['id']} {loc}: {f['comment']}")
+        # The outlines the session that gave the verdict has (#196), for its next resumed pass.
+        self.record_outlines(refs, outlines, fresh_turn, gave.external_id)
         # The session that gave the verdict, so a later pass resumes it only if it is still
         # the saved one (see interdiff_from).  That turn's own id: a turn that failed without
         # reporting one leaves an older session saved, which never saw this pass.
@@ -1966,7 +1975,7 @@ class Worker:
 
     def reading_note(self, refs: dict, snap: snapshot.Snapshot | None = None, listing: bool = True,
                      diff: str | None = None, since: str | None = None, mention: list[str] | None = None,
-                     brief: bool = False, path_note: bool = True) -> str:
+                     brief: bool = False, path_note: bool = True, outlines: dict[str, str] | None = None) -> str:
         """How the reviewer can read the pinned head: the snapshot's path (#111), with its
         file list for a reviewer that can't list directories or search, and where the names
         ``diff`` defines or edits are used at the head (#117); copyable read-only git
@@ -1977,7 +1986,8 @@ class Worker:
         copy of; only the files added or removed since are listed then (#126).  ``brief``: for
         a resumed session, which had the full note on its first pass: the copy's path first,
         and the commands named rather than listed (#159).  ``path_note``: False when the
-        prompt gives the copy's path elsewhere (a follow-up's, at the top: #186)."""
+        prompt gives the copy's path elsewhere (a follow-up's, at the top: #186).  ``outlines``:
+        for a resumed session, the outlines it was given (see outlined_baseline)."""
         out = self._reading_note(refs, snap, listing, since, brief, path_note)
         try:
             ad = ADAPTERS[self.config.harness_of(refs["reviewer"])]
@@ -1987,31 +1997,38 @@ class Worker:
             out += prompts.READ_TIP_SHELL
         # A pushback (no listing, no new diff) still searches the names its replies give (codex-5).
         if ad is not None and not ad.lists_files and ((diff and listing) or mention):
-            out += self.usages_note(refs, diff if listing and diff else "", snap, mention)
+            out += self.usages_note(refs, diff if listing and diff else "", snap, mention, outlines)
         return out
 
     def usages_note(self, refs: dict, diff: str, snap: snapshot.Snapshot | None = None,
-                    mention: list[str] | None = None) -> str:
+                    mention: list[str] | None = None, outlines: dict[str, str] | None = None) -> str:
         """The usages section for a reviewer with no search tool (#117); best effort, and
-        searched once per head and diff (a follow-up's prompt and its fresh fallback share it)."""
+        searched once per head and diff (a follow-up's prompt and its fresh fallback share it).
+        ``outlines``: for a resumed prompt, the outlines its session was given (#196), so only
+        what changed since is shown; which outlines the section gives is kept in
+        ``outlines_given`` ("resumed" or "fresh") for record_outlines."""
         # The files the reviewer can read at the head: a full snapshot's are all of them; a
         # sparse one holds some; with none, reads come from the working copy (none are sure).
         readable = (None if snap is not None and snap.path and snap.mode == "full"
                     else frozenset(snap.files) if snap is not None and snap.path else frozenset())
         key = (refs["repo"], refs["head_commit_id"], hashlib.sha256(diff.encode("utf-8", "surrogateescape")).hexdigest(),
-               readable, tuple(mention or ()))
+               readable, tuple(mention or ()), None if outlines is None else tuple(sorted(outlines.items())))
         cache = self.__dict__.setdefault("_usages", {})
         if key not in cache:
+            known: dict[str, str] = {}
             try:
-                cache[key] = usages.note(refs["repo"], refs["head_commit_id"], diff, readable, mention)
+                note = usages.note(refs["repo"], refs["head_commit_id"], diff, readable, mention,
+                                   seen=outlines, known=known)
             except Exception as e:  # noqa: BLE001 (never what fails a review)
-                cache[key] = ("", False, False)
+                cache[key] = ("", False, False, {})
                 self.event("usages", f"no usage search: {e!r}")
             else:
-                if cache[key][0]:
+                cache[key] = (*note, known)
+                if note[0]:
                     self.event("usages", f"usages at head {refs['head_commit_id'][:12]} of the names the diff "
-                               f"touches: {len(cache[key][0])} characters")
-        hits, cut, outside = cache[key]
+                               f"touches: {len(note[0])} characters")
+        hits, cut, outside, known = cache[key]
+        self.__dict__.setdefault("outlines_given", {})["fresh" if outlines is None else "resumed"] = known
         if not hits:
             return ""
         return prompts.USAGES.format(head=refs["head_commit_id"], hits=hits,
@@ -2031,6 +2048,51 @@ class Worker:
             return
         whole = snapshot.complete(snap)
         self.event("listing", refs["head_commit_id"] if whole else "none", refs["reviewer"])
+
+    def record_outlines(self, refs: dict, baseline: dict[str, str] | None, fresh: bool,
+                        session: str | None) -> None:
+        """After a pass that gave a verdict, by a reviewer that can't search: which long files'
+        whole outlines the session that gave it now has, and at which head (#196), as an
+        "outline" event read by outlined_baseline.  A session that started in this pass (a
+        fresh first turn, or a repair's fresh fallback) has the fresh prompt's; a resumed one
+        keeps ``baseline`` and adds the resumed prompt's."""
+        try:
+            ad = ADAPTERS[self.config.harness_of(refs["reviewer"])]
+        except (KeyError, ValueError):
+            return
+        if ad.lists_files or not session:
+            return
+        given = getattr(self, "outlines_given", None) or {}
+        fresh = fresh or baseline is None
+        now = dict(given.get("fresh") or {}) if fresh else {**(baseline or {}), **(given.get("resumed") or {})}
+        # By head, so it stays short; past an event's 2,000 characters, files are dropped
+        # (they get their whole outline again), not the record (codex-6).
+        while True:
+            heads: dict[str, list[str]] = {}
+            for p, h in sorted(now.items()):
+                heads.setdefault(h, []).append(p)
+            text = json.dumps({"session": session, "heads": heads}, sort_keys=True)
+            if len(text) <= 2000 or not now:
+                break
+            now.pop(max(now, key=len))
+        self.event("outline", text, refs["reviewer"])
+
+    def outlined_baseline(self, reviewer: str) -> dict[str, str]:
+        """The long files whose whole outline this reviewer's saved session was given, with the
+        head it was given at (path -> head), from its latest "outline" event (#196): none if
+        that record is from another session (codex-1), before any, or for a thread from a
+        build that didn't record them."""
+        rows = [e for e in self.bus.events(self.thread_id, agent=reviewer) if e["kind"] == "outline"]
+        try:
+            rec = json.loads(rows[-1]["text"]) if rows else {}
+        except ValueError:
+            return {}
+        session = self.bus.peer_session(self.thread_id, reviewer)
+        if not isinstance(rec, dict) or not session or rec.get("session") != session \
+                or not isinstance(rec.get("heads"), dict):
+            return {}
+        return {p: h for h, ps in rec["heads"].items() if isinstance(h, str) and isinstance(ps, list)
+                for p in ps if isinstance(p, str)}
 
     def listed_baseline(self, reviewer: str) -> str | None:
         """The head whose whole file list (a full copy's, listed in full, or kept whole by a
