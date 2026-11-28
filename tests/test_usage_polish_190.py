@@ -27,9 +27,10 @@ def test_language_keywords_are_not_searched_as_mentioned_names():
     # Debrief of #189: a backticked `break` was searched (44 hits).
     assert usages.mentioned(["`break` here, `continue` there, `await x`, `lambda`, `drop_usage()`"]) == ["drop_usage"]
     # codex-1: only a bare keyword; other names, a qualified one and the diff's own are kept.
-    # #194: and a keyword as a dotted mention's last part, which _KEYWORDS must not cover.
-    assert (usages.mentioned(["`static.ensure()`, `router.switch()`, `switch`, `break`, `obj.from`"])
-            == ["static.ensure", "switch", "from"])
+    # #194: and a keyword as a dotted mention's last part, which _KEYWORDS must not cover; but
+    # #196's debrief: such a mention (`cfg.from()`, 1,194 hits) is skipped, as is a builtin's name.
+    assert (usages.mentioned(["`static.ensure()`, `router.switch()`, `switch`, `break`, `obj.from`, `cfg.compile()`"])
+            == ["static.ensure", "switch"])
     diff = ("diff --git a/src/r.py b/src/r.py\n--- a/src/r.py\n+++ b/src/r.py\n@@ -1,0 +1,3 @@\n"
             "+class Router:\n+    static: int = 0\n+    def switch(self): return options[\"from\"]\n")
     found = {t.pattern for t in usages.terms(diff)}

@@ -230,3 +230,43 @@ def test_first_pass_is_the_current_reviewers_unless_it_has_a_verdict(env, no_spa
     crash_at(monkeypatch, Worker, "review_outcome")  # every approval in: no pass left to run
     run_crashing(bus, tid)
     assert w.first_pass(bus.thread(tid)) is None
+
+
+# ------------------------------------------------------------------ #210
+
+
+def test_the_poller_checks_may_settle_without_another_sweep(env, no_spawn, monkeypatch):
+    """codex-5 (#210): each tick's poll already touched the session and swept; may_settle is
+    a plain read, so it isn't run through call() (a second sweep every second)."""
+    from agent_bus import autoresume, mcp_server
+    bus, repo = env["bus"], env["repo"]
+    sh = git_repo(repo)
+    base = sh("git", "rev-parse", "HEAD")
+    (repo / "a.txt").write_text("one\n")
+    sh("git", "commit", "-qam", "one")
+    head = sh("git", "rev-parse", "HEAD")
+    server = mcp_server.build("claude", bus=bus)
+    tid = call(server, "request_review", {"reviewer": "codex", "repo": str(repo), "base_commit_id": base,
+                                          "head_commit_id": head})["thread"]["id"]
+    sweeps, checks = [], []
+    real_sweep, real_check = autoresume.sweep_quietly, Service.may_settle
+    monkeypatch.setattr(autoresume, "sweep_quietly", lambda *a, **k: sweeps.append(1) or real_sweep(*a, **k))
+    monkeypatch.setattr(Service, "may_settle", lambda self, t: checks.append(1) or real_check(self, t))
+    res, took = timed_wait(server, tid, 3)  # its job is queued: the wait sits out its timeout
+    assert res["status"] == "timeout" and len(checks) >= 2
+    assert len(sweeps) <= len(checks) + 2  # one per tick's poll (and the wait's own calls), not two
+
+
+def test_head_build_attempt_skips_unmatched_legacy_text():
+    """antigravity-2 (#210): an ownerless head_build event whose text is neither of an older
+    build's (start or end) closes no open legacy attempt."""
+    def ev(text):
+        ev.n += 1
+        return {"kind": "head_build", "agent": None, "purpose": None, "text": text, "created_at": ev.n}
+    ev.n = 0
+    h = "b" * 12
+    a = head_build_attempt([ev(f"building head {h} with nix"), ev("something else entirely")])
+    assert a == {"head": h, "owner": None, "start": 1, "end": None}
+    end = ev(f"head {h}'s build ready after 3 s")
+    assert head_build_attempt([ev(f"building head {h} with nix"), ev("odd"), end])["end"] == end["created_at"]
+    assert head_build_attempt([ev("odd")]) is None

@@ -67,6 +67,9 @@ tail gives line numbers, not just files.
 
 #196: the names the removed lines call and the added lines don't (a deleted call) are searched
 too, so a reviewer sees whether the function still has other callers before calling it unused.
+A changed Python file too long to read whole gets an outline (its definitions with their line
+ranges), and a dotted mention ending in a keyword or builtin name (`cfg.from()`) is not searched.
+#202: a discussion's peer gets the same search for the names in its question and evidence.
 """
 
 from __future__ import annotations
@@ -77,7 +80,10 @@ import keyword
 import re
 import subprocess
 import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from typing import Iterator
 
 from . import snapshot
 
@@ -115,6 +121,11 @@ MAX_CALLEES = 20
 MAX_CALLED = 60
 DEF_HITS = 3
 DEF_CHARS = 1_200
+# The outline of a changed Python file longer than LONG_FILE characters (#196), which a reviewer
+# that can't search can't read whole either (Antigravity's read_file returns at most 46,080
+# bytes): its definitions with their line ranges, at most OUTLINE_CHARS for all such files.
+LONG_FILE = 40_000
+OUTLINE_CHARS = 8_000
 # What a term is, and how much room it gets: the changed definitions (and fields) are always
 # shown, at worst as one line; the rest go, highest hit count first, when space runs out.
 KINDS = {"defined": 0, "field": 0, "enclosing": 1, "override": 1, "removed": 1, "read": 2, "mentioned": 2}
@@ -170,7 +181,9 @@ _GENERIC = frozenset({"repo", "path", "paths", "line", "lines", "file", "files",
                       "write", "load", "dump", "dumps", "loads", "ensure", "check", "parse", "render", "build",
                       "create", "delete", "remove", "reset", "clear", "apply", "undo", "fetch", "send", "call",
                       "wait", "kill", "exists", "flush", "run", "get", "pop", "add", "sort", "sorted", "group",
-                      "match", "search", "sub", "findall", "finditer", "fullmatch", "now", "sleep", "exit"})
+                      "match", "search", "sub", "findall", "finditer", "fullmatch", "now", "sleep", "exit",
+                      # A builtin type's methods (#196): a removed `.rstrip()` used a MAX_REMOVED slot.
+                      "lstrip", "rstrip", "setdefault", "fromkeys"})
 # Common standard-library modules: an attribute read off one (``os.O_RDWR``) is the module's
 # own.  Not every name in sys.stdlib_module_names: `queue.claim_next_job()` may well be a
 # project's own object (codex-11).
@@ -287,6 +300,11 @@ class PyScopes:
     consts: dict[int, tuple[str, ...]]
     calls: dict[int, tuple[tuple[str, str], ...]] = field(default_factory=dict)
     def_lines: dict[int, tuple[str, ...]] = field(default_factory=dict)
+    # For the outline of a long changed file (#196): its definitions outside any function, as
+    # (name, first line, last line, its class's own (name, first, last) ...), decorators
+    # included; and the file's length in characters.
+    outline: tuple[tuple[str, int, int, tuple[tuple[str, int, int], ...]], ...] = ()
+    chars: int = 0
 
     def touch(self, ln: int) -> list[tuple[str, str, str]]:
         """What a change to line ``ln`` touches, as (what, name, class) each: "defined" (a
@@ -321,10 +339,17 @@ def py_scopes(source: str) -> PyScopes | None:
         end = min(end, len(at) - 1)
         at[start:end + 1] = [what] * max(0, end + 1 - start)
 
+    outline: list[tuple[str, int, int, list[tuple[str, int, int]]]] = []
+
     def walk(body: list, cls: str | None) -> None:
         for n in body:
             start = min([d.lineno for d in getattr(n, "decorator_list", [])] + [n.lineno])
             end = n.end_lineno or n.lineno
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if cls is None:
+                    outline.append((n.name, start, end, []))
+                elif outline:  # a method, or a nested class (whose methods follow, as its class's)
+                    outline[-1][3].append((n.name, start, end))
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 # Not walked into: whatever it defines is local to it.
                 defs.setdefault(n.lineno, []).append((n.name, cls is not None))
@@ -367,7 +392,8 @@ def py_scopes(source: str) -> PyScopes | None:
         return None
     return PyScopes({k: tuple(v) for k, v in defs.items()}, at, {k: tuple(v) for k, v in fields.items()},
                     {k: tuple(v) for k, v in consts.items()}, {k: tuple(v) for k, v in calls.items()},
-                    {k: tuple(v) for k, v in def_lines.items()})
+                    {k: tuple(v) for k, v in def_lines.items()},
+                    tuple((n, a, b, tuple(m)) for n, a, b, m in outline), len(source))
 
 
 def _header(line: str, old: str, new: str) -> tuple[str, str, bool]:
@@ -462,10 +488,34 @@ def old_text(head: list[str], hunks: list[tuple[int, int, int, int, list[str], l
     return out + head[pos:]
 
 
+# A total time limit for this thread's git calls (time_limit), as a time.monotonic() deadline.
+_LIMIT = threading.local()
+
+
+@contextmanager
+def time_limit(seconds: float) -> Iterator[None]:
+    """Every git call this thread makes within gets at most what is left of ``seconds`` in all
+    (and at most GREP_TIMEOUT_S each); one with no time left fails as a timeout would.  For a
+    search that other work waits for (a discussion's, codex-2 and codex-8 of #211)."""
+    _LIMIT.deadline = time.monotonic() + seconds
+    try:
+        yield
+    finally:
+        _LIMIT.deadline = None
+
+
+def time_left() -> float:
+    """How long the next git call may take (see time_limit)."""
+    deadline = getattr(_LIMIT, "deadline", None)
+    return GREP_TIMEOUT_S if deadline is None else min(GREP_TIMEOUT_S, deadline - time.monotonic())
+
+
 def _cat(repo: str, env: dict, argv: list[str], stdin: bytes) -> bytes | None:
+    if time_left() <= 0:
+        return None
     try:
         proc = subprocess.run(["git", "--no-replace-objects", "cat-file", *argv], cwd=repo, env=env, input=stdin,
-                              capture_output=True, timeout=GREP_TIMEOUT_S)
+                              capture_output=True, timeout=time_left())
     except (OSError, subprocess.TimeoutExpired):
         return None
     return proc.stdout if proc.returncode == 0 else None
@@ -685,7 +735,8 @@ def mentioned(texts: list[str], exclude: set[str] | frozenset[str] = frozenset()
               limit: int | None = MAX_MENTIONED) -> list[str]:
     """The names in backticks in ``texts`` (findings and notes on the thread), first
     mentioned first: a dotted one's last part (``TurnResult.launched``: launched), or its
-    first if that is too short; file names, common words and ``exclude`` left out."""
+    first if that is too short; file names, common words, a dotted one ending in a keyword or
+    builtin name, and ``exclude`` left out."""
     out: dict[str, None] = {}
     for text in texts:
         for m in _TICKED.finditer(text or ""):
@@ -704,6 +755,10 @@ def mentioned(texts: list[str], exclude: set[str] | frozenset[str] = frozenset()
                 # `db.close()`, `self.reset()`): searched as written, its last two parts,
                 # which finds the calls meant (#161).  Not a builtin's (`str.split`).
                 name = ".".join(parts[-2:])
+            elif len(parts) > 1 and (parts[-1] in _KEYWORDS or parts[-1] in _BUILTINS):
+                # Another language's keyword or a builtin's name as a method (`cfg.from()`,
+                # `cfg.compile()`): its bare name is everywhere, its owner says nothing (#196).
+                continue
             else:
                 # Failing that its last part, or its first.
                 name = next((p for p in (parts[-1], parts[0]) if _specific(p)), None)
@@ -871,11 +926,14 @@ def _run_grep(repo: str, env: dict, head: str, flags: list[str], patterns: list[
     for n in patterns:
         argv += ["-e", n]
     argv += [head, "--"]
+    limit = time_left()
+    if limit <= 0:
+        return None
     try:
         proc = subprocess.Popen(argv, cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
         return None
-    timer = threading.Timer(GREP_TIMEOUT_S, proc.kill)
+    timer = threading.Timer(limit, proc.kill)
     timer.start()
     try:
         out = proc.stdout.read(MAX_OUTPUT + 1)
@@ -1049,7 +1107,9 @@ def _desc(t: Term) -> str:
 
 def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
            readable: frozenset[str] | set[str] | None = None,
-           defs: dict[str, list[tuple[str, int]]] | None = None, defs_cut: bool = False) -> str:
+           defs: dict[str, list[tuple[str, int]]] | None = None, defs_cut: bool = False,
+           outlined: list[str] | None = None, mentioned_as: str | None = None,
+           defs_title: str | None = None) -> str:
     """The hits, grouped by name, fewest hits first (names touched only in tests last), and
     capped: at most ``per_symbol`` lines each, hits outside test files first (then a count
     and the files of the rest), and ``limit`` characters in all; a name with no room for that
@@ -1064,7 +1124,11 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
     or a listed file elsewhere is marked.  When git grep's output was cut, counts are lower
     bounds and no hit means none found before the cut, not none at all.
     ``defs``: where the functions the changed lines call are defined (see definitions), one
-    line each after the rest, in DEF_CHARS (#191); ``defs_cut``: that search's output was cut."""
+    line each after the rest, in DEF_CHARS (#191); ``defs_cut``: that search's output was cut.
+    ``outlined``: the outline lines of the long changed files (see outline), last (#196).
+    ``mentioned_as``: what a mentioned name's heading says in place of "named in the thread's
+    findings or notes"; "" for nothing (a discussion's, whose names are all mentioned, #202).
+    ``defs_title``: the definitions' heading, if not the changed lines' callees'."""
     def mark(p: str) -> str:
         return _defuse(p) + (" (not in the copy)" if readable is not None and p not in readable else "")
 
@@ -1076,7 +1140,8 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
     compact: dict[str, str] = {}  # that line, for a name left out (#186)
     for n in u.names:
         t = u.terms.get(n) or Term(n)
-        desc = ", ".join(d for d in (_desc(t), "only in tests" if t.test else "") if d)
+        desc = ", ".join(d for d in (mentioned_as if mentioned_as is not None and t.kind == "mentioned" else _desc(t),
+                                     "only in tests" if t.test else "") if d)
         hits = u.hits.get(n) or []
         if not hits:
             full[n] = sample[n] = short[n] = compact[n] = (
@@ -1153,11 +1218,13 @@ def render(u: Usages, limit: int = MAX_CHARS, per_symbol: int = PER_SYMBOL,
         out += shown
     if left:
         out.append(f"[... {_plural(len(left), 'more name')} not shown: {', '.join(left)}]")
-    out += _render_defs(defs or {}, mark, defs_cut)
+    out += _render_defs(defs or {}, mark, defs_cut, defs_title)
+    out += outlined or []
     return f"{OPEN}\n" + "\n".join(out) + f"\n{CLOSE}"
 
 
-def _render_defs(defs: dict[str, list[tuple[str, int]]], mark, cut: bool = False) -> list[str]:
+def _render_defs(defs: dict[str, list[tuple[str, int]]], mark, cut: bool = False,
+                 title: str | None = None) -> list[str]:
     """The lines for ``defs`` (see render): ``name: path:line`` each, at most DEF_HITS of its
     definitions, and at most MAX_CALLEES names in DEF_CHARS; a name that doesn't fit is left
     out (a shorter one after it may still fit), and how many were is said.  ``cut``: the
@@ -1174,9 +1241,61 @@ def _render_defs(defs: dict[str, list[tuple[str, int]]], mark, cut: bool = False
     left += max(0, len(defs) - MAX_CALLEES)
     if not lines and not cut:
         return []
-    return (["Where what the changed lines call is defined:", *lines]
+    return ([title or "Where what the changed lines call is defined:", *lines]
             + ([f"[... {_plural(left, 'more name')} not shown]"] if left else [])
             + (["[the definition search's output was cut short: some definitions may be missing]"] if cut else []))
+
+
+def outline(diff: str, scopes: dict[tuple[str, str], PyScopes],
+            readable: frozenset[str] | set[str] | None = None) -> tuple[list[str], list[str]]:
+    """(The outline lines, the paths outlined) of ``diff``'s long changed Python files at the
+    head (#196), outside test files first: ``path: name first-last (method first-last, ...);
+    ...``, from their PyScopes (see pinned_python), for those over LONG_FILE characters.  At
+    most OUTLINE_CHARS in all, the notices included: a file's definitions are listed in order
+    while they fit, and how many more there are is said (codex-4 of #211); a file with no room
+    for any is named at the end, while that fits.  ``readable``: as for render, a file outside
+    it is marked."""
+    heading = ("Outline of the changed files too long to read whole (definitions outside functions, a class's "
+               "methods in parentheses, first-last line):")
+    tail = " [+99999 more definitions]"
+    paths = [f.new for f in _files(diff) if not f.deleted and ("+", f.new) in scopes]
+    lines, left, done = [], [], []
+    used = len(heading) + 1
+    room = OUTLINE_CHARS - COMPACT  # the last line, for the files left out
+    for p in sorted(dict.fromkeys(paths), key=is_test):
+        sc = scopes["+", p]
+        if sc.chars <= LONG_FILE or not sc.outline:
+            continue
+        # The pieces in order, each with what goes before it: "; " between definitions, " ("
+        # and ", " for a class's methods; a cut inside a class's list still closes it.
+        pieces: list[tuple[str, str, bool]] = []  # (before, text, inside a class's list)
+        for n, a, b, ms in sc.outline:
+            pieces.append((("); " if pieces[-1][2] else "; ") if pieces else "", f"{n} {a}-{b}", False))
+            pieces += [(" (" if i == 0 else ", ", f"{m} {c}-{d}", True) for i, (m, c, d) in enumerate(ms)]
+        mark = " (not in the copy)" if readable is not None and p not in readable else ""
+        line = f"  {_defuse(p)}{mark}: "
+        taken = 0
+        for before, text, inside in pieces:
+            if used + len(line) + len(before) + len(text) + len(")") + len(tail) + 1 > room:
+                break
+            line += before + text
+            taken += 1
+        if not taken:
+            left.append(_defuse(p))
+            continue
+        if pieces[taken - 1][2]:
+            line += ")"
+        if taken < len(pieces):
+            line += f" [+{len(pieces) - taken} more definitions]"
+        lines.append(line)
+        done.append(p)
+        used += len(line) + 1
+    if not lines and not left:
+        return [], []
+    if left:
+        names = f": {', '.join(left)}" if len(", ".join(left)) <= COMPACT - 60 else ""
+        lines.append(f"[... no room for the outline of {_plural(len(left), 'more file')}{names}]")
+    return [heading, *lines], done
 
 
 def _lines_at(hits: list[tuple[str, int, str]], mark, limit: int = COMPACT, busiest: bool = False) -> str:
@@ -1218,24 +1337,46 @@ def _lines_at(hits: list[tuple[str, int, str]], mark, limit: int = COMPACT, busi
 
 
 def note(repo: str, head: str, diff: str, readable: frozenset[str] | set[str] | None = None,
-         mention: list[str] | None = None) -> tuple[str, bool, bool]:
+         mention: list[str] | None = None, mentioned_as: str | None = None,
+         define: bool = False) -> tuple[str, bool, bool]:
     """(rendered hits, whether git grep's output was cut, whether a hit is outside
     ``readable``) for ``diff`` at ``head``, and for the names in ``mention`` (see
-    mentioned()); ("", False, False) when there is nothing to search or git can't."""
+    mentioned()), with the outline of its long changed files; ("", False, False) when there
+    is nothing to show or git can't search.  ``mentioned_as``: see render.  ``define``: where
+    the mentioned names are defined too (a discussion's, which has no diff: codex-3 of #211)."""
     # The Python files' scopes, from the full diff (a capped one keeps it as ``raw``), whose
     # hunks rebuild the old sides; the names come from the diff the reviewer sees.
-    scopes = pinned_python(repo, head, getattr(diff, "raw", None) or diff)
+    raw = getattr(diff, "raw", None) or diff
+    scopes = pinned_python(repo, head, raw)
     found = terms(diff, mention, scopes=scopes)
     called = callees(diff, scopes)
-    if not found and not called:
+    # A qualified mention (`snapshot.ensure`) is looked up by its last part, its qualifier's
+    # files first (codex-3 of #211).
+    qualifier: dict[str, str] = {}
+    if define:
+        for t in found:
+            if t.kind == "mentioned":
+                q, _, last = t.pattern.rpartition(".")
+                if last.isidentifier() and last not in called:
+                    called.append(last)
+                    if q:
+                        qualifier.setdefault(last, q.rsplit(".", 1)[-1])
+    outlined, outlined_paths = outline(raw, scopes, readable)
+    if not found and not called and not outlined:
         return "", False, False
     u = search(repo, head, [t.pattern for t in found])
     if u is None:
         return "", False, False
     u.terms = {t.pattern: t for t in found}
     defs, defs_cut = definitions(repo, head, called)
-    if not u.names and not defs and not defs_cut:
+    for n, q in qualifier.items():
+        if n in defs:
+            defs[n] = sorted(defs[n], key=lambda w: q not in w[0])
+    if not u.names and not defs and not defs_cut and not outlined:
         return "", False, False
-    shown = [p for hs in u.hits.values() for p, _, _ in hs] + [p for ws in defs.values() for p, _ in ws[:DEF_HITS]]
+    shown = ([p for hs in u.hits.values() for p, _, _ in hs] + [p for ws in defs.values() for p, _ in ws[:DEF_HITS]]
+             + outlined_paths)
     outside = readable is not None and any(p not in readable for p in shown)
-    return render(u, readable=readable, defs=defs, defs_cut=defs_cut), u.truncated, outside
+    return (render(u, readable=readable, defs=defs, defs_cut=defs_cut, outlined=outlined, mentioned_as=mentioned_as,
+                   defs_title="Where these names are defined:" if define else None),
+            u.truncated, outside)

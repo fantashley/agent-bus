@@ -186,7 +186,13 @@ def build(agent: str, role: str | None = None, bus: Bus | None = None, participa
             # Nothing can arrive (#208): what the timeout would give, without sitting it out.
             # Checked in one write transaction only after a cheap read finds no live job and
             # a thread that could be settled.
-            if call(svc.may_settle, thread) is True:
+            # Called directly (#210): poll above already touched the session and swept, and
+            # may_settle only reads.
+            try:
+                settle = svc.may_settle(thread)
+            except BusError:
+                settle = False
+            if settle:
                 res = call(svc.settled_wait, thread)
                 if res is not None:
                     return res

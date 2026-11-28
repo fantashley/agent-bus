@@ -129,6 +129,25 @@ def _git_env(repo: str) -> dict[str, str] | None:
     return env
 
 
+def partial_clone(repo: str, timeout: float = 10) -> bool:
+    """Whether ``repo``'s git store may be a partial clone: extensions.partialClone, or any
+    remote's promisor or partialCloneFilter setting, whatever its value (codex-1 of #211).  Some
+    blobs may be missing there, and git grep fetches them from the remote before searching,
+    whatever GIT_NO_LAZY_FETCH says.  True if the configuration can't be read in ``timeout``
+    seconds."""
+    env = _git_env(repo)
+    if env is None or timeout <= 0:
+        return True
+    try:
+        out = subprocess.run(["git", "config", "--get-regexp",
+                              r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$"],
+                             cwd=repo, env=env, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    # Exit 1: no such key.  Anything else that isn't 0 is an error.
+    return out.returncode != 1
+
+
 def _git(repo: str, env: dict, *argv: str) -> bytes | None:
     try:
         out = subprocess.run(["git", *argv], cwd=repo, env=env, capture_output=True, timeout=GIT_TIMEOUT_S)

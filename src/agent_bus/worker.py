@@ -859,8 +859,46 @@ class Worker:
                 # A file can't close the list early (codex-1).
                 files=(text := snapshot.listing(snap).replace("[/repository file list]", "[/ repository file list]")),
                 escaped=escaped_note(text))
-                if snap is not None and snap.files else "")
+                if snap is not None and snap.files else "") + (self.discussion_usages(t, snap.head) if snap else "")
         return self._discussion_files
+
+    def discussion_usages(self, t: dict, rev: str) -> str:
+        """Where the names in backticks in the question and evidence appear at ``rev``, the
+        checked-out commit, and where they are defined, for a discussion peer that can't search
+        (#202), as a review's usages section does for its diff; best effort.  Not in a partial
+        clone, where git grep would fetch the missing blobs (codex-1 of #211), and given at most
+        DISCUSSION_SEARCH_S (or a quarter of what is left of the deadline) in all: every peer's
+        first turn waits for it (codex-2)."""
+        texts = [t["goal"] or ""] + [f"{i['title']}\n{i['text']}" for i in ev.of(t)]
+        mention = usages.mentioned(texts, limit=None)
+        if not mention:
+            return ""
+        # The whole search, its checks included, within the limit (codex-9): each git call is
+        # killed once the time is up (codex-8), so none outlives it.
+        limit = max(0.0, min(DISCUSSION_SEARCH_S, self.deadline_left() / 4))
+        started = time.monotonic()
+        if not os.path.exists(os.path.join(t["repo"], ".git")):
+            # A jj repository that isn't colocated: finding its git store takes a jj call that
+            # no time limit covers.
+            self.event("usages", "no usage search for the discussion: no .git in the repository")
+            return ""
+        try:
+            with usages.time_limit(limit):
+                if snapshot.partial_clone(t["repo"], timeout=usages.time_left()):
+                    self.event("usages", "no usage search for the discussion: a partial clone, or its git "
+                                         "configuration could not be read in time")
+                    return ""
+                hits, cut, _ = usages.note(t["repo"], rev, "", None, mention, mentioned_as="", define=True)
+        except Exception as e:  # noqa: BLE001 (never what fails a discussion)
+            self.event("usages", f"no usage search for the discussion: {e!r}")
+            return ""
+        if not hits:
+            if time.monotonic() - started >= limit:
+                self.event("usages", "no usage search for the discussion: it took too long")
+            return ""
+        self.event("usages", f"usages at {rev[:12]} of the names in the question and evidence: {len(hits)} characters")
+        return prompts.DISCUSSION_USAGES.format(rev=rev[:12], repo=t["repo"], hits=hits,
+                                                capped=prompts.USAGES_CUT if cut else "")
 
     def question(self, t: dict) -> str:
         """The question, fenced as peer data when an agent (not the human user) asked it."""
@@ -1660,12 +1698,13 @@ class Worker:
             prompt = prompts.REVIEW_PUSHBACK.format(head=refs["head_commit_id"], replies=replies,
                                                     reading=self.reading_note(refs, snap, listing=False,
                                                                               mention=mention, brief=True),
-                                                    severity=prompts.SEVERITY, budget=budget_note(t),
+                                                    severity=severity_brief(), budget=budget_note(t),
                                                     time_limit=self.time_limit_note(), earlier=earlier_note,
                                                     testing=("\n" + self.testing_note(t, refs) + "\n"
                                                              if self.testing_note(t, refs) else "")
                                                     + ev.unchanged(t),
-                                                    verdict_format=verdict_format(prior, bool(refs.get("review_only"))))
+                                                    verdict_format=verdict_format(prior, bool(refs.get("review_only")),
+                                                                                  brief=True))
         elif resume:
             # Open findings to settle lead the prompt, one line each, and the converge rules
             # point at them rather than repeating their text (#159).
@@ -1681,9 +1720,11 @@ class Worker:
                 reading=self.reading_note(refs, snap, diff=inter, since=refs["prev_head_commit_id"],
                                           mention=mention, brief=True, path_note=False),
                 converge=prompts.CONFIRM if prior else framing,
-                severity=prompts.SEVERITY, budget=budget_note(t),
+                # The resumed session had the severity rules and the verdict format in full (#196).
+                severity=severity_brief(), budget=budget_note(t),
                 time_limit=self.time_limit_note(), overview=self.review_overview(t, refs, inter, "interdiff"),
-                diff_heading=inter_heading, diff=inter, verdict_format=verdict_format(prior, bool(refs.get("review_only"))))
+                diff_heading=inter_heading, diff=inter,
+                verdict_format=verdict_format(prior, bool(refs.get("review_only")), brief=True))
         else:
             prompt = fresh
         # The author's follow-up request is one, even for a reviewer seeing the change for the
@@ -2391,6 +2432,9 @@ class Worker:
                                       asker="The human user" if asker == HUMAN else asker, question=question)
 
 
+# The most a discussion's usage search may hold up its peers' turns, in seconds (#202).
+DISCUSSION_SEARCH_S = 15.0
+
 # The most commit messages a review prompt lists (#93).
 MAX_COMMITS = 20
 MAX_COMMIT_LOG = 6000
@@ -2780,16 +2824,25 @@ def build_label() -> str:
     return __version__ + (f", {store}" if store else "")
 
 
-def verdict_format(prior: dict[str, dict], review_only: bool = False) -> str:
-    """How the verdict ends (#93), with complete follow-up examples when it has earlier
+def severity_brief() -> str:
+    """The severity rules for a resumed session, which had them in full on its first pass
+    (#196): in brief, unless this pass's prompts are the head's and its SEVERITY differs from
+    the installed one (codex-5 of #211), which then goes in full."""
+    return prompts.SEVERITY if prompts.SEVERITY != headprompts.prompts.SEVERITY else prompts.SEVERITY_BRIEF
+
+
+def verdict_format(prior: dict[str, dict], review_only: bool = False, brief: bool = False) -> str:
+    """How the verdict ends (#93), with a complete follow-up example when it has earlier
     blocking findings to settle (#126): "earlier" entries and a finding reused by "id".  A
-    review-only review adds how to write findings its author can read on GitHub (#151)."""
+    review-only review adds how to write findings its author can read on GitHub (#151).
+    ``brief``: for a resumed session, which had the full format on its first pass (#196)."""
     label = (prompts.FORMAT_LABEL_HEAD.format(version=prompts.VERDICT_FORMAT_VERSION, head=HEAD_BUILD[:12],
                                               build=build_label()) if HEAD_BUILD else
              prompts.FORMAT_LABEL.format(version=prompts.VERDICT_FORMAT_VERSION, build=build_label()))
     tail = (prompts.REVIEW_ONLY if review_only else "") + "\n" + label + headprompts.note()
+    base = prompts.VERDICT_BRIEF if brief else prompts.VERDICT_FORMAT
     if not prior:
-        return prompts.VERDICT_FORMAT + tail
+        return base + tail
     ids = list(prior)
     first = ids[0]
     still = {"verdict": "request_changes", "summary": "One paragraph.",
@@ -2797,12 +2850,9 @@ def verdict_format(prior: dict[str, dict], review_only: bool = False) -> str:
              + [{"id": i, "status": "fixed", "note": "How it was fixed."} for i in ids[1:]],
              # Still blocking: "earlier" alone carries it (#164), so it isn't repeated here.
              "findings": [{"file": "src/app.py", "line": 30, "severity": "low", "comment": "A new, non-blocking note."}]}
-    # A carried-over finding with updated text (#196): in "findings" with its id, and in "earlier".
-    update = {"id": first, "file": "src/app.py", "line": 34, "severity": "medium",
-              "comment": "The updated text."}
-    # One example (#159): the approving one only repeated it with every id fixed.
-    return prompts.VERDICT_FORMAT + prompts.VERDICT_FOLLOWUP.format(
-        ids=", ".join(ids), example=first, still=json.dumps(still), update=json.dumps(update)) + tail
+    # One example (#159): the approving one only repeated it with every id fixed, and one of a
+    # carried-over finding with updated text was one too many (#196).
+    return base + prompts.VERDICT_FOLLOWUP.format(ids=", ".join(ids), example=first, still=json.dumps(still)) + tail
 
 
 def settle_earlier(v: dict | None, prior: dict[str, dict], reusable: set[str] = frozenset()) -> dict | None:
